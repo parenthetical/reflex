@@ -1713,11 +1713,9 @@ switchPromptOnly = switchHoldPromptOnly
 -- TODO: Header/location in file of Switchable class & implementations.
 class (Reflex t) => Switchable f t m where
   switchfE :: f t a -> Event t (f t a) -> m (f t a)
-  -- FIXME: Not too pleased with Monoid a here, is the actual signature something which returns m (f t (IntMap a))?
   switchfIntMapE :: IntMap (f t a) -> Event t (PatchIntMap (f t a)) -> m (f t (IntMap a))
   switchfMapE :: (Ord k) => Map k (f t a) -> Event t (PatchMap k (f t a)) -> m (f t (Map k a))
   switchfMapWithMoveE :: (Ord k) => Map k (f t a) -> Event t (PatchMapWithMove k (f t a)) -> m (f t (Map k a))
--- TODO:  switchfDMap :: Patch p => PatchTarget p -> Event t p -> m (Incremental t p)
 
 instance (Reflex t, MonadHold t m) => Switchable Dynamic t m where
   switchfE v0 e = fmap M.join $ holdDyn v0 e
