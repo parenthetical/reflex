@@ -1,3 +1,5 @@
+{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE AllowAmbiguousTypes #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
@@ -17,6 +19,7 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE Trustworthy #-}
+{-# LANGUAGE QuantifiedConstraints #-}
 #ifdef USE_REFLEX_OPTIMIZER
 {-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
 #endif
@@ -171,6 +174,8 @@ module Reflex.Class
   , mergeWithCheap'
     -- * Slow, but general, implementations
   , slowHeadE
+    -- * TODO: description
+  , Switchable(..)
   ) where
 
 #ifdef MIN_VERSION_semialign
@@ -185,13 +190,14 @@ import Data.Zip (Zip (..), Unzip (..))
 #endif
 
 import Control.Applicative
-import Control.Monad.Identity
-import Control.Monad.Reader
-import Control.Monad.State.Strict
+import Control.Monad.Identity hiding (join)
+import Control.Monad.Reader hiding (join)
+import Control.Monad.State.Strict hiding (join)
 import Control.Monad.Trans.Cont (ContT)
 import Control.Monad.Trans.Except (ExceptT)
 import Control.Monad.Trans.RWS (RWST)
 import Control.Monad.Trans.Writer (WriterT)
+import Control.Monad as M
 import Data.Align
 import Data.Bifunctor
 import Data.Coerce
@@ -211,6 +217,8 @@ import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map (Map)
+import qualified Data.Map as Map
+import qualified Data.Patch.MapWithMove as MapWithMove
 import Data.Semigroup (Semigroup (..))
 import Data.Some (Some(Some))
 import Data.String
@@ -225,6 +233,9 @@ import Data.Patch
 import qualified Data.Patch.MapWithMove as PatchMapWithMove
 
 import Debug.Trace (trace)
+
+
+
 
 -- | The 'Reflex' class contains all the primitive functionality needed for
 -- Functional Reactive Programming (FRP).  The @/t/@ type parameter indicates
@@ -1697,3 +1708,80 @@ switchPromptly = switchHoldPromptly
 -- | See 'switchHoldPromptOnly'
 switchPromptOnly :: (Reflex t, MonadHold t m) => Event t a -> Event t (Event t a) -> m (Event t a)
 switchPromptOnly = switchHoldPromptOnly
+
+
+-- TODO: Header/location in file of Switchable class & implementations.
+class (Reflex t) => Switchable f t m where
+  switchfE :: f t a -> Event t (f t a) -> m (f t a)
+  -- FIXME: Not too pleased with Monoid a here, is the actual signature something which returns m (f t (IntMap a))?
+  switchfIntMapE :: IntMap (f t a) -> Event t (PatchIntMap (f t a)) -> m (f t (IntMap a))
+  switchfMapE :: (Ord k) => Map k (f t a) -> Event t (PatchMap k (f t a)) -> m (f t (Map k a))
+  switchfMapWithMoveE :: (Ord k) => Map k (f t a) -> Event t (PatchMapWithMove k (f t a)) -> m (f t (Map k a))
+-- TODO:  switchfDMap :: Patch p => PatchTarget p -> Event t p -> m (Incremental t p)
+
+instance (Reflex t, MonadHold t m) => Switchable Dynamic t m where
+  switchfE v0 e = fmap M.join $ holdDyn v0 e
+  switchfIntMapE v0 =
+    fmap (incrementalToDynamic . mergeIntMapDynIncremental) . holdIncremental v0
+  switchfMapE v0 = fmap (incrementalToDynamic . mergeDynIncremental) . holdIncremental v0
+  switchfMapWithMoveE v0 = fmap (incrementalToDynamic . mergeDynIncrementalWithMove) . holdIncremental v0
+
+
+instance (Reflex t, MonadHold t m) => Switchable Event t m where
+  switchfE v0 e = switchHoldPromptOnly v0 e
+  switchfIntMapE v0 e = switchHoldPromptOnlyIncremental mergeIntIncremental coincidencePatchIntMap v0 e
+  switchfMapE = switchHoldPromptOnlyIncremental mergeMapIncremental coincidencePatchMap
+  switchfMapWithMoveE = switchHoldPromptOnlyIncremental mergeMapIncrementalWithMove coincidencePatchMapWithMove
+
+instance (Reflex t, MonadHold t m) => Switchable Behavior t m where
+  switchfE v0 e = fmap M.join $ hold v0 e
+  switchfIntMapE v0 e = do
+    i <- holdIncremental v0 e
+    pure $ pull $ do
+      m <- sample $ currentIncremental i
+      traverse sample m
+  switchfMapE v0 e = do
+    i <- holdIncremental v0 e
+    pure $ pull $ do
+      m <- sample $ currentIncremental i
+      traverse sample m
+  switchfMapWithMoveE v0 e = do
+    i <- holdIncremental v0 e
+    pure $ pull $ do
+      m <- sample $ currentIncremental i
+      traverse sample m
+
+mergeIntMapDynIncremental :: Reflex t => Incremental t (PatchIntMap (Dynamic t v)) -> Incremental t (PatchIntMap v)
+mergeIntMapDynIncremental a = unsafeBuildIncremental (mapM (sample . current) =<< sample (currentIncremental a)) $ addedAndRemovedValues <> changedValues
+  where changedValues = fmap (PatchIntMap . fmap Just) $ mergeIntMapIncremental $ mapIncrementalMapValues updated a
+        addedAndRemovedValues = flip pushAlways (updatedIncremental a) $ \(PatchIntMap m) -> PatchIntMap <$> mapM (mapM (sample . current)) m
+
+mapIncrementalMapValues :: (Reflex t, Patch (p v), Patch (p v'), PatchTarget (p v) ~ f v, PatchTarget (p v') ~ f v', Functor p, Functor f) => (v -> v') -> Incremental t (p v) -> Incremental t (p v')
+mapIncrementalMapValues f = unsafeMapIncremental (fmap f) (fmap f)
+
+mergeDynIncremental :: (Reflex t, Ord k) => Incremental t (PatchMap k (Dynamic t v)) -> Incremental t (PatchMap k v)
+mergeDynIncremental a = unsafeBuildIncremental (mapM (sample . current) =<< sample (currentIncremental a)) $ addedAndRemovedValues <> changedValues
+  where changedValues = fmap (PatchMap . fmap Just) $ mergeMapIncremental $ mapIncrementalMapValues updated a
+        addedAndRemovedValues = flip pushAlways (updatedIncremental a) $ \(PatchMap m) -> PatchMap <$> mapM (mapM (sample . current)) m
+
+
+mergeDynIncrementalWithMove :: forall t k v. (Reflex t, Ord k) => Incremental t (PatchMapWithMove k (Dynamic t v)) -> Incremental t (PatchMapWithMove k v)
+mergeDynIncrementalWithMove a = unsafeBuildIncremental (mapM (sample . current) =<< sample (currentIncremental a)) $ alignWith f addedAndRemovedValues changedValues
+  where changedValues = mergeMapIncrementalWithMove $ mapIncrementalMapValues updated a
+        addedAndRemovedValues = flip pushAlways (updatedIncremental a) $ fmap unsafePatchMapWithMove . mapM (mapM (sample . current)) . unPatchMapWithMove
+        f :: These (PatchMapWithMove k v) (Map k v) -> PatchMapWithMove k v
+        f x = unsafePatchMapWithMove $
+          let (p, changed) = case x of
+                This p_ -> (unPatchMapWithMove p_, mempty)
+                That c -> (mempty, c)
+                These p_ c -> (unPatchMapWithMove p_, c)
+              (pWithNewVals, noLongerMoved) = flip runState [] $ forM p $ MapWithMove.nodeInfoMapMFrom $ \case
+                MapWithMove.From_Insert v -> return $ MapWithMove.From_Insert v
+                MapWithMove.From_Delete -> return MapWithMove.From_Delete
+                MapWithMove.From_Move k -> case Map.lookup k changed of
+                  Nothing -> return $ MapWithMove.From_Move k
+                  Just v -> do
+                    modify (k:)
+                    return $ MapWithMove.From_Insert v
+              noLongerMovedMap = Map.fromList $ fmap (, ()) noLongerMoved
+          in Map.differenceWith (\e _ -> Just $ MapWithMove.nodeInfoSetTo Nothing e) pWithNewVals noLongerMovedMap --TODO: Check if any in the second map are not covered?
