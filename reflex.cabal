@@ -151,6 +151,7 @@ library
     Reflex.TriggerEvent.Class,
     Reflex.Widget.Basic,
     Reflex.Workflow
+    Reflex.Writer.Base
 
   reexported-modules:
     patch:Data.Functor.Misc,
