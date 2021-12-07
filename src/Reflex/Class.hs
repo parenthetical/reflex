@@ -1718,12 +1718,11 @@ class (Reflex t) => Switchable f t m where
   switchfMapWithMoveE :: (Ord k) => Map k (f t a) -> Event t (PatchMapWithMove k (f t a)) -> m (f t (Map k a))
 
 instance (Reflex t, MonadHold t m) => Switchable Dynamic t m where
-  switchfE v0 e = fmap M.join $ holdDyn v0 e
+  switchfE v0 e = M.join <$> holdDyn v0 e
   switchfIntMapE v0 =
     fmap (incrementalToDynamic . mergeIntMapDynIncremental) . holdIncremental v0
   switchfMapE v0 = fmap (incrementalToDynamic . mergeDynIncremental) . holdIncremental v0
   switchfMapWithMoveE v0 = fmap (incrementalToDynamic . mergeDynIncrementalWithMove) . holdIncremental v0
-
 
 instance (Reflex t, MonadHold t m) => Switchable Event t m where
   switchfE v0 e = switchHoldPromptOnly v0 e
@@ -1732,7 +1731,7 @@ instance (Reflex t, MonadHold t m) => Switchable Event t m where
   switchfMapWithMoveE = switchHoldPromptOnlyIncremental mergeMapIncrementalWithMove coincidencePatchMapWithMove
 
 instance (Reflex t, MonadHold t m) => Switchable Behavior t m where
-  switchfE v0 e = fmap M.join $ hold v0 e
+  switchfE v0 e = M.join <$> hold v0 e
   switchfIntMapE v0 e = do
     i <- holdIncremental v0 e
     pure $ pull $ do

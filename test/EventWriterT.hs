@@ -47,7 +47,7 @@ main = do
   let ![[Nothing, Nothing]] = os6
   return ()
 
-unwrapApp :: (Reflex t, Monad m) => (a -> EventWriterT t [Int] m ()) -> a -> m (Event t [Int])
+unwrapApp :: (Reflex t, Monad m, MonadFix m) => (a -> EventWriterT t [Int] m ()) -> a -> m (Event t [Int])
 unwrapApp x appIn = do
   ((), e) <- runEventWriterT $ x appIn
   return e
@@ -55,7 +55,7 @@ unwrapApp x appIn = do
 testOrdering :: (Reflex t, Monad m) => Event t () -> EventWriterT t [Int] m ()
 testOrdering pulse = forM_ [10,9..1] $ \i -> tellEvent ([i] <$ pulse)
 
-testSimultaneous :: (Reflex t, Adjustable t m, MonadHold t m) => Event t (These () ()) -> EventWriterT t [Int] m ()
+testSimultaneous :: (Reflex t, Adjustable t m, MonadHold t m, MonadFix m) => Event t (These () ()) -> EventWriterT t [Int] m ()
 testSimultaneous pulse = do
   let e0 = fmapMaybe (^? here) pulse
       e1 = fmapMaybe (^? there) pulse
