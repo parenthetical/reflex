@@ -25,6 +25,7 @@
 {-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
 #endif
 {-# OPTIONS_GHC -Wunused-binds #-}
+{-# LANGUAGE TupleSections #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
@@ -1886,7 +1887,8 @@ mergeCheap
   => (forall a. q a -> Event x (v a))
   -> DynamicS x (PatchDMap k q)
   -> Event x (DMap k v)
-mergeCheap nt = mergeGCheap' unMergeSubscribedParent getInitialSubscribers updateMe destroy
+mergeCheap nt =
+  mergeGCheap' nt unMergeSubscribedParent getInitialSubscriber updateMe destroy
   where
       updateMe :: MergeUpdateFunc k v x (PatchDMap k q) (MergeSubscribedParent x)
       updateMe subscriber heightBagRef oldParents (PatchDMap p) = do
@@ -1907,19 +1909,8 @@ mergeCheap nt = mergeGCheap' unMergeSubscribedParent getInitialSubscribers updat
                 liftIO $ modifyIORef heightBagRef $ heightBagRemove oldHeight
               return (maybeToList (unMergeSubscribedParent <$> mOldSubd) ++ subscriptionsToKill, newPs)
         foldM f ([], oldParents) $ DMap.toList p
-
-      getInitialSubscribers :: MergeInitFunc k v q x (MergeSubscribedParent x)
-      getInitialSubscribers initialParents subscriber = do
-        subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
-          let s = subscriber $ return k
-          (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead (nt e) s
-          height <- liftIO $ getEventSubscribedHeight parentSubd
-          return (fmap (k :=>) parentOcc, height, k :=> MergeSubscribedParent subscription)
-        return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
-               , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
-               , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
-               )
-
+      getInitialSubscriber :: MergeInitFunc k v q x (MergeSubscribedParent x)
+      getInitialSubscriber = pure . (, MergeSubscribedParent) . pure
       destroy :: MergeDestroyFunc k (MergeSubscribedParent x)
       destroy s = forM_ (DMap.toList s) $ \(_ :=> MergeSubscribedParent sub) -> unsubscribe sub
 
@@ -1928,7 +1919,8 @@ mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a))
   -> DynamicS x (PatchDMapWithMove k q)
   -> Event x (DMap k v)
-mergeCheapWithMove nt = mergeGCheap' _mergeSubscribedParentWithMove_subscription getInitialSubscribers updateMe destroy
+mergeCheapWithMove nt =
+  mergeGCheap' nt _mergeSubscribedParentWithMove_subscription getInitialSubscriber updateMe destroy
   where
       updateMe :: MergeUpdateFunc k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove x k)
       updateMe subscriber heightBagRef oldParents p = do
@@ -1959,19 +1951,10 @@ mergeCheapWithMove nt = mergeGCheap' _mergeSubscribedParentWithMove_subscription
           DMap.intersectionWithKey moveOrDelete (unPatchDMapWithMove p) oldParents
 
         return (toDelete, applyAlways p' oldParents)
-      getInitialSubscribers :: MergeInitFunc k v q x (MergeSubscribedParentWithMove x k)
-      getInitialSubscribers initialParents subscriber = do
-        subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
+      getInitialSubscriber :: MergeInitFunc k v q x (MergeSubscribedParentWithMove x k)
+      getInitialSubscriber k = do
           keyRef <- liftIO $ newIORef k
-          let s = subscriber $ liftIO $ readIORef keyRef
-          (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead (nt e) s
-          height <- liftIO $ getEventSubscribedHeight parentSubd
-          return (fmap (k :=>) parentOcc, height, k :=> MergeSubscribedParentWithMove subscription keyRef)
-        return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
-               , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
-               , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
-               )
-
+          pure (liftIO $ readIORef keyRef, (`MergeSubscribedParentWithMove` keyRef))
       destroy :: MergeDestroyFunc k (MergeSubscribedParentWithMove x k)
       destroy s = forM_ (DMap.toList s) $ \(_ :=> MergeSubscribedParentWithMove sub _) -> unsubscribe sub
 
@@ -1985,9 +1968,7 @@ type MergeUpdateFunc k v x p s
 type MergeGetSubscription x s = forall a. s a -> EventSubscription x
 
 type MergeInitFunc k v q x s
-   = DMap k q
-  -> (forall a. EventM x (k a) -> Subscriber x (v a))
-  -> EventM x (DMap k v, [Height], DMap k s)
+   = forall a. k a -> EventM x  (EventM x (k a), EventSubscription x -> s a) -- (Maybe (DSum k v), Height, DSum k s)
 
 type MergeDestroyFunc k s
    = DMap k s
@@ -2092,8 +2073,9 @@ updateMerge subscribed m updateFunc p = SomeMergeUpdate updateMe (invalidateMerg
 
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarget p ~ DMap k q)
-  => MergeGetSubscription x s -> MergeInitFunc k v q x s -> MergeUpdateFunc k v x p s -> MergeDestroyFunc k s -> DynamicS x p -> Event x (DMap k v)
-mergeGCheap' getParent getInitialSubscribers updateFunc destroy d = Event $ \sub -> do
+  => (forall a. q a -> Event x (v a)) -> MergeGetSubscription x s -> MergeInitFunc k v q x s
+  -> MergeUpdateFunc k v x p s -> MergeDestroyFunc k s -> DynamicS x p -> Event x (DMap k v)
+mergeGCheap' nt getParent getInitialSubscriber updateFunc destroy d = Event $ \sub -> do
   initialParents <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
   heightRef <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
@@ -2120,7 +2102,19 @@ mergeGCheap' getParent getInitialSubscribers updateFunc destroy d = Event $ \sub
         , _merge_sub = sub
         , _merge_accumRef = accumRef
         }
-  (dm, heights, initialParentState) <- getInitialSubscribers initialParents $ mergeSubscriber subscribed m
+  (dm, heights, initialParentState) <- do
+        subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
+          let subscriber = mergeSubscriber subscribed m
+          (s, mkSub) <- getInitialSubscriber k
+          (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead (nt e) (subscriber s)
+          height <- liftIO $ getEventSubscribedHeight parentSubd
+          return (fmap (k :=>) parentOcc, height, k :=> mkSub subscription)
+          
+        return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
+               , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
+               , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
+               )
+
   let myHeightBag = heightBagFromList $ filter (/= invalidHeight) heights
       myHeight = if invalidHeight `elem` heights
                  then invalidHeight
