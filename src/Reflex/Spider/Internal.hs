@@ -359,6 +359,7 @@ cacheEvent e =
               (parentSub, occ) <- subscribeAndRead e $ Subscriber
 #endif
                   { subscriberPropagate = \a -> do
+                      -- TODO: similar code to subscriberPropagateCommon
                       liftIO $ writeIORef occRef (Just a)
                       scheduleClear occRef
                       propagateFast a subscribers
@@ -478,6 +479,7 @@ newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId su
   { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
       subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribed
       tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+      -- TODO: similar code to other propagate procedures (note DMap.traverse_ comment below)
       liftIO $ writeIORef (fanSubscribedOccurrence subscribed) $ Just a
       scheduleClear $ fanSubscribedOccurrence subscribed
       let f _ (Pair v subsubs) = do
@@ -495,10 +497,8 @@ newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId su
 
 newSubscriberSwitch :: forall x a. HasSpiderTimeline x => SwitchSubscribed x a -> IO (Subscriber x a)
 newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $ Subscriber
-  { subscriberPropagate = \a -> {-# SCC "traverseSwitch" #-} do
-      liftIO $ writeIORef ((commonSubscribedOccurrence . switchSubscribedCommon) subscribed) $ Just a
-      scheduleClear $ (commonSubscribedOccurrence . switchSubscribedCommon) subscribed
-      propagate a $ (commonSubscribedSubscribers . switchSubscribedCommon) subscribed
+  { subscriberPropagate = {-# SCC "traverseSwitch" #-}
+    subscriberPropagateCommon (switchSubscribedCommon subscribed)
   , subscriberInvalidateHeight = \_ -> do
       oldHeight <- readIORef $ (commonSubscribedHeight . switchSubscribedCommon) subscribed
       when (oldHeight /= invalidHeight) $ do
@@ -507,44 +507,52 @@ newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <
   , subscriberRecalculateHeight = (`updateSwitchHeight` subscribed)
     }
 
+newSubscriberCoincidence debugName subscribed propagate =
+  debugSubscriber (debugName <> showNodeId subscribed) $ Subscriber
+    { subscriberPropagate = propagate
+    , subscriberInvalidateHeight  = \_ -> invalidateCoincidenceHeight subscribed
+    , subscriberRecalculateHeight = \_ -> recalculateCoincidenceHeight subscribed
+    }
+
 newSubscriberCoincidenceOuter :: forall x b. HasSpiderTimeline x => CoincidenceSubscribed x b -> IO (Subscriber x (Event x b))
-newSubscriberCoincidenceOuter subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $ Subscriber
-  { subscriberPropagate = \a -> {-# SCC "traverseCoincidenceOuter" #-} do
+newSubscriberCoincidenceOuter subscribed = newSubscriberCoincidence "SubscriberCoincidenceOuter" subscribed $ \a -> 
+  {-# SCC "traverseCoincidenceOuter" #-} do
       outerHeight <- liftIO $ readIORef $ (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
       tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
       (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight subscribed
       tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
       tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
 
+      -- TODO: similar code to other propagate procedures? if coincidence = toEvent . (occurs <=< occurs) this
+      -- might be expressing how to do join propagates
       liftIO $ writeIORef (coincidenceSubscribedInnerParent subscribed) $ Just innerSubd
       scheduleClear $ coincidenceSubscribedInnerParent subscribed
-      case occ of
-        Nothing ->
-          when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
-            writeIORef ((commonSubscribedHeight . coincidenceSubscribedCommon) subscribed) $! innerHeight
-            WeakBag.traverse_ ((commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed) $ invalidateSubscriberHeight outerHeight
-            WeakBag.traverse_ ((commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed) $ recalculateSubscriberHeight innerHeight
-        Just o -> do -- Since it's already firing, no need to adjust height
-          liftIO $ writeIORef ((commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed) occ
-          scheduleClear $ (commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed
-          propagate o $ (commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed
-  , subscriberInvalidateHeight  = \_ -> invalidateCoincidenceHeight subscribed
-  , subscriberRecalculateHeight = \_ -> recalculateCoincidenceHeight subscribed
-  }
+      let commonSubscribed = coincidenceSubscribedCommon subscribed
+      let commonSubscribers = commonSubscribedSubscribers commonSubscribed
+      maybe
+        (when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
+            writeIORef (commonSubscribedHeight commonSubscribed) $! innerHeight
+            WeakBag.traverse_ commonSubscribers $ invalidateSubscriberHeight outerHeight
+            WeakBag.traverse_ commonSubscribers $ recalculateSubscriberHeight innerHeight)
+        (subscriberPropagateCommon (coincidenceSubscribedCommon subscribed))
+        occ
+
+
+subscriberPropagateCommon :: HasSpiderTimeline x => CommonSubscribed s x a -> a -> EventM x ()
+subscriberPropagateCommon subscribed a = do
+  liftIO $ writeIORef (commonSubscribedOccurrence subscribed) $ Just a
+  scheduleClear $ commonSubscribedOccurrence subscribed
+  propagate a $ commonSubscribedSubscribers subscribed
+
 
 newSubscriberCoincidenceInner :: forall x a. HasSpiderTimeline x => CoincidenceSubscribed x a -> IO (Subscriber x a)
-newSubscriberCoincidenceInner subscribed = debugSubscriber ("SubscriberCoincidenceInner" <> showNodeId subscribed) $ Subscriber
-  { subscriberPropagate = \a -> {-# SCC "traverseCoincidenceInner" #-} do
+newSubscriberCoincidenceInner subscribed = newSubscriberCoincidence "SubscriberCoincidenceInner" subscribed $ \a ->
+  {-# SCC "traverseCoincidenceInner" #-} do
       occ <- liftIO $ readIORef $ (commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed
       case occ of
         Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
-        Nothing -> do
-          liftIO $ writeIORef ((commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed) $ Just a
-          scheduleClear $ (commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed
-          propagate a $ (commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed
-  , subscriberInvalidateHeight  = \_ -> invalidateCoincidenceHeight subscribed
-  , subscriberRecalculateHeight = \_ -> recalculateCoincidenceHeight subscribed
-  }
+        Nothing -> subscriberPropagateCommon (coincidenceSubscribedCommon subscribed) a
+
 
 invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
 invalidateSubscriberHeight = flip subscriberInvalidateHeight
@@ -1660,6 +1668,7 @@ fanInt p = unsafePerformIO $ do
       let desc = "fanInt" <> showNodeId self <> ", k = "  <> show k
       (subscription, parentOcc) <- subscribeAndRead p $ debugSubscriber' desc $ Subscriber
         { subscriberPropagate = \m -> do
+            -- TODO: check commonalities with other propagate procedures?
             liftIO $ writeIORef (_fanInt_occRef self) m
             scheduleIntClear $ _fanInt_occRef self
             FastMutableIntMap.forIntersectionWithImmutable_ (_fanInt_subscribers self) m $ \b v ->  --TODO: Do we need to know that no subscribers are being added as we traverse?
@@ -2647,6 +2656,7 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
       { subscriberPropagate = \a -> do
           liftIO $ writeIORef val $ Just a
           scheduleClear val
+          -- TODO: why doesn't this have a propagate step on this line (vs other subscriberPropagates)?
       , subscriberInvalidateHeight = \_ -> return ()
       , subscriberRecalculateHeight = \_ -> return ()
       }
