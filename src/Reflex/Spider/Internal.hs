@@ -1888,7 +1888,7 @@ mergeCheap
   -> DynamicS x (PatchDMap k q)
   -> Event x (DMap k v)
 mergeCheap nt =
-  mergeGCheap' nt unMergeSubscribedParent getInitialSubscriber updateMe destroy
+  mergeGCheap' nt unMergeSubscribedParent getInitialSubscriber updateMe unMergeSubscribedParent
   where
       updateMe :: MergeUpdateFunc k v x (PatchDMap k q) (MergeSubscribedParent x)
       updateMe subscriber heightBagRef oldParents (PatchDMap p) = do
@@ -1911,8 +1911,6 @@ mergeCheap nt =
         foldM f ([], oldParents) $ DMap.toList p
       getInitialSubscriber :: MergeInitFunc k v q x (MergeSubscribedParent x)
       getInitialSubscriber = pure . (, MergeSubscribedParent) . pure
-      destroy :: MergeDestroyFunc k (MergeSubscribedParent x)
-      destroy s = forM_ (DMap.toList s) $ \(_ :=> MergeSubscribedParent sub) -> unsubscribe sub
 
 {-# INLINE [1] mergeCheapWithMove #-}
 mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
@@ -1920,7 +1918,7 @@ mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   -> DynamicS x (PatchDMapWithMove k q)
   -> Event x (DMap k v)
 mergeCheapWithMove nt =
-  mergeGCheap' nt _mergeSubscribedParentWithMove_subscription getInitialSubscriber updateMe destroy
+  mergeGCheap' nt _mergeSubscribedParentWithMove_subscription getInitialSubscriber updateMe _mergeSubscribedParentWithMove_subscription
   where
       updateMe :: MergeUpdateFunc k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove x k)
       updateMe subscriber heightBagRef oldParents p = do
@@ -1955,8 +1953,6 @@ mergeCheapWithMove nt =
       getInitialSubscriber k = do
           keyRef <- liftIO $ newIORef k
           pure (liftIO $ readIORef keyRef, (`MergeSubscribedParentWithMove` keyRef))
-      destroy :: MergeDestroyFunc k (MergeSubscribedParentWithMove x k)
-      destroy s = forM_ (DMap.toList s) $ \(_ :=> MergeSubscribedParentWithMove sub _) -> unsubscribe sub
 
 type MergeUpdateFunc k v x p s
    = (forall a. EventM x (k a) -> Subscriber x (v a))
@@ -1969,10 +1965,6 @@ type MergeGetSubscription x s = forall a. s a -> EventSubscription x
 
 type MergeInitFunc k v q x s
    = forall a. k a -> EventM x  (EventM x (k a), EventSubscription x -> s a) -- (Maybe (DSum k v), Height, DSum k s)
-
-type MergeDestroyFunc k s
-   = DMap k s
-  -> IO ()
 
 data Merge x k v s = Merge
   { _merge_parentsRef :: {-# UNPACK #-} !(IORef (DMap k s))
@@ -2074,8 +2066,8 @@ updateMerge subscribed m updateFunc p = SomeMergeUpdate updateMe (invalidateMerg
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarget p ~ DMap k q)
   => (forall a. q a -> Event x (v a)) -> MergeGetSubscription x s -> MergeInitFunc k v q x s
-  -> MergeUpdateFunc k v x p s -> MergeDestroyFunc k s -> DynamicS x p -> Event x (DMap k v)
-mergeGCheap' nt getParent getInitialSubscriber updateFunc destroy d = Event $ \sub -> do
+  -> MergeUpdateFunc k v x p s -> (forall a. s a -> EventSubscription x)  -> DynamicS x p -> Event x (DMap k v)
+mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \sub -> do
   initialParents <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
   heightRef <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
@@ -2142,7 +2134,8 @@ mergeGCheap' nt getParent getInitialSubscriber updateFunc destroy d = Event $ \s
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
     liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
-  let unsubscribeAll = destroy =<< readIORef parentsRef
+  let unsubscribeAll =
+          mapM_ (unsubscribe . (\(_ :=> s') -> getSub s')) . DMap.toList =<< readIORef parentsRef
 
   return (EventSubscription unsubscribeAll subscribed, occ)
 
