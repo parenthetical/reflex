@@ -172,13 +172,13 @@ instance HasNodeId (Hold x p) where
   getNodeId = holdNodeId
 
 instance HasNodeId (SwitchSubscribed x a) where
-  getNodeId = switchSubscribedNodeId
+  getNodeId = commonSubscribedNodeId . switchSubscribedCommon
 
 instance HasNodeId (FanSubscribed x v a) where
   getNodeId = fanSubscribedNodeId
 
 instance HasNodeId (CoincidenceSubscribed x a) where
-  getNodeId = coincidenceSubscribedNodeId
+  getNodeId = commonSubscribedNodeId . coincidenceSubscribedCommon
 
 instance HasNodeId (RootSubscribed x a) where
   getNodeId = rootSubscribedNodeId
@@ -664,7 +664,7 @@ eventSubscribedCoincidence !subscribed = EventSubscribed
           innerParents = maybeToList $ innerSubscription
       return $ outerParent : innerParents
   , eventSubscribedHasOwnHeightRef = True
-  , eventSubscribedWhoCreated = whoCreatedIORef $ coincidenceSubscribedCachedSubscribed subscribed
+  , eventSubscribedWhoCreated = whoCreatedIORef $ commonSubscribedCachedSubscribed . coincidenceSubscribedCommon $ subscribed
 #endif
   }
 
