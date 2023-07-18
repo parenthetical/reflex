@@ -26,6 +26,7 @@
 #endif
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
@@ -1890,18 +1891,12 @@ mergeCheap
 mergeCheap nt =
   mergeGCheap' nt unMergeSubscribedParent getInitialSubscriber updateMe unMergeSubscribedParent
   where
-      updateMe :: MergeUpdateFunc k v x (PatchDMap k q) (MergeSubscribedParent x)
-      updateMe subscriber heightBagRef oldParents (PatchDMap p) = do
+      updateMe :: MergeUpdateFunc' k v x (PatchDMap k q) (MergeSubscribedParent x)
+      updateMe subscribeParent heightBagRef oldParents (PatchDMap p) = do
         let f (subscriptionsToKill, ps) (k :=> ComposeMaybe me) = do
               (mOldSubd, newPs) <- case me of
                 Nothing -> return $ DMap.updateLookupWithKey (\_ _ -> Nothing) k ps
-                Just e -> fmap (\x -> DMap.insertLookupWithKey' (\_ new _ -> new) k x ps) $ do
-                  (foo,bar) <- getInitialSubscriber k
-                  subscription@(EventSubscription _ subd) <- subscribe (nt e) (subscriber foo)
-                  liftIO $ do
-                    newParentHeight <- getEventSubscribedHeight subd
-                    modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-                    pure $ bar subscription
+                Just e -> (\x -> DMap.insertLookupWithKey' (\_ new _ -> new) k x ps) <$> subscribeParent k (nt e)
               forM_ mOldSubd $ \oldSubd -> do
                 oldHeight <- liftIO $ getEventSubscribedHeight $
                   _eventSubscription_subscribed $ unMergeSubscribedParent oldSubd
@@ -1920,17 +1915,8 @@ mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
 mergeCheapWithMove nt =
   mergeGCheap' nt _mergeSubscribedParentWithMove_subscription getInitialSubscriber updateMe _mergeSubscribedParentWithMove_subscription
   where
-      updateMe :: MergeUpdateFunc k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove x k)
-      updateMe subscriber heightBagRef oldParents p = do
-        -- Prepare new parents for insertion
-        let subscribeParent :: forall a. k a -> Event x (v a) -> EventM x (MergeSubscribedParentWithMove x k a)
-            subscribeParent k e = do
-              (foo,bar) <- getInitialSubscriber k
-              subscription@(EventSubscription _ subd) <- subscribe e (subscriber foo)
-              liftIO $ do
-                newParentHeight <- getEventSubscribedHeight subd
-                modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-                pure $ bar subscription
+      updateMe :: MergeUpdateFunc' k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove x k)
+      updateMe subscribeParent heightBagRef oldParents p = do
         p' <- PatchDMapWithMove.traversePatchDMapWithMoveWithKey (\k q -> subscribeParent k (nt q)) p
         -- Collect old parents for deletion and update the keys of moved parents
         let moveOrDelete :: forall a. k a -> PatchDMapWithMove.NodeInfo k q a -> MergeSubscribedParentWithMove x k a -> Constant (EventM x (Maybe (EventSubscription x))) a
@@ -1959,6 +1945,14 @@ type MergeUpdateFunc k v x p s
   -> DMap k s
   -> p
   -> EventM x ([EventSubscription x], DMap k s)
+
+type MergeUpdateFunc' k v x p s
+   = (forall a. k a -> Event x (v a) -> EventM x (s a))
+  -> IORef HeightBag
+  -> DMap k s
+  -> p
+  -> EventM x ([EventSubscription x], DMap k s)
+
 
 type MergeGetSubscription x s = forall a. s a -> EventSubscription x
 
@@ -2062,10 +2056,13 @@ updateMerge subscribed m updateFunc p = SomeMergeUpdate updateMe (invalidateMerg
           liftIO $ writeIORef (_merge_parentsRef m) $! newParents
           return subscriptionsToKill
 
+-- Type-checker isn't happy when lambda is avoided:
+{-# ANN mergeGCheap' "HLint: ignore Avoid lambda" #-}
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarget p ~ DMap k q)
   => (forall a. q a -> Event x (v a)) -> MergeGetSubscription x s -> MergeInitFunc k v q x s
-  -> MergeUpdateFunc k v x p s -> (forall a. s a -> EventSubscription x)  -> DynamicS x p -> Event x (DMap k v)
+  -> MergeUpdateFunc' k v x p s
+  -> (forall a. s a -> EventSubscription x)  -> DynamicS x p -> Event x (DMap k v)
 mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \sub -> do
   initialParents <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
@@ -2119,16 +2116,26 @@ mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \su
   liftIO $ writeIORef heightRef $! myHeight
   liftIO $ writeIORef heightBagRef $! myHeightBag
   liftIO $ writeIORef parentsRef $! initialParentState
+  -- Prepare new parents for insertion
+  let subscribeParent :: forall a. (EventM x (k a) -> Subscriber x (v a)) -> k a -> Event x (v a) -> EventM x (s a)
+      subscribeParent subscriber k e = do
+            (foo,bar) <- getInitialSubscriber k
+            subscription@(EventSubscription _ subd) <- subscribe e (subscriber foo)
+            liftIO $ do
+              newParentHeight <- getEventSubscribedHeight subd
+              modifyIORef' heightBagRef $ heightBagAdd newParentHeight
+              pure $ bar subscription
+
   defer $ SomeMergeInit $ do
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
-              defer $ updateMerge subscribed m updateFunc a
+              defer $ updateMerge subscribed m (\subscriber -> updateFunc (subscribeParent  subscriber)) a
           , subscriberInvalidateHeight = \_ -> return ()
           , subscriberRecalculateHeight = \_ -> return ()
           }
     (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) changeSubscriber
-    forM_ change $ \c -> defer $ updateMerge subscribed m updateFunc c
+    forM_ change $ \c -> defer $ updateMerge subscribed m (\subscriber -> updateFunc (subscribeParent subscriber)) c
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
