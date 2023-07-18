@@ -1895,13 +1895,13 @@ mergeCheap nt =
         let f (subscriptionsToKill, ps) (k :=> ComposeMaybe me) = do
               (mOldSubd, newPs) <- case me of
                 Nothing -> return $ DMap.updateLookupWithKey (\_ _ -> Nothing) k ps
-                Just e -> do
-                  let s = subscriber $ return k
-                  subscription@(EventSubscription _ subd) <- subscribe (nt e) s
-                  newParentHeight <- liftIO $ getEventSubscribedHeight subd
-                  let newParent = MergeSubscribedParent subscription
-                  liftIO $ modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-                  return $ DMap.insertLookupWithKey' (\_ new _ -> new) k newParent ps
+                Just e -> fmap (\x -> DMap.insertLookupWithKey' (\_ new _ -> new) k x ps) $ do
+                  (foo,bar) <- getInitialSubscriber k
+                  subscription@(EventSubscription _ subd) <- subscribe (nt e) (subscriber foo)
+                  liftIO $ do
+                    newParentHeight <- getEventSubscribedHeight subd
+                    modifyIORef' heightBagRef $ heightBagAdd newParentHeight
+                    pure $ bar subscription
               forM_ mOldSubd $ \oldSubd -> do
                 oldHeight <- liftIO $ getEventSubscribedHeight $
                   _eventSubscription_subscribed $ unMergeSubscribedParent oldSubd
@@ -1925,13 +1925,12 @@ mergeCheapWithMove nt =
         -- Prepare new parents for insertion
         let subscribeParent :: forall a. k a -> Event x (v a) -> EventM x (MergeSubscribedParentWithMove x k a)
             subscribeParent k e = do
-              keyRef <- liftIO $ newIORef k
-              let s = subscriber $ liftIO $ readIORef keyRef
-              subscription@(EventSubscription _ subd) <- subscribe e s
+              (foo,bar) <- getInitialSubscriber k
+              subscription@(EventSubscription _ subd) <- subscribe e (subscriber foo)
               liftIO $ do
                 newParentHeight <- getEventSubscribedHeight subd
                 modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-                return $ MergeSubscribedParentWithMove subscription keyRef
+                pure $ bar subscription
         p' <- PatchDMapWithMove.traversePatchDMapWithMoveWithKey (\k q -> subscribeParent k (nt q)) p
         -- Collect old parents for deletion and update the keys of moved parents
         let moveOrDelete :: forall a. k a -> PatchDMapWithMove.NodeInfo k q a -> MergeSubscribedParentWithMove x k a -> Constant (EventM x (Maybe (EventSubscription x))) a
