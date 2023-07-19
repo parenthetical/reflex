@@ -1316,7 +1316,7 @@ run roots after = do
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
       propagate a subscribersRef
-    delayedRef <- asksEventEnv eventEnvDelayedMerges
+    delayedRef :: IORef (IntMap [EventM x ()]) <- asksEventEnv eventEnvDelayedMerges
     let go = do
           delayed <- liftIO $ readIORef delayedRef
           case IntMap.minViewWithKey delayed of
@@ -2083,7 +2083,7 @@ mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \su
 #endif
       }
 
-      m = Merge
+  let m = Merge
         { _merge_parentsRef = parentsRef
         , _merge_heightBagRef = heightBagRef
         , _merge_heightRef = heightRef
@@ -2257,6 +2257,94 @@ mergeIntCheap d = Event $ \sub -> do
 
 
   return (EventSubscription unsubscribeAll subscribed, occ)
+
+
+mergeIntMonolithic :: forall x a. (HasSpiderTimeline x) => IntMap (Event x a) -> Event x (IntMap a)
+mergeIntMonolithic initialParents = Event $ \sub -> do
+  accum <- liftIO FastMutableIntMap.newEmpty
+  heightRef <- liftIO $ newIORef zeroHeight
+  heightBagRef <- liftIO $ newIORef heightBagEmpty
+  parents <- liftIO FastMutableIntMap.newEmpty
+  changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
+  let subscribed = EventSubscribed
+        { eventSubscribedHeightRef = heightRef
+        , eventSubscribedRetained = toAny (parents, changeSubdRef)
+#ifdef DEBUG_CYCLES
+        , eventSubscribedGetParents = fmap (_eventSubscription_subscribed . snd) <$> FastMutableIntMap.toList parents
+        , eventSubscribedHasOwnHeightRef = False
+        , eventSubscribedWhoCreated = whoCreatedIORef heightRef
+#endif
+        }
+  let scheduleSelf = do
+        initialHeight <- liftIO $ readIORef $ heightRef
+        let scheduleMerge_ = scheduleMerge initialHeight $ do
+              height <- liftIO $ readIORef heightRef
+              currentHeight <- getCurrentHeight
+              case height `compare` currentHeight of
+                LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+                GT -> scheduleMerge_ -- The height has been increased (by a coincidence event; TODO: is this the only way?)
+                EQ -> do
+                  vals <- liftIO $ FastMutableIntMap.getFrozenAndClear accum
+                  subscriberPropagate sub vals
+        scheduleMerge_
+      invalidateMyHeight = invalidateMergeHeight' heightRef sub
+      recalculateMyHeight = do
+        currentHeight <- readIORef heightRef
+        when (currentHeight == invalidHeight) $ do --TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
+          heights <- readIORef heightBagRef
+          numParents <- FastMutableIntMap.size parents
+          case heightBagSize heights `compare` numParents of
+            LT -> return ()
+            EQ -> do
+              let height = succHeight $ heightBagMax heights
+              traceInvalidateHeight $ "recalculateSubscriberHeight: height: " <> show height
+              writeIORef heightRef $! height
+              subscriberRecalculateHeight sub height
+            GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show numParents <> ") for Merge"
+  forM_ (IntMap.toList initialParents) $ \(k, p) -> do
+    (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead p $
+        Subscriber
+        { subscriberPropagate = \a -> do
+            checkCycle subscribed
+
+            wasEmpty <- liftIO $ FastMutableIntMap.isEmpty accum
+            liftIO $ FastMutableIntMap.insert accum k a
+            when wasEmpty scheduleSelf
+        , subscriberInvalidateHeight = \old -> do
+            modifyIORef' heightBagRef $ heightBagRemove old
+            invalidateMyHeight
+        , subscriberRecalculateHeight = \new -> do
+            modifyIORef' heightBagRef $ heightBagAdd new
+            recalculateMyHeight
+        }
+    liftIO $ do
+      forM_ parentOcc $ FastMutableIntMap.insert accum k
+      FastMutableIntMap.insert parents k subscription
+      height <- getEventSubscribedHeight parentSubd
+      if height == invalidHeight
+        then writeIORef heightRef invalidHeight
+        else do
+          modifyIORef' heightBagRef $ heightBagAdd height
+          modifyIORef' heightRef $ \oldHeight ->
+            if oldHeight == invalidHeight
+            then invalidHeight
+            else max (succHeight height) oldHeight
+  isEmpty <- liftIO $ FastMutableIntMap.isEmpty accum
+  occ <- if isEmpty
+          then pure Nothing
+          else do
+             shouldWeHaveFired <- (>=) <$> getCurrentHeight <*> liftIO (readIORef heightRef) -- currentHeight >= myHeight
+             if shouldWeHaveFired
+               then liftIO $ Just <$> FastMutableIntMap.getFrozenAndClear accum
+               else do  -- We have things accumulated, but we shouldn't have fired them yet
+                 scheduleSelf
+                 pure Nothing
+  return ( EventSubscription
+           { _eventSubscription_unsubscribe = traverse_ unsubscribe =<< FastMutableIntMap.getFrozenAndClear parents
+           , _eventSubscription_subscribed = subscribed
+           }
+         , occ
+         )
 
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
 newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
