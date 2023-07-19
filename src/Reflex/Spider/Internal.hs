@@ -2302,6 +2302,8 @@ mergeIntStatic initialParents = Event $ \sub -> do
         when (currentHeight == invalidHeight) $ do --TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
           heights <- readIORef heightBagRef
           numParents <- FastMutableIntMap.size parents
+          -- TODO: how is numParents comparable to the height bag?
+          -- TODO: what do LT/EQ cases mean?
           case heightBagSize heights `compare` numParents of
             LT -> return ()
             EQ -> do
