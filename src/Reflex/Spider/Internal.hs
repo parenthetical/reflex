@@ -1826,8 +1826,8 @@ getCommonSubscribed subscribedRef__ getSCommonSubscribed extraCleanup whatToUnsu
   case mSubscribed of
     Just subscribed -> {-# SCC "hitCommon" #-} liftIO $ do
       let common = getSCommonSubscribed subscribed
-      sln <- -- Subscribe and get subscribption WeakBagTicket
-        WeakBag.insert sub (commonSubscribedSubscribers common) (commonSubscribedWeakSelf common) cleanup
+      -- Subscribe and get subscribption WeakBagTicket 
+      sln <- WeakBag.insert sub (commonSubscribedSubscribers common) (commonSubscribedWeakSelf common) cleanup
       occ <- readIORef $ commonSubscribedOccurrence common
       return (sln, subscribed, occ)
     Nothing -> {-# SCC "missCommon" #-} do
@@ -1839,12 +1839,18 @@ getCommonSubscribed subscribedRef__ getSCommonSubscribed extraCleanup whatToUnsu
       heightRef <- liftIO $ newIORef height
       weakSelf <- liftIO $ newIORef $ error "getCommonSubscribed: weakSelf not yet implemented"
       (subs, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanup
+#ifdef DEBUG_NODEIDS
+      nid <- liftIO newNodeId
+#endif
       let !subscribed = fromCommon $ CommonSubscribed
             { commonSubscribedCachedSubscribed = subscribedRef__
             , commonSubscribedOccurrence = occRef
             , commonSubscribedHeight = heightRef
             , commonSubscribedSubscribers = subs
             , commonSubscribedWeakSelf = weakSelf
+#ifdef DEBUG_NODEIDS
+            , commonSubscribedNodeId = nid
+#endif
             }
       liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug subscribed "commonSubscribedWeakSelf"
       liftIO $ writeIORef subscribedRef $! subscribed
