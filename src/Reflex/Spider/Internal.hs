@@ -2125,7 +2125,6 @@ mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \su
   liftIO $ writeIORef heightRef $! myHeight
   liftIO $ writeIORef heightBagRef $! myHeightBag
   liftIO $ writeIORef parentsRef $! initialParentState
-  -- Prepare new parents for insertion
   let subscribeParent :: forall a. (EventM x (k a) -> Subscriber x (v a)) -> k a -> Event x (v a) -> EventM x (s a)
       subscribeParent subscriber k e = do
             (foo,bar) <- getInitialSubscriber k
@@ -2134,17 +2133,19 @@ mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \su
               newParentHeight <- getEventSubscribedHeight subd
               modifyIORef' heightBagRef $ heightBagAdd newParentHeight
               pure $ bar subscription
-
+  let deferUpdateMerge =
+            defer . updateMerge subscribed m (\subscriber -> updateFunc (subscribeParent subscriber))
+  -- Prepare new parents for insertion
   defer $ SomeMergeInit $ do
     let changeSubscriber = Subscriber
-          { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
+          { subscriberPropagate = \c -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
-              defer $ updateMerge subscribed m (\subscriber -> updateFunc (subscribeParent  subscriber)) a
+              deferUpdateMerge c
           , subscriberInvalidateHeight = \_ -> return ()
           , subscriberRecalculateHeight = \_ -> return ()
           }
     (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) changeSubscriber
-    forM_ change $ \c -> defer $ updateMerge subscribed m (\subscriber -> updateFunc (subscribeParent subscriber)) c
+    forM_ change deferUpdateMerge
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
