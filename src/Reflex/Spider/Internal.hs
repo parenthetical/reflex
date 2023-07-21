@@ -1916,6 +1916,122 @@ mergeCheap nt =
       getInitialSubscriber :: MergeInitFunc k v q x (MergeSubscribedParent x)
       getInitialSubscriber = pure . (, MergeSubscribedParent) . pure
 
+-- Type-checker isn't happy when lambda is avoided:
+{-# ANN mergeCheapInlined "HLint: ignore Avoid lambda" #-}
+{-# INLINE mergeCheapInlined #-}
+mergeCheapInlined :: forall k x q v. (HasSpiderTimeline x, GCompare k)
+  => (forall a. q a -> Event x (v a))
+  -> DynamicS x (PatchDMap k q)
+  -> Event x (DMap k v)
+mergeCheapInlined nt d = Event $ \sub -> do
+  initialParents <- readBehaviorUntracked $ dynamicCurrent d
+  accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
+  heightRef <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
+  heightBagRef <- liftIO $ newIORef $ error "merge: heightBagRef not yet initialized"
+  parentsRef :: IORef (DMap k s) <- liftIO $ newIORef $ error "merge: parentsRef not yet initialized"
+  changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
+
+  let subscribed = EventSubscribed
+        { eventSubscribedHeightRef = heightRef
+        , eventSubscribedRetained = toAny (parentsRef, changeSubdRef)
+#ifdef DEBUG_CYCLES
+      , eventSubscribedGetParents = do
+          let getParent' (_ :=> v) = _eventSubscription_subscribed (unMergeSubscribedParent v)
+          fmap getParent' . DMap.toList  <$> readIORef parentsRef
+      , eventSubscribedHasOwnHeightRef = False
+      , eventSubscribedWhoCreated = whoCreatedIORef heightRef
+#endif
+      }
+  let m = Merge
+        { _merge_parentsRef = parentsRef
+        , _merge_heightBagRef = heightBagRef
+        , _merge_heightRef = heightRef
+        , _merge_sub = sub
+        , _merge_accumRef = accumRef
+        }
+  (dm, heights, initialParentState) <- do
+        subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
+          let subscriber = mergeSubscriber subscribed m
+          (s, mkSub) <- (pure . (, MergeSubscribedParent) . pure) k
+          (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead (nt e) (subscriber s)
+          height <- liftIO $ getEventSubscribedHeight parentSubd
+          return (fmap (k :=>) parentOcc, height, k :=> mkSub subscription)
+          
+        return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
+               , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
+               , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
+               )
+
+  let myHeightBag = heightBagFromList $ filter (/= invalidHeight) heights
+      myHeight = if invalidHeight `elem` heights
+                 then invalidHeight
+                 else succHeight $ heightBagMax myHeightBag
+  currentHeight <- getCurrentHeight
+  let (occ, accum) = if currentHeight >= myHeight -- If we should have fired by now
+                     then (if DMap.null dm then Nothing else Just dm, DMap.empty)
+                     else (Nothing, dm)
+  unless (DMap.null accum) $ scheduleMergeSelf m myHeight
+  liftIO $ writeIORef accumRef $! accum
+  liftIO $ writeIORef heightRef $! myHeight
+  liftIO $ writeIORef heightBagRef $! myHeightBag
+  liftIO $ writeIORef parentsRef $! initialParentState
+  -- Prepare new parents for insertion
+  let subscribeParent :: forall a. (EventM x (k a) -> Subscriber x (v a)) -> k a -> Event x (v a) -> EventM x (s a)
+      subscribeParent subscriber k e = do
+            (foo,bar) <- (pure . (, MergeSubscribedParent) . pure) k
+            subscription@(EventSubscription _ subd) <- subscribe e (subscriber foo)
+            liftIO $ do
+              newParentHeight <- getEventSubscribedHeight subd
+              modifyIORef' heightBagRef $ heightBagAdd newParentHeight
+              pure $ bar subscription
+  let updateFunc :: MergeUpdateFunc' k v x (PatchDMap k q) (MergeSubscribedParent x)
+      updateFunc subscribeParent heightBagRef oldParents (PatchDMap p) = do
+        let f (subscriptionsToKill, ps) (k :=> ComposeMaybe me) = do
+              (mOldSubd, newPs) <- case me of
+                Nothing -> return $ DMap.updateLookupWithKey (\_ _ -> Nothing) k ps
+                Just e -> (\x -> DMap.insertLookupWithKey' (\_ new _ -> new) k x ps) <$> subscribeParent k (nt e)
+              forM_ mOldSubd $ \oldSubd -> do
+                oldHeight <- liftIO $ getEventSubscribedHeight $
+                  _eventSubscription_subscribed $ unMergeSubscribedParent oldSubd
+
+                liftIO $ modifyIORef heightBagRef $ heightBagRemove oldHeight
+              return (maybeToList (unMergeSubscribedParent <$> mOldSubd) ++ subscriptionsToKill, newPs)
+        foldM f ([], oldParents) $ DMap.toList p
+  let updateMerge :: MergeUpdateFunc k v x p s -> p -> SomeMergeUpdate x
+      updateMerge updateFunc p =
+          SomeMergeUpdate
+          (do
+            oldParents <- liftIO $ readIORef $ _merge_parentsRef m
+            (subscriptionsToKill, newParents) <- updateFunc (mergeSubscriber subscribed m) (_merge_heightBagRef m) oldParents p
+            liftIO $ writeIORef (_merge_parentsRef m) $! newParents
+            return subscriptionsToKill)
+          (invalidateMergeHeight m)
+          (revalidateMergeHeight m)
+  defer $ SomeMergeInit $ do
+    let changeSubscriber = Subscriber
+          { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
+              tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
+              defer . updateMerge (\subscriber -> updateFunc (subscribeParent subscriber)) $ a
+          , subscriberInvalidateHeight = \_ -> return ()
+          , subscriberRecalculateHeight = \_ -> return ()
+          }
+    (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) changeSubscriber
+    -- TODO: are there other cases where something like "forM_ change"
+    -- is the same as the "propagate" from the subscriber? Originally
+    -- this was not written like this. The tracePropagate only
+    -- triggered on the subscribeAndRead version but this is a no-op
+    -- so morally the same. Maybe tracePropagate could wrap subscribers.
+    forM_ change (subscriberPropagate changeSubscriber)
+    -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
+    -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
+    -- its subscription.
+    liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
+  let unsubscribeAll =
+          mapM_ (unsubscribe . (\(_ :=> s') -> unMergeSubscribedParent s')) . DMap.toList =<< readIORef parentsRef
+
+  return (EventSubscription unsubscribeAll subscribed, occ)
+
+
 {-# INLINE [1] mergeCheapWithMove #-}
 mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a))
