@@ -1898,7 +1898,7 @@ mergeCheap
   -> DynamicS x (PatchDMap k q)
   -> Event x (DMap k v)
 mergeCheap nt =
-  mergeGCheap' nt unMergeSubscribedParent getInitialSubscriber updateMe unMergeSubscribedParent
+  mergeGCheap' nt getInitialSubscriber updateMe unMergeSubscribedParent
   where
       updateMe :: MergeUpdateFunc' k v x (PatchDMap k q) (MergeSubscribedParent x)
       updateMe subscribeParent heightBagRef oldParents (PatchDMap p) = do
@@ -2032,7 +2032,7 @@ mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   -> DynamicS x (PatchDMapWithMove k q)
   -> Event x (DMap k v)
 mergeCheapWithMove nt =
-  mergeGCheap' nt _mergeSubscribedParentWithMove_subscription getInitialSubscriber updateMe _mergeSubscribedParentWithMove_subscription
+  mergeGCheap' nt getInitialSubscriber updateMe _mergeSubscribedParentWithMove_subscription
   where
       updateMe :: MergeUpdateFunc' k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove x k)
       updateMe subscribeParent heightBagRef oldParents p = do
@@ -2179,10 +2179,12 @@ updateMerge subscribed m updateFunc p = SomeMergeUpdate updateMe (invalidateMerg
 {-# ANN mergeGCheap' "HLint: ignore Avoid lambda" #-}
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarget p ~ DMap k q)
-  => (forall a. q a -> Event x (v a)) -> MergeGetSubscription x s -> MergeInitFunc k v q x s
+  => (forall a. q a -> Event x (v a)) -> MergeInitFunc k v q x s
   -> MergeUpdateFunc' k v x p s
-  -> (forall a. s a -> EventSubscription x)  -> DynamicS x p -> Event x (DMap k v)
-mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \sub -> do
+  -> MergeGetSubscription x s
+  -> DynamicS x p
+  -> Event x (DMap k v)
+mergeGCheap' nt getInitialSubscriber updateFunc getSub d = Event $ \sub -> do
   initialParents <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
   heightRef <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
@@ -2195,8 +2197,8 @@ mergeGCheap' nt getParent getInitialSubscriber updateFunc getSub d = Event $ \su
         , eventSubscribedRetained = toAny (parentsRef, changeSubdRef)
 #ifdef DEBUG_CYCLES
         , eventSubscribedGetParents = do
-            let getParent' (_ :=> v) = _eventSubscription_subscribed (getParent v)
-            fmap getParent' . DMap.toList  <$> readIORef parentsRef
+            let getParent (_ :=> v) = _eventSubscription_subscribed (getSub v)
+            fmap getParent . DMap.toList  <$> readIORef parentsRef
         , eventSubscribedHasOwnHeightRef = False
         , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
