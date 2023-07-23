@@ -27,6 +27,7 @@
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE RecursiveDo #-}
 
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
@@ -1900,7 +1901,7 @@ mergeCheap nt =
   mergeGCheap' nt getInitialSubscriber updateMe
   where
       updateMe :: MergeUpdateFunc' k v x (PatchDMap k q) MergeSubscribedParent
-      updateMe subscribeParent heightBagRef oldParents (PatchDMap p) = do
+      updateMe heightBagRef oldParents (PatchDMap p) subscribeParent = do
         let f (subscriptionsToKill, ps) (k :=> ComposeMaybe me) = do
               (mOldSubd, newPs) <- case me of
                 Nothing -> return $ DMap.updateLookupWithKey (\_ _ -> Nothing) k ps
@@ -1924,7 +1925,7 @@ mergeCheapWithMove nt =
   mergeGCheap' nt getInitialSubscriber updateMe
   where
       updateMe :: MergeUpdateFunc' k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove k)
-      updateMe subscribeParent heightBagRef oldParents p = do
+      updateMe heightBagRef oldParents p subscribeParent = do
         p' <- PatchDMapWithMove.traversePatchDMapWithMoveWithKey (\k q -> subscribeParent k (nt q)) p
         -- Collect old parents for deletion and update the keys of moved parents
         let moveOrDelete :: forall a. k a -> PatchDMapWithMove.NodeInfo k q a -> MergeGSubscribed x (MergeSubscribedParentWithMove k) a -> Constant (EventM x (Maybe (EventSubscription x))) a
@@ -1953,10 +1954,10 @@ type MergeUpdateFunc k v x p s
   -> EventM x ([EventSubscription x], DMap k s)
 
 type MergeUpdateFunc' k v x p s
-   = (forall a. k a -> Event x (v a) -> EventM x (MergeGSubscribed x s a))
-  -> IORef HeightBag
+   = IORef HeightBag
   -> DMap k (MergeGSubscribed x s)
   -> p
+  -> (forall a. k a -> Event x (v a) -> EventM x (MergeGSubscribed x s a))
   -> EventM x ([EventSubscription x], DMap k (MergeGSubscribed x s))
 
 
@@ -2044,7 +2045,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
                writeIORef heightRef $! height
                subscriberRecalculateHeight sub height
              GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show (DMap.size parents) <> ") for Merge"
-
   let scheduleMergeSelf :: Height -> EventM x ()
       scheduleMergeSelf height = scheduleMerge' height heightRef $ do
             vals <- liftIO $ readIORef $ accumRef
@@ -2073,7 +2073,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
             modifyIORef' heightBagRef $ heightBagAdd new
             revalidateMergeHeight
         }
-
   (dm, heights, initialParentState) <- do
         subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
           (s, theExtra) <- getInitialSubscriber k
@@ -2085,7 +2084,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
                , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
                , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
                )
-
   let myHeightBag = heightBagFromList $ filter (/= invalidHeight) heights
       myHeight = if invalidHeight `elem` heights
                  then invalidHeight
@@ -2099,17 +2097,15 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
   liftIO $ writeIORef heightRef $! myHeight
   liftIO $ writeIORef heightBagRef $! myHeightBag
   liftIO $ writeIORef parentsRef $! initialParentState
-  let subscribeParent :: forall a. (EventM x (k a) -> Subscriber x (v a)) -> k a -> Event x (v a) -> EventM x (MergeGSubscribed x s a)
-      subscribeParent subscriber k e = do
+  let deferUpdateMerge c = defer $ SomeMergeUpdate invalidateMergeHeight revalidateMergeHeight $ do
+         oldParents <- liftIO $ readIORef $ parentsRef
+         (subscriptionsToKill, newParents) <- updateFunc heightBagRef oldParents c $ \k e -> do
             (s,theExtra) <- getInitialSubscriber k
-            subscription@(EventSubscription _ subd) <- subscribe e (subscriber s)
+            subscription@(EventSubscription _ subd) <- subscribe e (mergeSubscriber s)
             liftIO $ do
               newParentHeight <- getEventSubscribedHeight subd
               modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-              pure $ MergeGSubscribed subscription theExtra
-  let deferUpdateMerge c = defer $ SomeMergeUpdate invalidateMergeHeight revalidateMergeHeight $ do
-         oldParents <- liftIO $ readIORef $ parentsRef
-         (subscriptionsToKill, newParents) <- updateFunc (subscribeParent mergeSubscriber) heightBagRef oldParents c
+            pure $ MergeGSubscribed subscription theExtra
          liftIO $ writeIORef parentsRef $! newParents
          return subscriptionsToKill 
   -- Prepare new parents for insertion
@@ -2129,7 +2125,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
     liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
   let unsubscribeAll =
           mapM_ (unsubscribe . (\(_ :=> (MergeGSubscribed s' _)) -> s')) . DMap.toList =<< readIORef parentsRef
-
   return (EventSubscription unsubscribeAll subscribed, occ)
 
 
