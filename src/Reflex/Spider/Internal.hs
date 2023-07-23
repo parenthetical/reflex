@@ -2009,13 +2009,13 @@ mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarge
   -> MergeUpdateFunc' k v x p s
   -> DynamicS x p
   -> Event x (DMap k v)
-mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
-  initialParents <- readBehaviorUntracked $ dynamicCurrent d
-  accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
-  heightRef <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
-  heightBagRef <- liftIO $ newIORef $ error "merge: heightBagRef not yet initialized"
+mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> mdo
+  initialParents :: DMap k q <- readBehaviorUntracked $ dynamicCurrent d
+  accumRef :: IORef (DMap k v) <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
+  heightRef :: IORef Height <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
+  heightBagRef :: IORef HeightBag <- liftIO $ newIORef $ error "merge: heightBagRef not yet initialized"
   parentsRef :: IORef (DMap k (MergeGSubscribed x s)) <- liftIO $ newIORef $ error "merge: parentsRef not yet initialized"
-  changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
+  changeSubdRef :: IORef (Subscriber x p, EventSubscription x) <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
 
   let subscribed = EventSubscribed
         { eventSubscribedHeightRef = heightRef
