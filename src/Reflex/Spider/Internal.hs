@@ -2006,7 +2006,7 @@ mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarge
   => (forall a. q a -> Event x (v a))
   -> MergeInitFunc k v q x s
   -> MergeUpdateFunc' k v x p s
-  -> DynamicS x p
+  -> DynamicS x p -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x (DMap k v)
 mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
   initialParents :: DMap k q <- readBehaviorUntracked $ dynamicCurrent d
@@ -2014,6 +2014,7 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
   heightRef :: IORef Height <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
   heightBagRef :: IORef HeightBag <- liftIO $ newIORef $ error "merge: heightBagRef not yet initialized"
   parentsRef :: IORef (DMap k (MergeGSubscribed x s)) <- liftIO $ newIORef $ error "merge: parentsRef not yet initialized"
+  -- TODO: changeSubdRef only exists to retain the change subscriber, so type info could be destroyed without issue
   changeSubdRef :: IORef (Subscriber x p, EventSubscription x) <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
 
   let subscribed = EventSubscribed
@@ -2138,6 +2139,7 @@ mergeIntCheap d = Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight
   heightBagRef <- liftIO $ newIORef heightBagEmpty
   parents <- liftIO $ FastMutableIntMap.newEmpty
+  -- changeSubdRef only exists to retain the change subscriber, so type info could be destroyed without issue
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
   let subscribed = EventSubscribed
         { eventSubscribedHeightRef = heightRef
@@ -2322,6 +2324,7 @@ mergeMToEvent initM afterAnyOccurrenceM mergeM = Event $ \sub -> do
                else do  -- We have things accumulated, but we shouldn't have fired them yet
                  scheduleSelf
                  pure Nothing
+             
   return ( EventSubscription
            { _eventSubscription_unsubscribe = traverse_ unsubscribe =<< FastMutableIntMap.getFrozenAndClear parents
            , _eventSubscription_subscribed = subscribed
