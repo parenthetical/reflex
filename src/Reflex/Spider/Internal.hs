@@ -2238,7 +2238,6 @@ mergeMToEvent initM afterAnyOccurrenceM mergeM = Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight
   heightBagRef :: IORef HeightBag <- liftIO $ newIORef heightBagEmpty
   parents <- liftIO FastMutableIntMap.newEmpty
-  changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
   idCtrRef <- liftIO $ newIORef (0 :: Int)
   let makeId = liftIO $ do
         i <- readIORef idCtrRef
@@ -2246,7 +2245,7 @@ mergeMToEvent initM afterAnyOccurrenceM mergeM = Event $ \sub -> do
         pure i
   let subscribed = EventSubscribed
         { eventSubscribedHeightRef = heightRef
-        , eventSubscribedRetained = toAny (parents, changeSubdRef)
+        , eventSubscribedRetained = toAny parents
 #ifdef DEBUG_CYCLES
         , eventSubscribedGetParents = fmap (_eventSubscription_subscribed . snd) <$> FastMutableIntMap.toList parents
         , eventSubscribedHasOwnHeightRef = False
