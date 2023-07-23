@@ -2076,10 +2076,9 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
 
   (dm, heights, initialParentState) <- do
         subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
-          let subscriber = mergeSubscriber
           (s, theExtra) <- getInitialSubscriber k
           (subscription@(EventSubscription _ parentSubd), parentOcc) <-
-            subscribeAndRead (nt e) (subscriber s)
+            subscribeAndRead (nt e) (mergeSubscriber s)
           height <- liftIO $ getEventSubscribedHeight parentSubd
           return (fmap (k :=>) parentOcc, height, k :=> MergeGSubscribed subscription theExtra)
         return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
@@ -2108,16 +2107,11 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
               newParentHeight <- getEventSubscribedHeight subd
               modifyIORef' heightBagRef $ heightBagAdd newParentHeight
               pure $ MergeGSubscribed subscription theExtra
-  let updateMerge :: MergeUpdateFunc k v x p (MergeGSubscribed x s) -> p -> SomeMergeUpdate x
-      --TODO: Be able to run as much of this as possible promptly
-      updateMerge updateFunc p = SomeMergeUpdate invalidateMergeHeight revalidateMergeHeight $ do
+  let deferUpdateMerge c = defer $ SomeMergeUpdate invalidateMergeHeight revalidateMergeHeight $ do
          oldParents <- liftIO $ readIORef $ parentsRef
-         (subscriptionsToKill, newParents) <- updateFunc mergeSubscriber heightBagRef oldParents p
+         (subscriptionsToKill, newParents) <- updateFunc (subscribeParent mergeSubscriber) heightBagRef oldParents c
          liftIO $ writeIORef parentsRef $! newParents
-         return subscriptionsToKill
-
-  let deferUpdateMerge =
-        defer . updateMerge (\subscriber -> updateFunc (subscribeParent subscriber))
+         return subscriptionsToKill 
   -- Prepare new parents for insertion
   defer $ SomeMergeInit $ do
     let changeSubscriber = Subscriber
