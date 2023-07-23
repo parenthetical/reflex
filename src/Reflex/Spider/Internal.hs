@@ -27,7 +27,6 @@
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE RecursiveDo #-}
 
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
@@ -1942,7 +1941,7 @@ mergeCheapWithMove nt =
 
         return (toDelete, applyAlways p' oldParents)
       getInitialSubscriber :: MergeInitFunc k v q x (MergeSubscribedParentWithMove k)
-      getInitialSubscriber k = do
+      getInitialSubscriber (k :: k a) = do
           keyRef <- liftIO $ newIORef k
           pure (liftIO $ readIORef keyRef, MergeSubscribedParentWithMove keyRef)
 
@@ -2009,7 +2008,7 @@ mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarge
   -> MergeUpdateFunc' k v x p s
   -> DynamicS x p
   -> Event x (DMap k v)
-mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> mdo
+mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
   initialParents :: DMap k q <- readBehaviorUntracked $ dynamicCurrent d
   accumRef :: IORef (DMap k v) <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
   heightRef :: IORef Height <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
@@ -2035,16 +2034,16 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> mdo
          -- revalidateMergeHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
          when (currentHeight == invalidHeight) $ do
            heights <- readIORef $ heightBagRef
-           parents <- readIORef $ parentsRef
+           numParents <- fmap DMap.size $ readIORef $ parentsRef
            -- When the number of heights in the bag reaches the number of parents, we should have a valid height
-           case heightBagSize heights `compare` DMap.size parents of
+           case heightBagSize heights `compare` numParents of
              LT -> return ()
              EQ -> do
                let height = succHeight $ heightBagMax heights
                traceInvalidateHeight $ "recalculateSubscriberHeight: height: " <> show height
                writeIORef heightRef $! height
                subscriberRecalculateHeight sub height
-             GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show (DMap.size parents) <> ") for Merge"
+             GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show numParents <> ") for Merge"
   let scheduleMergeSelf :: Height -> EventM x ()
       scheduleMergeSelf height = scheduleMerge' height heightRef $ do
             vals <- liftIO $ readIORef $ accumRef
@@ -2053,8 +2052,9 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> mdo
             liftIO $ writeIORef accumRef $! DMap.empty
             --TODO: Assert that m is not empty
             subscriberPropagate sub vals
-  let mergeSubscriber :: EventM x (k a) -> Subscriber x (v a)
-      mergeSubscriber getKey = Subscriber
+  let mergeSubscriber :: forall a. EventM x (k a) -> Subscriber x (v a)
+      mergeSubscriber getKey =
+        Subscriber
         { subscriberPropagate = \a -> do
             oldM <- liftIO $ readIORef $ accumRef
             k <- getKey
@@ -2064,7 +2064,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> mdo
             when (DMap.null oldM) $ do -- Only schedule the firing once
               height <- liftIO $ readIORef $ heightRef
               checkCycle subscribed
-      
               scheduleMergeSelf height
         , subscriberInvalidateHeight = \old -> do --TODO: When removing a parent doesn't actually change the height, maybe we can avoid invalidating
             modifyIORef' heightBagRef $ heightBagRemove old
