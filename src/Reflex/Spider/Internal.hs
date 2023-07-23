@@ -1905,12 +1905,12 @@ mergeCheap nt =
               (mOldSubd, newPs) <- case me of
                 Nothing -> return $ DMap.updateLookupWithKey (\_ _ -> Nothing) k ps
                 Just e -> (\x -> DMap.insertLookupWithKey' (\_ new _ -> new) k x ps) <$> subscribeParent k (nt e)
-              forM_ mOldSubd $ \(MergeGSubscribed (parentSub, _)) -> do
+              forM_ mOldSubd $ \(MergeGSubscribed parentSub _) -> do
                 oldHeight <- liftIO $ getEventSubscribedHeight $
                   _eventSubscription_subscribed $ parentSub
 
                 liftIO $ modifyIORef heightBagRef $ heightBagRemove oldHeight
-              return (maybeToList ((\(MergeGSubscribed (sub, _)) -> sub) <$> mOldSubd) ++ subscriptionsToKill, newPs)
+              return (maybeToList ((\(MergeGSubscribed sub _) -> sub) <$> mOldSubd) ++ subscriptionsToKill, newPs)
         foldM f ([], oldParents) $ DMap.toList p
       getInitialSubscriber :: MergeInitFunc k v q x MergeSubscribedParent
       getInitialSubscriber = pure . (, MergeSubscribedParent ()) . pure
@@ -1928,7 +1928,7 @@ mergeCheapWithMove nt =
         p' <- PatchDMapWithMove.traversePatchDMapWithMoveWithKey (\k q -> subscribeParent k (nt q)) p
         -- Collect old parents for deletion and update the keys of moved parents
         let moveOrDelete :: forall a. k a -> PatchDMapWithMove.NodeInfo k q a -> MergeGSubscribed x (MergeSubscribedParentWithMove k) a -> Constant (EventM x (Maybe (EventSubscription x))) a
-            moveOrDelete _ ni (MergeGSubscribed (parentSub, MergeSubscribedParentWithMove parentKey)) = Constant $ case getComposeMaybe $ PatchDMapWithMove._nodeInfo_to ni of
+            moveOrDelete _ ni (MergeGSubscribed parentSub (MergeSubscribedParentWithMove parentKey)) = Constant $ case getComposeMaybe $ PatchDMapWithMove._nodeInfo_to ni of
               Nothing -> do
                 oldHeight <- liftIO $ getEventSubscribedHeight $ _eventSubscription_subscribed $ parentSub
                 liftIO $ modifyIORef heightBagRef $ heightBagRemove oldHeight
@@ -1994,7 +1994,10 @@ checkCycle subscribed = liftIO $ do
 #endif
 
 
-newtype MergeGSubscribed x s k = MergeGSubscribed (EventSubscription x, s k)
+data MergeGSubscribed x s k = MergeGSubscribed
+  { _mergeGSubscribed_subscription :: EventSubscription x
+  , _mergeGSubscribed_extra :: s k
+  }
 
 -- Type-checker isn't happy when lambda is avoided:
 {-# ANN mergeGCheap' "HLint: ignore Avoid lambda" #-}
@@ -2018,7 +2021,7 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
         , eventSubscribedRetained = toAny (parentsRef, changeSubdRef)
 #ifdef DEBUG_CYCLES
         , eventSubscribedGetParents =
-            fmap (\(_ :=> (MergeGSubscribed (theSub, _))) -> _eventSubscription_subscribed theSub)
+            fmap (\(_ :=> (MergeGSubscribed theSub _)) -> _eventSubscription_subscribed theSub)
             . DMap.toList
             <$> readIORef parentsRef
         , eventSubscribedHasOwnHeightRef = False
@@ -2078,8 +2081,7 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
           (subscription@(EventSubscription _ parentSubd), parentOcc) <-
             subscribeAndRead (nt e) (subscriber s)
           height <- liftIO $ getEventSubscribedHeight parentSubd
-          return (fmap (k :=>) parentOcc, height, k :=> MergeGSubscribed (subscription, theExtra))
-          
+          return (fmap (k :=>) parentOcc, height, k :=> MergeGSubscribed subscription theExtra)
         return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
                , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
                , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
@@ -2105,7 +2107,7 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
             liftIO $ do
               newParentHeight <- getEventSubscribedHeight subd
               modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-              pure $ MergeGSubscribed (subscription, theExtra)
+              pure $ MergeGSubscribed subscription theExtra
   let updateMerge :: MergeUpdateFunc k v x p (MergeGSubscribed x s) -> p -> SomeMergeUpdate x
       updateMerge updateFunc p = --TODO: Be able to run as much of this as possible promptly
         let updateMe = do
@@ -2133,7 +2135,7 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
     -- its subscription.
     liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
   let unsubscribeAll =
-          mapM_ (unsubscribe . (\(_ :=> (MergeGSubscribed (s', _))) -> s')) . DMap.toList =<< readIORef parentsRef
+          mapM_ (unsubscribe . (\(_ :=> (MergeGSubscribed s' _)) -> s')) . DMap.toList =<< readIORef parentsRef
 
   return (EventSubscription unsubscribeAll subscribed, occ)
 
