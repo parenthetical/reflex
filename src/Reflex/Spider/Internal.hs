@@ -2135,7 +2135,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
            , occ
            )
 
-
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt = cacheEvent . mergeIntCheap
 
@@ -2242,118 +2241,6 @@ mergeIntCheap d = Event $ \sub -> do
     liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
   let unsubscribeAll = traverse_ unsubscribe =<< FastMutableIntMap.getFrozenAndClear parents
   return (EventSubscription unsubscribeAll subscribed, occ)
-
-mergeMToEvent :: forall x a b. (HasSpiderTimeline x) => IO b -> (b -> IO a) -> (b -> MergeM x ()) -> Event x a
-mergeMToEvent initM afterAnyOccurrenceM mergeM = Event $ \sub -> do
-  heightRef <- liftIO $ newIORef zeroHeight
-  heightBagRef :: IORef HeightBag <- liftIO $ newIORef heightBagEmpty
-  parents <- liftIO FastMutableIntMap.newEmpty
-  idCtrRef <- liftIO $ newIORef (0 :: Int)
-  let makeId = liftIO $ do
-        i <- readIORef idCtrRef
-        modifyIORef idCtrRef succ
-        pure i
-  let subscribed = EventSubscribed
-        { eventSubscribedHeightRef = heightRef
-        , eventSubscribedRetained = toAny parents
-#ifdef DEBUG_CYCLES
-        , eventSubscribedGetParents = fmap (_eventSubscription_subscribed . snd) <$> FastMutableIntMap.toList parents
-        , eventSubscribedHasOwnHeightRef = False
-        , eventSubscribedWhoCreated = whoCreatedIORef heightRef
-#endif
-        }
-  initVal <- liftIO initM
-  let scheduleSelf = do
-        initialHeight <- liftIO $ readIORef heightRef
-        let scheduleMerge_ = scheduleMerge initialHeight $ do
-              height <- liftIO $ readIORef heightRef
-              currentHeight <- getCurrentHeight
-              case height `compare` currentHeight of
-                LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-                GT -> scheduleMerge_ -- The height has been increased (by a coincidence event; TODO: is this the only way?)
-                EQ -> do
-                  vals <- liftIO $ afterAnyOccurrenceM initVal
-                  subscriberPropagate sub vals
-        scheduleMerge_
-      invalidateMyHeight = invalidateMergeHeight' heightRef sub
-      recalculateMyHeight = do
-        currentHeight <- readIORef heightRef
-        when (currentHeight == invalidHeight) $ do --TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-          heights <- readIORef heightBagRef
-          numParents <- FastMutableIntMap.size parents
-          -- TODO: how is numParents comparable to the height bag?
-          -- TODO: what do LT/EQ cases mean?
-          case heightBagSize heights `compare` numParents of
-            LT -> return ()
-            EQ -> do
-              let height = succHeight $ heightBagMax heights
-              traceInvalidateHeight $ "recalculateSubscriberHeight: height: " <> show height
-              writeIORef heightRef $! height
-              subscriberRecalculateHeight sub height
-            GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show numParents <> ") for Merge"
-
-  hadOccurrenceRef <- liftIO $ newIORef False
-  runReaderT (mergeM initVal) $ WhenOccurs $ \p action -> do
-       k <- makeId
-       (subscription@(EventSubscription _ parentSubd), parentOcc) <- subscribeAndRead p $
-           Subscriber
-           { subscriberPropagate = \a -> do
-               checkCycle subscribed
-               hadOccurrence <- liftIO $ readIORef hadOccurrenceRef
-               liftIO $ action a
-               unless hadOccurrence
-                 scheduleSelf
-           , subscriberInvalidateHeight = \old -> do
-               modifyIORef' heightBagRef $ heightBagRemove old
-               invalidateMyHeight
-           , subscriberRecalculateHeight = \new -> do
-               modifyIORef' heightBagRef $ heightBagAdd new
-               recalculateMyHeight
-           }
-       forM_ parentOcc $ liftIO . action
-       liftIO $ do
-         FastMutableIntMap.insert parents k subscription
-         height <- getEventSubscribedHeight parentSubd
-         if height == invalidHeight
-           then writeIORef heightRef invalidHeight
-           else do
-             modifyIORef' heightBagRef $ heightBagAdd height
-             modifyIORef' heightRef $ \oldHeight ->
-               if oldHeight == invalidHeight
-               then invalidHeight
-               else max (succHeight height) oldHeight
-  hadOccurrence <- liftIO $ readIORef hadOccurrenceRef
-  occ <- if not hadOccurrence
-          then pure Nothing
-          else do
-             shouldWeHaveFired <- (>=) <$> getCurrentHeight <*> liftIO (readIORef heightRef) -- currentHeight >= myHeight
-             if shouldWeHaveFired
-               then liftIO $ Just <$> afterAnyOccurrenceM initVal
-               else do  -- We have things accumulated, but we shouldn't have fired them yet
-                 scheduleSelf
-                 pure Nothing
-             
-  return ( EventSubscription
-           { _eventSubscription_unsubscribe = traverse_ unsubscribe =<< FastMutableIntMap.getFrozenAndClear parents
-           , _eventSubscription_subscribed = subscribed
-           }
-         , occ
-         )
-
-data WhenOccurs x where
-  WhenOccurs :: (forall b. Event x b -> (b -> IO ()) -> EventM x ()) -> WhenOccurs x
-type MergeM x a = ReaderT (WhenOccurs x) (EventM x) a
-
-whenOccurs :: Event x a -> (a -> IO ()) -> MergeM x ()
-whenOccurs e action = do
-  WhenOccurs wo <- ask
-  lift $ wo e action
-
-mergeIntStatic :: forall x a. (HasSpiderTimeline x) => IntMap (Event x a) -> Event x (IntMap a)
-mergeIntStatic es =
-  mergeMToEvent FastMutableIntMap.newEmpty FastMutableIntMap.getFrozenAndClear $ \accum -> do
-    mapM_ (\(k,e) -> whenOccurs e (FastMutableIntMap.insert accum k)) (IntMap.toList es)
-
 
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
 newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
