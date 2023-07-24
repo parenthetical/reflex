@@ -2051,7 +2051,6 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
             -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
             -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
             liftIO $ writeIORef accumRef $! DMap.empty
-            --TODO: Assert that m is not empty
             subscriberPropagate sub vals
   let mergeSubscriber :: forall a. EventM x (k a) -> Subscriber x (v a)
       mergeSubscriber getKey =
