@@ -2099,30 +2099,32 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
     -- its subscription.
     liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
   do
-    (dm, heights, initialParentState) <- do
+    (dm, heights) <- do
           subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
             (s, theExtra) <- getInitialSubscriber k
             (subscription@(EventSubscription _ parentSubd), parentOcc) <-
               subscribeAndRead (nt e) (mergeSubscriber s)
             height <- liftIO $ getEventSubscribedHeight parentSubd
             return (fmap (k :=>) parentOcc, height, k :=> MergeGSubscribed subscription theExtra)
+          liftIO $ writeIORef parentsRef $! DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers -- initialParentsState
           return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
                  , fmap (\(_, h, _) -> h) subscribers --TODO: Assert that there's no invalidHeight in here
-                 , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
                  )
-    let myHeightBag = heightBagFromList $ filter (/= invalidHeight) heights
-        myHeight = if invalidHeight `elem` heights
-                   then invalidHeight
-                   else succHeight $ heightBagMax myHeightBag
-    currentHeight <- getCurrentHeight
-    let (occ, accum) = if currentHeight >= myHeight -- If we should have fired by now
-                       then (if DMap.null dm then Nothing else Just dm, DMap.empty)
-                       else (Nothing, dm)
-    unless (DMap.null accum) $ scheduleMergeSelf myHeight
-    liftIO $ writeIORef accumRef $! accum
+    myHeight <- do
+      let myHeightBag = heightBagFromList $ filter (/= invalidHeight) heights
+      liftIO $ writeIORef heightBagRef $! myHeightBag
+      pure $ if invalidHeight `elem` heights
+             then invalidHeight
+             else succHeight $ heightBagMax myHeightBag
     liftIO $ writeIORef heightRef $! myHeight
-    liftIO $ writeIORef heightBagRef $! myHeightBag
-    liftIO $ writeIORef parentsRef $! initialParentState
+    occ <- do
+      currentHeight <- getCurrentHeight
+      let (occ, accum) = if currentHeight >= myHeight -- If we should have fired by now
+             then (if DMap.null dm then Nothing else Just dm, DMap.empty)
+             else (Nothing, dm)
+      liftIO $ writeIORef accumRef $! accum
+      unless (DMap.null accum) $ scheduleMergeSelf myHeight
+      pure occ
     pure ( EventSubscription
              { _eventSubscription_unsubscribe =
                mapM_ (unsubscribe . (\(_ :=> (MergeGSubscribed s' _)) -> s'))
