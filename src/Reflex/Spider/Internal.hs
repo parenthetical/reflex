@@ -2014,7 +2014,7 @@ mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
   heightRef :: IORef Height <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
   heightBagRef :: IORef HeightBag <- liftIO $ newIORef $ error "merge: heightBagRef not yet initialized"
   parentsRef :: IORef (DMap k (MergeGSubscribed x s)) <- liftIO $ newIORef $ error "merge: parentsRef not yet initialized"
-  -- TODO: changeSubdRef only exists to retain the change subscriber, so type info could be destroyed without issue
+  -- TODO: changeSubdRef only exists to retain the change subscriber, so could type info be destroyed without issue?
   changeSubdRef :: IORef (Subscriber x p, EventSubscription x) <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
 
   let subscribed = EventSubscribed
