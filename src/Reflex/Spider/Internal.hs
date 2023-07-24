@@ -1899,7 +1899,7 @@ mergeCheap
 mergeCheap nt =
   mergeGCheap' nt getInitialSubscriber updateMe
   where
-      updateMe :: MergeUpdateFunc' k v x (PatchDMap k q) MergeSubscribedParent
+      updateMe :: MergeUpdateFunc k v x (PatchDMap k q) MergeSubscribedParent
       updateMe heightBagRef oldParents (PatchDMap p) subscribeParent = do
         let f (subscriptionsToKill, ps) (k :=> ComposeMaybe me) = do
               (mOldSubd, newPs) <- case me of
@@ -1923,7 +1923,7 @@ mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
 mergeCheapWithMove nt =
   mergeGCheap' nt getInitialSubscriber updateMe
   where
-      updateMe :: MergeUpdateFunc' k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove k)
+      updateMe :: MergeUpdateFunc k v x (PatchDMapWithMove k q) (MergeSubscribedParentWithMove k)
       updateMe heightBagRef oldParents p subscribeParent = do
         p' <- PatchDMapWithMove.traversePatchDMapWithMoveWithKey (\k q -> subscribeParent k (nt q)) p
         -- Collect old parents for deletion and update the keys of moved parents
@@ -1946,13 +1946,6 @@ mergeCheapWithMove nt =
           pure (liftIO $ readIORef keyRef, MergeSubscribedParentWithMove keyRef)
 
 type MergeUpdateFunc k v x p s
-   = (forall a. EventM x (k a) -> Subscriber x (v a))
-  -> IORef HeightBag
-  -> DMap k s
-  -> p
-  -> EventM x ([EventSubscription x], DMap k s)
-
-type MergeUpdateFunc' k v x p s
    = IORef HeightBag
   -> DMap k (MergeGSubscribed x s)
   -> p
@@ -2005,7 +1998,7 @@ data MergeGSubscribed x s k = MergeGSubscribed
 mergeGCheap' :: forall k v x p s q. (HasSpiderTimeline x, GCompare k, PatchTarget p ~ DMap k q)
   => (forall a. q a -> Event x (v a))
   -> MergeInitFunc k v q x s
-  -> MergeUpdateFunc' k v x p s
+  -> MergeUpdateFunc k v x p s
   -> DynamicS x p -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x (DMap k v)
 mergeGCheap' nt getInitialSubscriber updateFunc d = Event $ \sub -> do
