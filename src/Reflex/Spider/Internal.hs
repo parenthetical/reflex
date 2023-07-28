@@ -111,7 +111,7 @@ import Reflex.NotReady.Class
 import Data.Patch
 import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import Reflex.PerformEvent.Base (PerformEventT)
-import qualified Data.Patch.DMap as PatchDMap
+import Data.Patch.DMapWithMove (PatchDMapWithMove(..), From (..), nodeInfoMapFromM, NodeInfo (..))
 
 #ifdef DEBUG_TRACE_EVENTS
 import qualified Data.ByteString.Char8 as BS8
@@ -1904,7 +1904,8 @@ mergeCheap
   -> DynamicS x (PatchDMap k q)
   -> Event x (DMap k v)
 mergeCheap =
-  mergeGCheap' unMergeSubscribedParent getPerKeyState toDelete PatchDMap.traversePatchDMapWithKey
+  mergeGCheap' unMergeSubscribedParent getPerKeyState toDelete
+    (\f (PatchDMap p) -> DMap.traverseWithKey_ (\k (ComposeMaybe v) -> traverse_ (f k) v) p)
   where
     toDelete oldParents p =
              pure
@@ -1924,7 +1925,13 @@ mergeCheapWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   -> DynamicS x (PatchDMapWithMove k q)
   -> Event x (DMap k v)
 mergeCheapWithMove =
-  mergeGCheap' _mergeSubscribedParentWithMove_subscription getPerKeyState toDelete PatchDMapWithMove.traversePatchDMapWithMoveWithKey
+  mergeGCheap' _mergeSubscribedParentWithMove_subscription getPerKeyState toDelete
+  (\f (PatchDMapWithMove p) ->
+     DMap.traverseWithKey_ (\k (NodeInfo from _) ->
+                              case from of
+                                  From_Insert v -> f k v
+                                  _ -> pure ())
+     p)
   where
     -- Collect old parents for deletion and update the keys of moved parents
     toDelete oldParents p =
@@ -2034,23 +2041,20 @@ checkCycle subscribed = liftIO $ do
 
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q.
-  ( HasSpiderTimeline x, GCompare k, PatchTarget (p k q) ~ DMap k q
-  , PatchTarget (p k s) ~ DMap k s
-  , Patch (p k s)
-  )
+  ( HasSpiderTimeline x, GCompare k, PatchTarget (p k q) ~ DMap k q )
   => (forall a. s a -> EventSubscription x)
   -> MergeGetKeyStateFunc k v q x s
   -> MergeDestroyFunc k p q x s
-  -> ((forall a. (k a -> q a -> EventM x (s a))) -> p k q -> EventM x (p k s))
+  -> ((forall a. k a -> q a -> EventM x ()) -> p k q -> EventM x ())
   -> (forall a. q a -> Event x (v a))
   -> DynamicS x (p k q) -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x (DMap k v)
-mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = Event $ \sub -> do
+mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d = Event $ \sub -> do
   initialParents :: DMap k q <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ mempty
   heightRef <- liftIO $ newIORef $ zeroHeight
   heightBagRef <- liftIO $ newIORef $ heightBagEmpty
-  parentsRef :: IORef (DMap k s) <- liftIO $ newIORef $ error "merge: parentsRef not yet initialized"
+  parentsRef :: IORef (DMap k s) <- liftIO $ newIORef $ mempty
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
 
   let subscribed = EventSubscribed
@@ -2073,7 +2077,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
         , _merge_accumRef = accumRef
         }
   let {-# INLINE [1] mergeSubscribeAndRead #-}
-      mergeSubscribeAndRead :: forall a. Bool -> k a -> q a -> EventM x (s a)
+      mergeSubscribeAndRead :: forall a. Bool -> k a -> q a -> EventM x ()
       mergeSubscribeAndRead isInit k e = do -- !isInit == isUpdate
         (getKey, getSFromSub) <- getPerKeyState k
         let addAccum a = do
@@ -2113,9 +2117,8 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
                   then invalidHeight
                   else max (succHeight height) oldHeight
         mapM_ addAccum parentOcc
-        pure (getSFromSub subscription)
-  liftIO . (writeIORef parentsRef <=< evaluate) =<<
-    DMap.traverseWithKey (mergeSubscribeAndRead True) initialParents
+        liftIO $ modifyIORef' parentsRef (DMap.insert k (getSFromSub subscription))
+  DMap.traverseWithKey_ (mergeSubscribeAndRead True) initialParents
   myHeight <- liftIO $ readIORef heightRef
   currentHeight <- getCurrentHeight
   dm <- liftIO $ readIORef accumRef
@@ -2130,8 +2133,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
                 subsToKill <- subscriptionsToKillF oldParents p
                 forM_ subsToKill $ \subToKill -> do
                   liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
-                p' <- traversePatch (mergeSubscribeAndRead False) p
-                liftIO $ writeIORef parentsRef $! applyAlways p' oldParents
+                _ <- traversePatch_ (mergeSubscribeAndRead False) p
                 pure subsToKill
           -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
           -- just pass in the heightRef/sub?
