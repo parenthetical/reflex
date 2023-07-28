@@ -2118,19 +2118,21 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                <=< getEventSubscribedHeight . _eventSubscription_subscribed)
             _ <- traversePatch_ (mergeSubscribeAndRead False) p
             pure subsToKill
-    let changeSubscriber = Subscriber
+    (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
               deferUpdateMerge a
           , subscriberInvalidateHeight = \_ -> return ()
           , subscriberRecalculateHeight = \_ -> return ()
           }
-    (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) changeSubscriber
     forM_ change deferUpdateMerge
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
-    liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
+    -- TODO: changeSubscriber was also kept in changeSubdRef but I'm
+    -- not sure that's needed. If there are GC issues put it back.
+    -- (Tests don't fail.)
+    liftIO $ writeIORef changeSubdRef changeSubscription
   let unsubscribeAll = mapM_ (unsubscribe . (\(_ :=> s) -> getParent s))
                        . DMap.toList
                        =<< readIORef parentsRef
@@ -2218,19 +2220,20 @@ mergeIntCheap d = Event $ \sub -> do
             print ("updateMe", oldParentHeight)
             modifyIORef' heightBagRef $ heightBagRemove oldParentHeight
           return $ IntMap.elems oldParents
-    let changeSubscriber = Subscriber
+    (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) $ "SubscriberMergeInt/Change"
               updateMe a
           , subscriberInvalidateHeight = \_ -> return ()
           , subscriberRecalculateHeight = \_ -> return ()
           }
-    (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) changeSubscriber
     forM_ change updateMe
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
-    liftIO $ writeIORef changeSubdRef (changeSubscriber, changeSubscription)
+    -- TODO: changeSubscriber was also kept in changeSubdRef but I'm
+    -- not sure that's needed. If there are GC issues put it back.
+    liftIO $ writeIORef changeSubdRef changeSubscription
   let unsubscribeAll = traverse_ unsubscribe =<< FastMutableIntMap.getFrozenAndClear parents
 
 
