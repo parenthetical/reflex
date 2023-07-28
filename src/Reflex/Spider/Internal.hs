@@ -1052,9 +1052,9 @@ data SomeHoldInit x = forall p. Patch p => SomeHoldInit !(Hold x p)
 data SomeDynInit x = forall p. Patch p => SomeDynInit !(Dyn x p)
 
 data SomeMergeUpdate x = SomeMergeUpdate
-  { _someMergeUpdate_update :: !(EventM x [EventSubscription x])
-  , _someMergeUpdate_invalidateHeight :: !(IO ())
+  { _someMergeUpdate_invalidateHeight :: !(IO ())
   , _someMergeUpdate_recalculateHeight :: !(IO ())
+  , _someMergeUpdate_update :: !(EventM x [EventSubscription x])
   }
 
 newtype SomeMergeInit x = SomeMergeInit { unSomeMergeInit :: EventM x () }
@@ -2108,16 +2108,15 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
           --TODO: Be able to run as much of this as possible promptly
-          let updateMe = do
-                oldParents <- liftIO $ readIORef $ parentsRef
-                subsToKill <- subscriptionsToKillF oldParents p
-                forM_ subsToKill $ \subToKill -> do
-                  liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
-                _ <- traversePatch_ (mergeSubscribeAndRead False) p
-                pure subsToKill
           -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
           -- just pass in the heightRef/sub?
-          defer $ SomeMergeUpdate updateMe invalidateMyHeight recalculateMyHeight
+          defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
+            oldParents <- liftIO $ readIORef $ parentsRef
+            subsToKill <- subscriptionsToKillF oldParents p
+            forM_ subsToKill $ \subToKill -> do
+              liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
+            _ <- traversePatch_ (mergeSubscribeAndRead False) p
+            pure subsToKill
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
@@ -2171,7 +2170,6 @@ mergeIntCheap d = Event $ \sub -> do
       mySubscriber k = Subscriber
         { subscriberPropagate = \a -> do
             checkCycle subscribed
-
             wasEmpty <- liftIO $ FastMutableIntMap.isEmpty accum
             liftIO $ FastMutableIntMap.insert accum k a
             when wasEmpty scheduleSelf
@@ -2206,22 +2204,19 @@ mergeIntCheap d = Event $ \sub -> do
     else do when (not isEmpty) scheduleSelf -- We have things accumulated, but we shouldn't have fired them yet
             return Nothing
   defer $ SomeMergeInit $ do
-    let updateMe a = SomeMergeUpdate u invalidateMyHeight recalculateMyHeight
-          where
-            u = do
-              let f k newParent = do
-                    subscription@(EventSubscription _ subd) <- subscribe newParent $ mySubscriber k
-                    newParentHeight <- liftIO $ getEventSubscribedHeight subd
-                    liftIO $ modifyIORef' heightBagRef $ heightBagAdd newParentHeight
-                    return subscription
-              newSubscriptions <- FastMutableIntMap.traverseIntMapPatchWithKey f a
-              oldParents <- liftIO $ FastMutableIntMap.applyPatch parents newSubscriptions
-              liftIO $ for_ oldParents $ \oldParent -> do
-                oldParentHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed oldParent
-
-                print ("updateMe", oldParentHeight)
-                modifyIORef' heightBagRef $ heightBagRemove oldParentHeight
-              return $ IntMap.elems oldParents
+    let updateMe a = SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
+          let f k newParent = do
+                subscription@(EventSubscription _ subd) <- subscribe newParent $ mySubscriber k
+                newParentHeight <- liftIO $ getEventSubscribedHeight subd
+                liftIO $ modifyIORef' heightBagRef $ heightBagAdd newParentHeight
+                return subscription
+          newSubscriptions <- FastMutableIntMap.traverseIntMapPatchWithKey f a
+          oldParents <- liftIO $ FastMutableIntMap.applyPatch parents newSubscriptions
+          liftIO $ for_ oldParents $ \oldParent -> do
+            oldParentHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed oldParent
+            print ("updateMe", oldParentHeight)
+            modifyIORef' heightBagRef $ heightBagRemove oldParentHeight
+          return $ IntMap.elems oldParents
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) $ "SubscriberMergeInt/Change"
