@@ -2052,7 +2052,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
   let recalculateMyHeight = revalidateMergeHeight heightRef heightBagRef parentsRef sub DMap.size
   let {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead :: forall a. Bool -> k a -> q a -> EventM x ()
-      mergeSubscribeAndRead isInit k e = do -- !isInit == isUpdate
+      mergeSubscribeAndRead isInit k e = do -- not isInit == isUpdate
         (getKey, getSFromSub) <- getPerKeyState k
         let addAccum a = do
                  oldM <- liftIO $ readIORef $ accumRef
@@ -2069,7 +2069,6 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                      -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
                      -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
                      liftIO $ writeIORef accumRef $! DMap.empty
-                     --TODO: Assert that m is not empty
                      subscriberPropagate sub vals
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
           subscribeAndRead (nt e) $ Subscriber
@@ -2083,8 +2082,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                  recalculateMyHeight
              }
         height <- liftIO $ getEventSubscribedHeight parentSubd
-        -- TODO: In the original code invalidHeights are filtered out
-        -- of the heightBag when initializing. Is this needed/can it be done differently?
+        -- TODO: Can isInit be avoided?
         liftIO $ if not isInit
           then modifyIORef' heightBagRef $ heightBagAdd height -- new parent height
           else do
