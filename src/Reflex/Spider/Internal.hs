@@ -2031,27 +2031,6 @@ checkCycle subscribed = liftIO $ do
 #endif
 
 
-mergeSubscriber :: forall x k v s a. (HasSpiderTimeline x, GCompare k) => EventSubscribed x -> Merge x k v s -> EventM x (k a) -> Subscriber x (v a)
-mergeSubscriber subscribed m getKey = Subscriber
-  { subscriberPropagate = \a -> do
-      oldM <- liftIO $ readIORef $ _merge_accumRef m
-      k <- getKey
-      let newM = DMap.insertWith (error "Same key fired multiple times for Merge") k a oldM
-      tracePropagate (Proxy :: Proxy x) $ "  DMap.size oldM = " <> show (DMap.size oldM) <> "; DMap.size newM = " <> show (DMap.size newM)
-      liftIO $ writeIORef (_merge_accumRef m) $! newM
-      when (DMap.null oldM) $ do -- Only schedule the firing once
-        height <- liftIO $ readIORef $ _merge_heightRef m
-        checkCycle subscribed
-
-        scheduleMergeSelf m height
-  , subscriberInvalidateHeight = \old -> do --TODO: When removing a parent doesn't actually change the height, maybe we can avoid invalidating
-      modifyIORef' (_merge_heightBagRef m) $ heightBagRemove old
-      invalidateMergeHeight m
-  , subscriberRecalculateHeight = \new -> do
-      modifyIORef' (_merge_heightBagRef m) $ heightBagAdd new
-      revalidateMergeHeight m
-  }
-
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q.
   ( HasSpiderTimeline x, GCompare k, PatchTarget (p k q) ~ DMap k q
@@ -2092,13 +2071,32 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
         , _merge_sub = sub
         , _merge_accumRef = accumRef
         }
-  let -- TODO: updating accum should also go into this function (via inlining mergeSubscriber):
-      {-# INLINE [1] mergeSubscribeAndRead #-}
+  let {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead :: forall a. Bool -> DSum k q -> EventM x (s a, Maybe (v a))
       mergeSubscribeAndRead isInit (k :=> e) = do -- !isInit == isUpdate
-        (getKA, getSFromSub) <- getPerKeyState k
+        (getKey, getSFromSub) <- getPerKeyState k
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
-          subscribeAndRead (nt e) $ mergeSubscriber subscribed m getKA
+          subscribeAndRead (nt e) $ Subscriber
+             { subscriberPropagate = \a -> do
+                 -- TODO: factor out updating accum so that it can be used to initialize as well
+                 oldM <- liftIO $ readIORef $ accumRef
+                 k' <- getKey
+                 let newM = DMap.insertWith (error "Same key fired multiple times for Merge") k' a oldM
+                 tracePropagate (Proxy :: Proxy x) $ "  DMap.size oldM = "
+                   <> show (DMap.size oldM) <> "; DMap.size newM = " <> show (DMap.size newM)
+                 liftIO $ writeIORef accumRef $! newM
+                 when (DMap.null oldM) $ do -- Only schedule the firing once
+                   height <- liftIO $ readIORef $ heightRef
+                   checkCycle subscribed
+                   scheduleMergeSelf m height
+             , subscriberInvalidateHeight = \old -> do
+                 --TODO: When removing a parent doesn't actually change the height, maybe we can avoid invalidating
+                 modifyIORef' heightBagRef $ heightBagRemove old
+                 invalidateMergeHeight m
+             , subscriberRecalculateHeight = \new -> do
+                 modifyIORef' heightBagRef $ heightBagAdd new
+                 revalidateMergeHeight m
+             }
         height <- liftIO $ getEventSubscribedHeight parentSubd
         -- TODO: In the original code invalidHeights are filtered out
         -- of the heightBag when initializing. Is this needed/can it be done differently?
