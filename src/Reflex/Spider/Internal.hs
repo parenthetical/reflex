@@ -51,7 +51,7 @@ import Data.Coerce
 import Data.Dependent.Map (DMap)
 import qualified Data.Dependent.Map as DMap
 import Data.Dependent.Sum (DSum (..))
-import Data.FastMutableIntMap (FastMutableIntMap, PatchIntMap (..))
+import Data.FastMutableIntMap (FastMutableIntMap (..), PatchIntMap (..))
 import qualified Data.FastMutableIntMap as FastMutableIntMap
 import Data.Foldable hiding (concat, elem, sequence_)
 import Data.Functor.Constant
@@ -1971,14 +1971,6 @@ type MergeGetKeyStateFunc k v q x s
 type MergeDestroyFunc k p q x s
    = DMap k s -> p k q -> EventM x [EventSubscription x]
 
-data Merge x k v s = Merge
-  { _merge_parentsRef :: {-# UNPACK #-} !(IORef (DMap k s))
-  , _merge_heightBagRef :: {-# UNPACK #-} !(IORef HeightBag)
-  , _merge_heightRef :: {-# UNPACK #-} !(IORef Height)
-  , _merge_sub :: {-# UNPACK #-} !(Subscriber x (DMap k v))
-  , _merge_accumRef :: {-# UNPACK #-} !(IORef (DMap k v))
-  }
-
 invalidateMergeHeight' :: IORef Height -> Subscriber x a -> IO ()
 invalidateMergeHeight' heightRef sub = do
   oldHeight <- readIORef heightRef
@@ -1987,24 +1979,23 @@ invalidateMergeHeight' heightRef sub = do
     writeIORef heightRef $! invalidHeight
     subscriberInvalidateHeight sub oldHeight
 
--- TODO: this is the same as recalculateMyHeight from mergeIntCheap
-revalidateMergeHeight :: Merge x k v s -> IO ()
-revalidateMergeHeight m = do
-  currentHeight <- readIORef $ _merge_heightRef m
-
+revalidateMergeHeight :: IORef Height -> IORef HeightBag -> IORef p -> Subscriber x a -> (p -> Int) -> IO ()
+revalidateMergeHeight heightRef heightBagRef parentsRef sub parentsSize = do
+  currentHeight <- readIORef $ heightRef
   -- revalidateMergeHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
+  -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
   when (currentHeight == invalidHeight) $ do
-    heights <- readIORef $ _merge_heightBagRef m
-    parents <- readIORef $ _merge_parentsRef m
+    heights <- readIORef $ heightBagRef
+    parents <- readIORef $ parentsRef
     -- When the number of heights in the bag reaches the number of parents, we should have a valid height
-    case heightBagSize heights `compare` DMap.size parents of
+    case heightBagSize heights `compare` parentsSize parents of
       LT -> return ()
       EQ -> do
         let height = succHeight $ heightBagMax heights
         traceInvalidateHeight $ "recalculateSubscriberHeight: height: " <> show height
-        writeIORef (_merge_heightRef m) $! height
-        subscriberRecalculateHeight (_merge_sub m) height
-      GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show (DMap.size parents) <> ") for Merge"
+        writeIORef heightRef $! height
+        subscriberRecalculateHeight sub height
+      GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show (parentsSize parents) <> ") for Merge"
 
 checkCycle :: HasSpiderTimeline x => EventSubscribed x -> EventM x ()
 checkCycle subscribed = liftIO $ do
@@ -2057,14 +2048,8 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
         , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
       }
-      m = Merge
-        { _merge_parentsRef = parentsRef
-        , _merge_heightBagRef = heightBagRef
-        , _merge_heightRef = heightRef
-        , _merge_sub = sub
-        , _merge_accumRef = accumRef
-        }
   let invalidateMyHeight = invalidateMergeHeight' heightRef sub
+  let recalculateMyHeight = revalidateMergeHeight heightRef heightBagRef parentsRef sub DMap.size
   let {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead :: forall a. Bool -> k a -> q a -> EventM x ()
       mergeSubscribeAndRead isInit k e = do -- !isInit == isUpdate
@@ -2095,7 +2080,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                  invalidateMyHeight
              , subscriberRecalculateHeight = \new -> do
                  modifyIORef' heightBagRef $ heightBagAdd new
-                 revalidateMergeHeight m
+                 recalculateMyHeight
              }
         height <- liftIO $ getEventSubscribedHeight parentSubd
         -- TODO: In the original code invalidHeights are filtered out
@@ -2132,7 +2117,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                 pure subsToKill
           -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
           -- just pass in the heightRef/sub?
-          defer $ SomeMergeUpdate updateMe invalidateMyHeight (revalidateMergeHeight m)
+          defer $ SomeMergeUpdate updateMe invalidateMyHeight recalculateMyHeight
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
@@ -2180,19 +2165,9 @@ mergeIntCheap d = Event $ \sub -> do
           vals <- liftIO $ FastMutableIntMap.getFrozenAndClear accum
           subscriberPropagate sub vals
       invalidateMyHeight = invalidateMergeHeight' heightRef sub
-      recalculateMyHeight = do
-        currentHeight <- readIORef heightRef
-        when (currentHeight == invalidHeight) $ do --TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-          heights <- readIORef heightBagRef
-          numParents <- FastMutableIntMap.size parents
-          case heightBagSize heights `compare` numParents of
-            LT -> return ()
-            EQ -> do
-              let height = succHeight $ heightBagMax heights
-              traceInvalidateHeight $ "recalculateSubscriberHeight: height: " <> show height
-              writeIORef heightRef $! height
-              subscriberRecalculateHeight sub height
-            GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show numParents <> ") for Merge"
+      recalculateMyHeight =
+        let (FastMutableIntMap parentsRef) = parents
+        in revalidateMergeHeight heightRef heightBagRef parentsRef sub IntMap.size
       mySubscriber k = Subscriber
         { subscriberPropagate = \a -> do
             checkCycle subscribed

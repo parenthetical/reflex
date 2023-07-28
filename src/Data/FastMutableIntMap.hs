@@ -5,7 +5,7 @@
 -- Description:
 --   A mutable version of 'IntMap'
 module Data.FastMutableIntMap
-  ( FastMutableIntMap
+  ( FastMutableIntMap(..)
   , new
   , newEmpty
   , insert
