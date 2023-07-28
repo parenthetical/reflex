@@ -2045,7 +2045,7 @@ mergeGCheap' :: forall k v x p s q.
   -> DynamicS x (p k q) -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x (DMap k v)
 mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = Event $ \sub -> do
-  initialParents <- readBehaviorUntracked $ dynamicCurrent d
+  initialParents :: DMap k q <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ mempty
   heightRef <- liftIO $ newIORef $ zeroHeight
   heightBagRef <- liftIO $ newIORef $ heightBagEmpty
@@ -2072,8 +2072,8 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
         , _merge_accumRef = accumRef
         }
   let {-# INLINE [1] mergeSubscribeAndRead #-}
-      mergeSubscribeAndRead :: forall a. Bool -> DSum k q -> EventM x (s a)
-      mergeSubscribeAndRead isInit (k :=> e) = do -- !isInit == isUpdate
+      mergeSubscribeAndRead :: forall a. Bool -> k a -> q a -> EventM x (s a)
+      mergeSubscribeAndRead isInit k e = do -- !isInit == isUpdate
         (getKey, getSFromSub) <- getPerKeyState k
         let addAccum a = do
                  oldM <- liftIO $ readIORef $ accumRef
@@ -2112,19 +2112,15 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
                   then invalidHeight
                   else max (succHeight height) oldHeight
         mapM_ addAccum parentOcc
-        pure (unsafeCoerce (getSFromSub subscription)) -- FIXME: unsafeCoerce
-  initialParentState <- do
-    subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
-      sa <- mergeSubscribeAndRead True (k :=> e)
-      return (k :=> sa)
-    return $ DMap.fromDistinctAscList $ subscribers
+        pure (getSFromSub subscription)
+  liftIO . (writeIORef parentsRef <=< evaluate) =<<
+    DMap.traverseWithKey (mergeSubscribeAndRead True) initialParents
   myHeight <- liftIO $ readIORef heightRef
   currentHeight <- getCurrentHeight
   dm <- liftIO $ readIORef accumRef
   let occ = if currentHeight >= myHeight -- If we should have fired by now
             then (if DMap.null dm then Nothing else Just dm)
             else Nothing
-  liftIO $ writeIORef parentsRef $! initialParentState
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
           --TODO: Be able to run as much of this as possible promptly
@@ -2133,7 +2129,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
                 subsToKill <- subscriptionsToKillF oldParents p
                 forM_ subsToKill $ \subToKill -> do
                   liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
-                p' <- traversePatch (\k q -> mergeSubscribeAndRead False (k :=> q)) p
+                p' <- traversePatch (mergeSubscribeAndRead False) p
                 liftIO $ writeIORef parentsRef $! applyAlways p' oldParents
                 pure subsToKill
           defer $ SomeMergeUpdate updateMe (invalidateMergeHeight m) (revalidateMergeHeight m)
