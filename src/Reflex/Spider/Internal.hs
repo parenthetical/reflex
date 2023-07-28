@@ -2078,8 +2078,8 @@ mergeGCheap' :: forall k v x p s q.
 mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = Event $ \sub -> do
   initialParents <- readBehaviorUntracked $ dynamicCurrent d
   accumRef <- liftIO $ newIORef $ error "merge: accumRef not yet initialized"
-  heightRef <- liftIO $ newIORef $ error "merge: heightRef not yet initialized"
-  heightBagRef <- liftIO $ newIORef $ error "merge: heightBagRef not yet initialized"
+  heightRef <- liftIO $ newIORef $ zeroHeight
+  heightBagRef <- liftIO $ newIORef $ heightBagEmpty
   parentsRef :: IORef (DMap k s) <- liftIO $ newIORef $ error "merge: parentsRef not yet initialized"
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
 
@@ -2095,7 +2095,6 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
         , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
       }
-
       m = Merge
         { _merge_parentsRef = parentsRef
         , _merge_heightBagRef = heightBagRef
@@ -2103,33 +2102,42 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
         , _merge_sub = sub
         , _merge_accumRef = accumRef
         }
-  let getMergeSubscriberAndRead :: forall a. DSum k q -> EventM x ((Height, s a), Maybe (v a))
-      getMergeSubscriberAndRead (k :=> e) = do
+  let -- TODO: updating accum should also go into this function:
+      {-# INLINE [1] mergeSubscribeAndRead #-}
+      mergeSubscribeAndRead :: forall a. Bool -> DSum k q -> EventM x (s a, Maybe (v a))
+      mergeSubscribeAndRead isInit (k :=> e) = do -- !isInit == isUpdate
         (getKA, getSFromSub) <- getPerKeyState k
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
           subscribeAndRead (nt e) $ mergeSubscriber subscribed m getKA
         height <- liftIO $ getEventSubscribedHeight parentSubd
-        pure ((height, unsafeCoerce (getSFromSub subscription)), unsafeCoerce parentOcc) -- FIXME: unsafeCoerce
-  (dm, heights, initialParentState) <- do
+        -- TODO: In the original code invalidHeights are filtered out
+        -- of the heightBag when initializing. Is this needed/can it be done differently?
+        liftIO $ if not isInit
+          then modifyIORef' heightBagRef $ heightBagAdd height -- new parent height
+          else do
+            if height == invalidHeight
+              then writeIORef heightRef invalidHeight
+              else do
+                modifyIORef' heightBagRef $ heightBagAdd height
+                modifyIORef' heightRef $ \oldHeight ->
+                  if oldHeight == invalidHeight
+                  then invalidHeight
+                  else max (succHeight height) oldHeight
+        pure (unsafeCoerce (getSFromSub subscription), unsafeCoerce parentOcc) -- FIXME: unsafeCoerce
+  (dm, initialParentState) <- do
     subscribers <- forM (DMap.toList initialParents) $ \(k :=> e) -> do
-      ((height, sa), parentOcc) <- getMergeSubscriberAndRead (k :=> e)
-      return (fmap (k :=>) parentOcc, height, k :=> sa)
-    return ( DMap.fromDistinctAscList $ mapMaybe (\(x, _, _) -> x) subscribers
-           , fmap (\(_, h, _) -> h) subscribers -- TODO: Assert that there's no invalidHeight in here
-           , DMap.fromDistinctAscList $ map (\(_, _, x) -> x) subscribers
+      (sa, parentOcc) <- mergeSubscribeAndRead True (k :=> e)
+      return (fmap (k :=>) parentOcc, k :=> sa)
+    return ( DMap.fromDistinctAscList $ mapMaybe fst subscribers
+           , DMap.fromDistinctAscList $ map snd subscribers
            )
-  let myHeightBag = heightBagFromList $ filter (/= invalidHeight) heights
-      myHeight = if invalidHeight `elem` heights
-                 then invalidHeight
-                 else succHeight $ heightBagMax myHeightBag
+  myHeight <- liftIO $ readIORef heightRef
   currentHeight <- getCurrentHeight
   let (occ, accum) = if currentHeight >= myHeight -- If we should have fired by now
                      then (if DMap.null dm then Nothing else Just dm, DMap.empty)
                      else (Nothing, dm)
   unless (DMap.null accum) $ scheduleMergeSelf m myHeight
   liftIO $ writeIORef accumRef $! accum
-  liftIO $ writeIORef heightRef $! myHeight
-  liftIO $ writeIORef heightBagRef $! myHeightBag
   liftIO $ writeIORef parentsRef $! initialParentState
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
@@ -2137,13 +2145,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
                 subsToKill <- subscriptionsToKillF oldParents p
                 forM_ subsToKill $ \subToKill -> do
                   liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
-                p' <- traversePatch (\k q -> do
-                                        ((height, sa), _parentOcc) <-
-                                          getMergeSubscriberAndRead (k :=> q)
-                                        liftIO $ do
-                                          modifyIORef' heightBagRef $ heightBagAdd height -- new parent height
-                                          return sa)
-                      p
+                p' <- traversePatch (\k q -> fst <$> mergeSubscribeAndRead False (k :=> q)) p
                 pure (subsToKill, applyAlways p' oldParents)
           defer $ updateMerge subscribed m updateFunc p -- TODO: inline updateMerge & updateFunc
     let changeSubscriber = Subscriber
