@@ -2009,15 +2009,6 @@ revalidateMergeHeight m = do
         subscriberRecalculateHeight (_merge_sub m) height
       GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show (DMap.size parents) <> ") for Merge"
 
-scheduleMergeSelf :: HasSpiderTimeline x => Merge x k v s -> Height -> EventM x ()
-scheduleMergeSelf m height = scheduleMerge' height (_merge_heightRef m) $ do
-  vals <- liftIO $ readIORef $ _merge_accumRef m
-  -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
-  -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-  liftIO $ writeIORef (_merge_accumRef m) $! DMap.empty
-  --TODO: Assert that m is not empty
-  subscriberPropagate (_merge_sub m) vals
-
 checkCycle :: HasSpiderTimeline x => EventSubscribed x -> EventM x ()
 checkCycle subscribed = liftIO $ do
     height <- readIORef (eventSubscribedHeightRef subscribed)
@@ -2090,7 +2081,13 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                  when (DMap.null oldM) $ do -- Only schedule the firing once
                    height <- liftIO $ readIORef $ heightRef
                    checkCycle subscribed
-                   scheduleMergeSelf m height
+                   scheduleMerge' height heightRef $ do
+                     vals <- liftIO $ readIORef $ accumRef
+                     -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
+                     -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
+                     liftIO $ writeIORef accumRef $! DMap.empty
+                     --TODO: Assert that m is not empty
+                     subscriberPropagate sub vals
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
           subscribeAndRead (nt e) $ Subscriber
              { subscriberPropagate = addAccum
