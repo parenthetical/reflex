@@ -1983,6 +1983,7 @@ invalidateMergeHeight' heightRef sub = do
     writeIORef heightRef $! invalidHeight
     subscriberInvalidateHeight sub oldHeight
 
+-- TODO: this is the same as recalculateMyHeight from mergeIntCheap
 revalidateMergeHeight :: Merge x k v s -> IO ()
 revalidateMergeHeight m = do
   currentHeight <- readIORef $ _merge_heightRef m
@@ -2132,6 +2133,8 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
                 p' <- traversePatch (mergeSubscribeAndRead False) p
                 liftIO $ writeIORef parentsRef $! applyAlways p' oldParents
                 pure subsToKill
+          -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
+          -- just pass in the heightRef/sub?
           defer $ SomeMergeUpdate updateMe (invalidateMergeHeight m) (revalidateMergeHeight m)
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
