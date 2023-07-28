@@ -2121,11 +2121,12 @@ mergeGCheap' getParent getInitialSubscribers updateFunc destroy d = Event $ \sub
         { eventSubscribedHeightRef = heightRef
         , eventSubscribedRetained = toAny (parentsRef, changeSubdRef)
 #ifdef DEBUG_CYCLES
-      , eventSubscribedGetParents = do
-          let getParent' (_ :=> v) = _eventSubscription_subscribed (getParent v)
-          fmap getParent' . DMap.toList  <$> readIORef parentsRef
-      , eventSubscribedHasOwnHeightRef = False
-      , eventSubscribedWhoCreated = whoCreatedIORef heightRef
+        , eventSubscribedGetParents = do
+            fmap (\(_ :=> v) -> _eventSubscription_subscribed (getParent v))
+              . DMap.toList
+              <$> readIORef parentsRef
+        , eventSubscribedHasOwnHeightRef = False
+        , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
       }
 
