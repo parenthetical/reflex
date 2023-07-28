@@ -1979,9 +1979,6 @@ data Merge x k v s = Merge
   , _merge_accumRef :: {-# UNPACK #-} !(IORef (DMap k v))
   }
 
-invalidateMergeHeight :: Merge x k v s -> IO ()
-invalidateMergeHeight m = invalidateMergeHeight' (_merge_heightRef m) (_merge_sub m)
-
 invalidateMergeHeight' :: IORef Height -> Subscriber x a -> IO ()
 invalidateMergeHeight' heightRef sub = do
   oldHeight <- readIORef heightRef
@@ -2067,6 +2064,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
         , _merge_sub = sub
         , _merge_accumRef = accumRef
         }
+  let invalidateMyHeight = invalidateMergeHeight' heightRef sub
   let {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead :: forall a. Bool -> k a -> q a -> EventM x ()
       mergeSubscribeAndRead isInit k e = do -- !isInit == isUpdate
@@ -2094,7 +2092,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
              , subscriberInvalidateHeight = \old -> do
                  --TODO: When removing a parent doesn't actually change the height, maybe we can avoid invalidating
                  modifyIORef' heightBagRef $ heightBagRemove old
-                 invalidateMergeHeight m
+                 invalidateMyHeight
              , subscriberRecalculateHeight = \new -> do
                  modifyIORef' heightBagRef $ heightBagAdd new
                  revalidateMergeHeight m
@@ -2134,7 +2132,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
                 pure subsToKill
           -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
           -- just pass in the heightRef/sub?
-          defer $ SomeMergeUpdate updateMe (invalidateMergeHeight m) (revalidateMergeHeight m)
+          defer $ SomeMergeUpdate updateMe invalidateMyHeight (revalidateMergeHeight m)
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
