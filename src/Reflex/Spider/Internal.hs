@@ -2052,16 +2052,6 @@ mergeSubscriber subscribed m getKey = Subscriber
       revalidateMergeHeight m
   }
 
---TODO: Be able to run as much of this as possible promptly
-updateMerge :: (HasSpiderTimeline x, GCompare k) => EventSubscribed x -> Merge x k v s -> MergeUpdateFunc k v x p s -> p -> SomeMergeUpdate x
-updateMerge subscribed m updateFunc p = SomeMergeUpdate updateMe (invalidateMergeHeight m) (revalidateMergeHeight m)
-  where updateMe = do
-          oldParents <- liftIO $ readIORef $ _merge_parentsRef m
-          (subscriptionsToKill, newParents) <- updateFunc (mergeSubscriber subscribed m) (_merge_heightBagRef m) oldParents p
-          liftIO $ writeIORef (_merge_parentsRef m) $! newParents
-          return subscriptionsToKill
-
-
 {-# INLINE mergeGCheap' #-}
 mergeGCheap' :: forall k v x p s q.
   ( HasSpiderTimeline x, GCompare k, PatchTarget (p k q) ~ DMap k q
@@ -2102,7 +2092,7 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
         , _merge_sub = sub
         , _merge_accumRef = accumRef
         }
-  let -- TODO: updating accum should also go into this function:
+  let -- TODO: updating accum should also go into this function (via inlining mergeSubscriber):
       {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead :: forall a. Bool -> DSum k q -> EventM x (s a, Maybe (v a))
       mergeSubscribeAndRead isInit (k :=> e) = do -- !isInit == isUpdate
@@ -2141,13 +2131,16 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch nt d = 
   liftIO $ writeIORef parentsRef $! initialParentState
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
-          let updateFunc subscriber heightBagRef oldParents p = do
+          --TODO: Be able to run as much of this as possible promptly
+          let updateMe = do
+                oldParents <- liftIO $ readIORef $ parentsRef
                 subsToKill <- subscriptionsToKillF oldParents p
                 forM_ subsToKill $ \subToKill -> do
                   liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
                 p' <- traversePatch (\k q -> fst <$> mergeSubscribeAndRead False (k :=> q)) p
-                pure (subsToKill, applyAlways p' oldParents)
-          defer $ updateMerge subscribed m updateFunc p -- TODO: inline updateMerge & updateFunc
+                liftIO $ writeIORef parentsRef $! applyAlways p' oldParents
+                pure subsToKill
+          defer $ SomeMergeUpdate updateMe (invalidateMergeHeight m) (revalidateMergeHeight m)
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
