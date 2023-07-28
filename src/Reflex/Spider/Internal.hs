@@ -2204,7 +2204,7 @@ mergeIntCheap d = Event $ \sub -> do
     else do when (not isEmpty) scheduleSelf -- We have things accumulated, but we shouldn't have fired them yet
             return Nothing
   defer $ SomeMergeInit $ do
-    let updateMe a = SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
+    let updateMe a = defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
           let f k newParent = do
                 subscription@(EventSubscription _ subd) <- subscribe newParent $ mySubscriber k
                 newParentHeight <- liftIO $ getEventSubscribedHeight subd
@@ -2220,12 +2220,12 @@ mergeIntCheap d = Event $ \sub -> do
     let changeSubscriber = Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) $ "SubscriberMergeInt/Change"
-              defer $ updateMe a
+              updateMe a
           , subscriberInvalidateHeight = \_ -> return ()
           , subscriberRecalculateHeight = \_ -> return ()
           }
     (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) changeSubscriber
-    forM_ change $ \c -> defer $ updateMe c
+    forM_ change updateMe
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
