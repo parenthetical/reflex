@@ -2107,14 +2107,15 @@ mergeGCheap' getParent getPerKeyState subscriptionsToKillF traversePatch_ nt d =
             else Nothing
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
-          --TODO: Be able to run as much of this as possible promptly
+          -- TODO: Be able to run as much of this as possible promptly
           -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
           -- just pass in the heightRef/sub?
           defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
             oldParents <- liftIO $ readIORef $ parentsRef
             subsToKill <- subscriptionsToKillF oldParents p
-            forM_ subsToKill $ \subToKill -> do
-              liftIO $ modifyIORef heightBagRef . heightBagRemove <=< getEventSubscribedHeight $ _eventSubscription_subscribed $ subToKill
+            liftIO $ forM_ subsToKill $
+              (modifyIORef heightBagRef . heightBagRemove
+               <=< getEventSubscribedHeight . _eventSubscription_subscribed)
             _ <- traversePatch_ (mergeSubscribeAndRead False) p
             pure subsToKill
     let changeSubscriber = Subscriber
