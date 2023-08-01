@@ -1995,6 +1995,8 @@ merge :: forall x ip ipt o s.
   -> Event x o
 merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
  cacheEvent $ Event $ \sub -> do
+  -- TODO: is it worth caching the number of subscriptions?
+  --      This is now done with 'getNumSubs' but those functions traverse a tree.
   accumRef :: IORef o <- liftIO $ newIORef $ mempty
   heightRef <- liftIO $ newIORef $ zeroHeight
   heightBagRef <- liftIO $ newIORef $ heightBagEmpty
