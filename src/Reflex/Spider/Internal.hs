@@ -1902,36 +1902,42 @@ mergeInt =
   (fmap snd . IntMap.elems)
   IntMap.size
 
-mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
-  => (forall a. q a -> Event x (v a))
-  -> DynamicS x (PatchDMap k q) -> Event x (DMap k v)
-mergeG nt =
+{-# INLINE mergeG' #-}
+mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
+  => ( patch k q
+       -> DMap k (Constant (MergeM x (), EventSubscription x))
+       -> MergeRead x (DMap k v)
+       -> MergeM x (DMap k (Constant (MergeM x (), EventSubscription x))))
+  -> (forall a. q a -> Event x (v a))
+  -> DynamicS x (patch k q)
+  -> Event x (DMap k v)
+mergeG' doPatch nt =
   merge
   (\ipt (MergeRead tellE) ->
        DMap.traverseWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
        ipt)
+  doPatch
+  DMap.null
+  (fmap (\(_ :=> (Constant (_, sub))) -> sub) . DMap.toList)
+  DMap.size
+
+mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
+  => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMap k q) -> Event x (DMap k v)
+mergeG nt =
+  mergeG'
   (\ip s (MergeRead tellE) -> do
      ip' <- traversePatchDMapWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
      mapM_ (\(_ :=> v) -> fst $ getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
-     pure $ applyAlways  ip' s)
-  DMap.null
-  (fmap (\(_ :=> (Constant (_, sub))) -> sub) . DMap.toList)
-  DMap.size
-
+     pure $ applyAlways ip' s)
+  nt
 
 mergeWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
-  => (forall a. q a -> Event x (v a))
-  -> DynamicS x (PatchDMapWithMove k q)
-  -> Event x (DMap k v)
+  => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMapWithMove k q) -> Event x (DMap k v)
 mergeWithMove nt =
-  merge
-  (\ipt (MergeRead tellE) ->
-       DMap.traverseWithKey (\k v ->
-                               Constant <$> tellE (DMap.singleton k <$> nt v))
-       ipt)
+  mergeG'
   (\ip s (MergeRead tellE) -> do
      ip' <- traversePatchDMapWithMoveWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
@@ -1947,10 +1953,8 @@ mergeWithMove nt =
                     Nothing)
             (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
             s
-     pure $ applyAlways  ip' s)
-  DMap.null
-  (fmap (\(_ :=> (Constant (_, sub))) -> sub) . DMap.toList)
-  DMap.size
+     pure $ applyAlways ip' s)
+  nt
 
 checkCycle :: HasSpiderTimeline x => EventSubscribed x -> EventM x ()
 checkCycle subscribed = liftIO $ do
