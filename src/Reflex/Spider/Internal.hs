@@ -1984,23 +1984,22 @@ merge doInitialInput doPatchInput outputIsEmpty d =
   accumRef :: IORef o <- liftIO $ newIORef $ mempty
   heightRef <- liftIO $ newIORef $ zeroHeight
   heightBagRef <- liftIO $ newIORef $ heightBagEmpty
-  stateRef :: IORef s <- liftIO $ newIORef $ mempty
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
   -- TODO: not all these are needed when not debugging
   parentsIdCtr :: IORef Int <- liftIO $ newIORef 0
   parentsRef_ :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef mempty
   let subscribed = EventSubscribed
         { eventSubscribedHeightRef = heightRef
-#ifdef DEBUG_CYCLES
-        , eventSubscribedGetParents =
-            fmap  _eventSubscription_subscribed . IntMap.elems <$> readIORef parentsRef_
-        , eventSubscribedHasOwnHeightRef = False
-        , eventSubscribedWhoCreated = whoCreatedIORef heightRef
-#endif
-        -- TODO: This parentsRef also used to be retained but was
+        -- TODO: parentsRef also used to be retained but was
         -- omitted as an experiment. In case of GC issues put it
         -- back.
         , eventSubscribedRetained = toAny changeSubdRef
+#ifdef DEBUG_CYCLES
+        , eventSubscribedGetParents =
+            fmap _eventSubscription_subscribed . IntMap.elems <$> readIORef parentsRef_
+        , eventSubscribedHasOwnHeightRef = False
+        , eventSubscribedWhoCreated = whoCreatedIORef heightRef
+#endif
         }
   let invalidateMyHeight = do
           oldHeight <- readIORef heightRef
@@ -2028,17 +2027,21 @@ merge doInitialInput doPatchInput outputIsEmpty d =
       mergeSubscribeAndRead :: Bool -> Event x o -> MergeM x (MergeM x ())
       mergeSubscribeAndRead isInit e = do -- not isInit == isUpdate
         let addAccum !a = do
-                 oldM <- liftIO $ readIORef $ accumRef
-                 liftIO $ modifyIORef accumRef $! (a <>)
-                 when (outputIsEmpty oldM) $ do -- Only schedule the firing once
+                 oldAccum <- liftIO (readIORef $ accumRef)
+                 liftIO $ writeIORef accumRef $! (a <> oldAccum) -- left-biased generally but there shouldn't be dup'd keys
+                 when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
                    height <- liftIO $ readIORef $ heightRef
                    checkCycle subscribed
                    scheduleMerge' height heightRef $ do
                      vals <- liftIO $ readIORef $ accumRef
+                      -- TODO: this is an unfortunate effect of my
+                      -- attempt to use addAccum both at init time and
+                      -- update time.
+                     unless (outputIsEmpty vals) $ do
                      -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
                      -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                     liftIO $ writeIORef accumRef $! mempty
-                     subscriberPropagate sub vals
+                       liftIO $ writeIORef accumRef $! mempty
+                       subscriberPropagate sub vals
         -- TODO: is "subscribeAndReadWithThisPropagation" something handy? Avoids defining having to define and use addAccum twice here, and it might lead to more consistency everywhere.
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
           lift $ subscribeAndRead e $ Subscriber
@@ -2053,6 +2056,7 @@ merge doInitialInput doPatchInput outputIsEmpty d =
              }
         height <- liftIO $ getEventSubscribedHeight parentSubd
         -- TODO: Can isInit be avoided?
+        lift $ mapM_ addAccum parentOcc
         liftIO $ if not isInit
           then modifyIORef' heightBagRef $ heightBagAdd height -- new parent height
           else do
@@ -2064,25 +2068,32 @@ merge doInitialInput doPatchInput outputIsEmpty d =
                   if oldHeight == invalidHeight
                   then invalidHeight
                   else max (succHeight height) oldHeight
-        lift $ mapM_ addAccum parentOcc
         liftIO $ do
           i <- readIORef parentsIdCtr
-          modifyIORef parentsRef_ (IntMap.insert i subscription)
-          modifyIORef parentsIdCtr succ
+          modifyIORef' parentsRef_ (IntMap.insert i subscription)
+          modifyIORef' parentsIdCtr succ
           pure $ do
-            liftIO $ modifyIORef parentsRef_ (IntMap.delete i)
-            liftIO $ modifyIORef heightBagRef . heightBagRemove
-                 <=< getEventSubscribedHeight . _eventSubscription_subscribed $ subscription
+            liftIO $ modifyIORef' parentsRef_ (IntMap.delete i)
+            liftIO $ modifyIORef' heightBagRef . heightBagRemove
+                 <=< getEventSubscribedHeight . _eventSubscription_subscribed
+                 $ subscription
             W.tell [subscription]
-  subsToKillIllegal <- W.execWriterT (liftIO . writeIORef stateRef =<< flip doInitialInput (MergeRead (mergeSubscribeAndRead True))
-    =<< lift (readBehaviorUntracked (dynamicCurrent d)))
+  (stateRef, subsToKillIllegal) <- W.runWriterT $
+    liftIO . newIORef
+    =<< flip doInitialInput (MergeRead (mergeSubscribeAndRead True))
+    =<< lift (readBehaviorUntracked (dynamicCurrent d))
   unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
   myHeight <- liftIO $ readIORef heightRef
   currentHeight <- getCurrentHeight
-  dm <- liftIO $ readIORef accumRef
-  let occ = if currentHeight >= myHeight -- If we should have fired by now
-            then (if outputIsEmpty dm then Nothing else Just dm)
-            else Nothing
+  occ <- if currentHeight >= myHeight -- If we should have fired by now
+         then liftIO $ do
+           dm <- readIORef accumRef
+           if outputIsEmpty dm
+             then pure Nothing
+             else do
+               writeIORef accumRef mempty
+               pure $ Just dm
+         else pure Nothing
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
           -- TODO: Be able to run as much of this as possible promptly
@@ -2090,7 +2101,9 @@ merge doInitialInput doPatchInput outputIsEmpty d =
           -- just pass in the heightRef/sub?
           defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
             oldState <- liftIO $ readIORef stateRef
-            W.execWriterT (liftIO . writeIORef stateRef =<< doPatchInput p oldState (MergeRead (mergeSubscribeAndRead False)))
+            W.execWriterT $
+              liftIO . writeIORef stateRef
+              =<< doPatchInput p oldState (MergeRead (mergeSubscribeAndRead False))
     (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
