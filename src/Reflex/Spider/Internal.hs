@@ -1895,8 +1895,8 @@ mergeInt =
   (\ipt (MergeRead tellE) -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
   (\(PatchIntMap ip) s (MergeRead tellE) -> do
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
-     sequence_ $ IntMap.intersectionWith (\_ d -> d) ip s
-     pure $ applyAlways  (PatchIntMap ip') s)
+     sequence_ $ IntMap.intersection s ip
+     pure $ applyAlways (PatchIntMap ip') s)
   IntMap.null
 
 mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
