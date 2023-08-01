@@ -25,6 +25,7 @@
 {-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
 #endif
 {-# OPTIONS_GHC -Wunused-binds #-}
+{-# LANGUAGE TupleSections #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
@@ -1895,9 +1896,11 @@ mergeInt =
   (\ipt (MergeRead tellE) -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
   (\(PatchIntMap ip) s (MergeRead tellE) -> do
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
-     sequence_ $ IntMap.intersection s ip
+     traverse_ fst $ IntMap.intersection s ip
      pure $ applyAlways (PatchIntMap ip') s)
   IntMap.null
+  (fmap snd . IntMap.elems)
+  IntMap.size
 
 mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a))
@@ -1912,9 +1915,11 @@ mergeG nt =
      ip' <- traversePatchDMapWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
-     mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
+     mapM_ (\(_ :=> v) -> fst $ getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
      pure $ applyAlways  ip' s)
   DMap.null
+  (fmap (\(_ :=> (Constant (_, sub))) -> sub) . DMap.toList)
+  DMap.size
 
 
 mergeWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
@@ -1937,13 +1942,15 @@ mergeWithMove nt =
             (\_ to (Constant unsub) ->
                 Constant $ case getComposeMaybe to of
                   Nothing -> -- We are deleting/replacing
-                    Just unsub
-                  Just toKey -> do -- We are moving
+                    Just (fst unsub)
+                  Just _toKey -> do -- We are moving
                     Nothing)
             (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
             s
      pure $ applyAlways  ip' s)
   DMap.null
+  (fmap (\(_ :=> (Constant (_, sub))) -> sub) . DMap.toList)
+  DMap.size
 
 checkCycle :: HasSpiderTimeline x => EventSubscribed x -> EventM x ()
 checkCycle subscribed = liftIO $ do
@@ -1968,7 +1975,7 @@ checkCycle subscribed = liftIO $ do
 type MergeM x a = WriterT [EventSubscription x] (EventM x) a
 
 newtype MergeRead x a = MergeRead
-  { _tellE :: Event x a -> MergeM x (MergeM x ())
+  { _tellE :: Event x a -> MergeM x (MergeM x (), EventSubscription x)
   }
 
 {-# INLINE merge #-}
@@ -1977,26 +1984,23 @@ merge :: forall x ip ipt o s.
   => (ipt -> MergeRead x o -> MergeM x s)
   -> (ip -> s -> MergeRead x o -> MergeM x s)
   -> (o -> Bool)
+  -> (s -> [EventSubscription x])
+  -> (s -> Int)
   -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-merge doInitialInput doPatchInput outputIsEmpty d =
+merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
  cacheEvent $ Event $ \sub -> do
   accumRef :: IORef o <- liftIO $ newIORef $ mempty
   heightRef <- liftIO $ newIORef $ zeroHeight
   heightBagRef <- liftIO $ newIORef $ heightBagEmpty
-  changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
-  -- TODO: not all these are needed when not debugging
-  parentsIdCtr :: IORef Int <- liftIO $ newIORef 0
-  parentsRef_ :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef mempty
+  toRetainRef <- liftIO $ newIORef $ error "getMergeSubscribed: toRetainRef not yet initialized"
+  stateRef <- liftIO $ newIORef $ error "merge state not initialized"
   let subscribed = EventSubscribed
         { eventSubscribedHeightRef = heightRef
-        -- TODO: parentsRef also used to be retained but was
-        -- omitted as an experiment. In case of GC issues put it
-        -- back.
-        , eventSubscribedRetained = toAny changeSubdRef
+        , eventSubscribedRetained = toAny toRetainRef
 #ifdef DEBUG_CYCLES
         , eventSubscribedGetParents =
-            fmap _eventSubscription_subscribed . IntMap.elems <$> readIORef parentsRef_
+            fmap _eventSubscription_subscribed . getSubs <$> readIORef stateRef
         , eventSubscribedHasOwnHeightRef = False
         , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
@@ -2013,7 +2017,7 @@ merge doInitialInput doPatchInput outputIsEmpty d =
           -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
           when (currentHeight == invalidHeight) $ do
             heights <- readIORef $ heightBagRef
-            parentsCount <- IntMap.size <$> readIORef parentsRef_
+            parentsCount <- getNumSubs <$> readIORef stateRef
             -- When the number of heights in the bag reaches the number of parents, we should have a valid height
             case heightBagSize heights `compare` parentsCount of
               LT -> return ()
@@ -2024,7 +2028,6 @@ merge doInitialInput doPatchInput outputIsEmpty d =
                 subscriberRecalculateHeight sub height
               GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show parentsCount <> ") for Merge"
   let {-# INLINE [1] mergeSubscribeAndRead #-}
-      mergeSubscribeAndRead :: Bool -> Event x o -> MergeM x (MergeM x ())
       mergeSubscribeAndRead isInit e = do -- not isInit == isUpdate
         let addAccum !a = do
                  oldAccum <- liftIO (readIORef $ accumRef)
@@ -2069,17 +2072,13 @@ merge doInitialInput doPatchInput outputIsEmpty d =
                   then invalidHeight
                   else max (succHeight height) oldHeight
         liftIO $ do
-          i <- readIORef parentsIdCtr
-          modifyIORef' parentsRef_ (IntMap.insert i subscription)
-          modifyIORef' parentsIdCtr succ
-          pure $ do
-            liftIO $ modifyIORef' parentsRef_ (IntMap.delete i)
+          pure . (, subscription) $ do
             liftIO $ modifyIORef' heightBagRef . heightBagRemove
                  <=< getEventSubscribedHeight . _eventSubscription_subscribed
                  $ subscription
             W.tell [subscription]
-  (stateRef, subsToKillIllegal) <- W.runWriterT $
-    liftIO . newIORef
+  subsToKillIllegal <- W.execWriterT $
+    liftIO . writeIORef stateRef
     =<< flip doInitialInput (MergeRead (mergeSubscribeAndRead True))
     =<< lift (readBehaviorUntracked (dynamicCurrent d))
   unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
@@ -2115,14 +2114,10 @@ merge doInitialInput doPatchInput outputIsEmpty d =
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
-    -- TODO: changeSubscriber was also kept in changeSubdRef but I'm
-    -- not sure that's needed. If there are GC issues put it back.
-    -- (Tests don't fail.)
-    liftIO $ writeIORef changeSubdRef changeSubscription
-  -- FIXME: this does a lot more than what unsubscribeAll used to do
+    liftIO $ writeIORef toRetainRef (changeSubscription, stateRef)
   let unsubscribeAll = do
-        traverse_ unsubscribe =<< readIORef parentsRef_
-        writeIORef parentsRef_ mempty -- TODO: needed? mergeIntCheap did it
+        traverse_ unsubscribe . getSubs =<< readIORef stateRef
+        writeIORef stateRef mempty -- TOOD: needed/useful?
   return (EventSubscription unsubscribeAll subscribed, occ)
 
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
