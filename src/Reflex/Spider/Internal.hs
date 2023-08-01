@@ -1945,46 +1945,6 @@ mergeWithMove nt =
      pure $ applyAlways  ip' s)
   DMap.null
 
-type MergeUpdateFunc k v x p s
-   = (forall a. EventM x (k a) -> Subscriber x (v a))
-  -> IORef HeightBag
-  -> DMap k s
-  -> p
-  -> EventM x ([EventSubscription x], DMap k s)
-
-type MergeGetSubscription x s = forall a. s a -> EventSubscription x
-
-type MergeGetKeyStateFunc k v q x s
-   = forall a. k a -> EventM x (EventM x (k a), EventSubscription x -> s a)
-
--- TODO: delete when no longer used
-invalidateMergeHeight' :: IORef Height -> Subscriber x a -> IO ()
-invalidateMergeHeight' heightRef sub = do
-  oldHeight <- readIORef heightRef
-  -- If the height used to be valid, it must be invalid now; we should never have *more* heights than we have parents
-  when (oldHeight /= invalidHeight) $ do
-    writeIORef heightRef $! invalidHeight
-    subscriberInvalidateHeight sub oldHeight
-
--- TODO: delete when no longer used
-revalidateMergeHeight :: IORef Height -> IORef HeightBag -> IORef p -> Subscriber x a -> (p -> Int) -> IO ()
-revalidateMergeHeight heightRef heightBagRef parentsRef sub parentsSize = do
-  currentHeight <- readIORef $ heightRef
-  -- revalidateMergeHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
-  -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-  when (currentHeight == invalidHeight) $ do
-    heights <- readIORef $ heightBagRef
-    parents <- readIORef $ parentsRef
-    -- When the number of heights in the bag reaches the number of parents, we should have a valid height
-    case heightBagSize heights `compare` parentsSize parents of
-      LT -> return ()
-      EQ -> do
-        let height = succHeight $ heightBagMax heights
-        traceInvalidateHeight $ "recalculateSubscriberHeight: height: " <> show height
-        writeIORef heightRef $! height
-        subscriberRecalculateHeight sub height
-      GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show (parentsSize parents) <> ") for Merge"
-
 checkCycle :: HasSpiderTimeline x => EventSubscribed x -> EventM x ()
 checkCycle subscribed = liftIO $ do
     height <- readIORef (eventSubscribedHeightRef subscribed)
