@@ -888,6 +888,7 @@ instance HasSpiderTimeline x => Defer (SomeMergeInit x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvMergeInits
 
+-- TODO: this is only used in the 'merge' function thus obfuscates what's going on?
 class HasSpiderTimeline x => HasCurrentHeight x m | m -> x where
   getCurrentHeight :: m Height
   scheduleMerge :: Height -> EventM x () -> m ()
