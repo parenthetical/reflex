@@ -113,7 +113,8 @@ import qualified Data.Patch.DMap as PatchDMap
 import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import Reflex.PerformEvent.Base (PerformEventT)
 import Data.Patch.DMapWithMove (PatchDMapWithMove(..), From (..), nodeInfoMapFromM, NodeInfo (..))
-
+import qualified Control.Monad.Writer as W
+import Control.Monad.Writer (WriterT, MonadTrans (..))
 #ifdef DEBUG_TRACE_EVENTS
 import qualified Data.ByteString.Char8 as BS8
 import System.IO (stderr)
@@ -234,6 +235,8 @@ data EventSubscription x = EventSubscription
 
 unsubscribe :: EventSubscription x -> IO ()
 unsubscribe (EventSubscription u _) = u
+
+
 
 --------------------------------------------------------------------------------
 -- Event
@@ -1892,9 +1895,8 @@ mergeInt =
   (\ipt (MergeRead tellE) -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
   (\(PatchIntMap ip) s (MergeRead tellE) -> do
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
-     mapM_ liftIO $ IntMap.intersectionWith (\_ d -> d) ip s
+     sequence_ $ IntMap.intersectionWith (\_ d -> d) ip s
      pure $ applyAlways  (PatchIntMap ip') s)
-  sequence_
   IntMap.null
 
 mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
@@ -1910,9 +1912,8 @@ mergeG nt =
      ip' <- traversePatchDMapWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
-     mapM_ (\(_ :=> v) -> liftIO $ getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
+     mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
      pure $ applyAlways  ip' s)
-  (mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList)
   DMap.null
 
 
@@ -1936,13 +1937,12 @@ mergeWithMove nt =
             (\_ to (Constant unsub) ->
                 Constant $ case getComposeMaybe to of
                   Nothing -> -- We are deleting/replacing
-                    Just (liftIO unsub)
+                    Just unsub
                   Just toKey -> do -- We are moving
                     Nothing)
             (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
             s
      pure $ applyAlways  ip' s)
-  (mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList)
   DMap.null
 
 type MergeUpdateFunc k v x p s
@@ -2005,48 +2005,30 @@ checkCycle subscribed = liftIO $ do
           throwIO EventLoopException
 #endif
 
+type MergeM x a = WriterT [EventSubscription x] (EventM x) a
+
 newtype MergeRead x a = MergeRead
-  { _tellE :: Event x a -> EventM x (IO ())
+  { _tellE :: Event x a -> MergeM x (MergeM x ())
   }
 
 {-# INLINE merge #-}
 merge :: forall x ip ipt o s.
   ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Monoid s)
-  => (ipt -> MergeRead x o -> EventM x s)
-  -> (ip -> s -> MergeRead x o -> EventM x s)
-  -> (s -> IO ())
+  => (ipt -> MergeRead x o -> MergeM x s)
+  -> (ip -> s -> MergeRead x o -> MergeM x s)
   -> (o -> Bool)
   -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent $ Event $ \sub -> do
+merge doInitialInput doPatchInput outputIsEmpty d =
+ cacheEvent $ Event $ \sub -> do
   accumRef :: IORef o <- liftIO $ newIORef $ mempty
   heightRef <- liftIO $ newIORef $ zeroHeight
   heightBagRef <- liftIO $ newIORef $ heightBagEmpty
   stateRef :: IORef s <- liftIO $ newIORef $ mempty
   changeSubdRef <- liftIO $ newIORef $ error "getMergeSubscribed: changeSubdRef not yet initialized"
-  parentsCountRef <- liftIO $ newIORef (0 :: Int) -- TODO: make sure this is updated everywhere
-  subscriptionsToKillRef <- liftIO $ newIORef ([] :: [EventSubscription x]) -- FIXME: there could just be a global unsubscribe queue
   -- TODO: not all these are needed when not debugging
--- #ifdef DEBUG_CYCLES
   parentsIdCtr :: IORef Int <- liftIO $ newIORef 0
   parentsRef_ :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef mempty
--- #endif
-  let addNewParentSub :: EventSubscription x -> IO (IO ())
-      addNewParentSub psubscription = do
--- #ifdef DEBUG_CYCLES
-        i <- readIORef parentsIdCtr
-        modifyIORef parentsRef_ (IntMap.insert i psubscription)
-        modifyIORef parentsIdCtr succ
--- #endif
-        modifyIORef parentsCountRef succ
-        pure $ liftIO $ do
--- #ifdef DEBUG_CYCLES
-          modifyIORef parentsRef_ (IntMap.delete i)
--- #endif
-          modifyIORef heightBagRef . heightBagRemove
-               <=< getEventSubscribedHeight . _eventSubscription_subscribed $ psubscription
-          modifyIORef subscriptionsToKillRef (psubscription:)
-          modifyIORef parentsCountRef pred
   let subscribed = EventSubscribed
         { eventSubscribedHeightRef = heightRef
 #ifdef DEBUG_CYCLES
@@ -2072,7 +2054,7 @@ merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent 
           -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
           when (currentHeight == invalidHeight) $ do
             heights <- readIORef $ heightBagRef
-            parentsCount <- readIORef $ parentsCountRef
+            parentsCount <- IntMap.size <$> readIORef parentsRef_
             -- When the number of heights in the bag reaches the number of parents, we should have a valid height
             case heightBagSize heights `compare` parentsCount of
               LT -> return ()
@@ -2083,7 +2065,7 @@ merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent 
                 subscriberRecalculateHeight sub height
               GT -> error $ "revalidateMergeHeight: more heights (" <> show (heightBagSize heights) <> ") than parents (" <> show parentsCount <> ") for Merge"
   let {-# INLINE [1] mergeSubscribeAndRead #-}
-      mergeSubscribeAndRead :: Bool -> Event x o -> EventM x (IO ())
+      mergeSubscribeAndRead :: Bool -> Event x o -> MergeM x (MergeM x ())
       mergeSubscribeAndRead isInit e = do -- not isInit == isUpdate
         let addAccum !a = do
                  oldM <- liftIO $ readIORef $ accumRef
@@ -2099,7 +2081,7 @@ merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent 
                      subscriberPropagate sub vals
         -- TODO: is "subscribeAndReadWithThisPropagation" something handy? Avoids defining having to define and use addAccum twice here, and it might lead to more consistency everywhere.
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
-          subscribeAndRead e $ Subscriber
+          lift $ subscribeAndRead e $ Subscriber
              { subscriberPropagate = addAccum
              , subscriberInvalidateHeight = \old -> do
                  --TODO: When removing a parent doesn't actually change the height, maybe we can avoid invalidating
@@ -2122,9 +2104,19 @@ merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent 
                   if oldHeight == invalidHeight
                   then invalidHeight
                   else max (succHeight height) oldHeight
-        mapM_ addAccum parentOcc
-        liftIO $ addNewParentSub subscription
-  liftIO . writeIORef stateRef =<< flip doInitialInput (MergeRead (mergeSubscribeAndRead True)) =<< readBehaviorUntracked (dynamicCurrent d)
+        lift $ mapM_ addAccum parentOcc
+        liftIO $ do
+          i <- readIORef parentsIdCtr
+          modifyIORef parentsRef_ (IntMap.insert i subscription)
+          modifyIORef parentsIdCtr succ
+          pure $ do
+            liftIO $ modifyIORef parentsRef_ (IntMap.delete i)
+            liftIO $ modifyIORef heightBagRef . heightBagRemove
+                 <=< getEventSubscribedHeight . _eventSubscription_subscribed $ subscription
+            W.tell [subscription]
+  subsToKillIllegal <- W.execWriterT (liftIO . writeIORef stateRef =<< flip doInitialInput (MergeRead (mergeSubscribeAndRead True))
+    =<< lift (readBehaviorUntracked (dynamicCurrent d)))
+  unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
   myHeight <- liftIO $ readIORef heightRef
   currentHeight <- getCurrentHeight
   dm <- liftIO $ readIORef accumRef
@@ -2138,10 +2130,7 @@ merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent 
           -- just pass in the heightRef/sub?
           defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
             oldState <- liftIO $ readIORef stateRef
-            liftIO . writeIORef stateRef =<< doPatchInput p oldState (MergeRead (mergeSubscribeAndRead False))
-            subsToKill <- liftIO $ readIORef subscriptionsToKillRef
-            liftIO $ writeIORef subscriptionsToKillRef []
-            pure subsToKill
+            W.execWriterT (liftIO . writeIORef stateRef =<< doPatchInput p oldState (MergeRead (mergeSubscribeAndRead False)))
     (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
@@ -2158,7 +2147,9 @@ merge doInitialInput doPatchInput doUnsubscribeAll outputIsEmpty d = cacheEvent 
     -- (Tests don't fail.)
     liftIO $ writeIORef changeSubdRef changeSubscription
   -- FIXME: this does a lot more than what unsubscribeAll used to do
-  let unsubscribeAll = traverse_ unsubscribe =<< readIORef parentsRef_
+  let unsubscribeAll = do
+        traverse_ unsubscribe =<< readIORef parentsRef_
+        writeIORef parentsRef_ mempty -- TODO: needed? mergeIntCheap did it
   return (EventSubscription unsubscribeAll subscribed, occ)
 
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
