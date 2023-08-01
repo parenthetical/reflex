@@ -1331,15 +1331,6 @@ run roots after = do
   tracePropagate (Proxy :: Proxy x) "Done running an event frame"
   return result
 
-scheduleMerge' :: HasSpiderTimeline x => Height -> IORef Height -> EventM x () -> EventM x ()
-scheduleMerge' initialHeight heightRef a = scheduleMerge initialHeight $ do
-  height <- liftIO $ readIORef heightRef
-  currentHeight <- getCurrentHeight
-  case height `compare` currentHeight of
-    LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-    GT -> scheduleMerge' height heightRef a -- The height has been increased (by a coincidence event; TODO: is this the only way?)
-    EQ -> a
-
 newtype Clear a = Clear (IORef (Maybe a))
 
 newtype IntClear a = IntClear (IORef (IntMap a))
@@ -2040,18 +2031,27 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
                  oldAccum <- liftIO (readIORef $ accumRef)
                  liftIO $ writeIORef accumRef $! (a <> oldAccum) -- left-biased generally but there shouldn't be dup'd keys
                  when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
-                   height <- liftIO $ readIORef $ heightRef
                    checkCycle subscribed
-                   scheduleMerge' height heightRef $ do
-                     vals <- liftIO $ readIORef $ accumRef
-                      -- TODO: this is an unfortunate effect of my
-                      -- attempt to use addAccum both at init time and
-                      -- update time.
-                     unless (outputIsEmpty vals) $ do
-                     -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
-                     -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                       liftIO $ writeIORef accumRef $! mempty
-                       subscriberPropagate sub vals
+                   let scheduleMerge' initialHeight = do
+                         scheduleMerge initialHeight $ do
+                           height <- liftIO $ readIORef heightRef
+                           currentHeight <- getCurrentHeight
+                           case height `compare` currentHeight of
+                             LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+                             -- The height has been increased (by a coincidence event;
+                             -- TODO: is this the only way?)
+                             GT -> scheduleMerge' height
+                             EQ -> do
+                               vals <- liftIO $ readIORef $ accumRef
+                                -- TODO: this is an unfortunate effect of my
+                                -- attempt to use addAccum both at init time and
+                                -- update time.
+                               unless (outputIsEmpty vals) $ do
+                               -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
+                               -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
+                                 liftIO $ writeIORef accumRef $! mempty
+                                 subscriberPropagate sub vals
+                   scheduleMerge' <=< liftIO $ readIORef heightRef
         -- TODO: is "subscribeAndReadWithThisPropagation" something handy? Avoids defining having to define and use addAccum twice here, and it might lead to more consistency everywhere.
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
           lift $ subscribeAndRead e $ Subscriber
