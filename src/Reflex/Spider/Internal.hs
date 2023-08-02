@@ -113,13 +113,11 @@ import Data.Patch
 import qualified Data.Patch.DMap as PatchDMap
 import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import Reflex.PerformEvent.Base (PerformEventT)
-import Data.Patch.DMapWithMove (PatchDMapWithMove(..), From (..), nodeInfoMapFromM, NodeInfo (..))
 import qualified Control.Monad.Writer as W
-import Control.Monad.Writer (WriterT, MonadTrans (..))
+import Control.Monad.Writer (WriterT)
 #ifdef DEBUG_TRACE_EVENTS
 import qualified Data.ByteString.Char8 as BS8
 import System.IO (stderr)
-import Data.List (isPrefixOf)
 #endif
 
 -- TODO stdout might not be the best channel for debug output
