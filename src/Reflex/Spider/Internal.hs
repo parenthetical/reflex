@@ -1096,11 +1096,10 @@ heightBagRemove (Height h) b@(HeightBag s c) = heightBagVerify $ case IntMap.loo
     _ -> IntMap.insert h (pred old) c
 
 heightBagRemoveMaybe :: Height -> HeightBag -> Maybe HeightBag
-heightBagRemoveMaybe (Height h) b@(HeightBag s c) = heightBagVerify . removed <$> IntMap.lookup h c where
+heightBagRemoveMaybe (Height h) (HeightBag s c) = heightBagVerify . removed <$> IntMap.lookup h c where
   removed old = HeightBag (pred s) $ case old of
     0 -> IntMap.delete h c
     _ -> IntMap.insert h (pred old) c
-
 
 heightBagMax :: HeightBag -> Height
 heightBagMax (HeightBag _ c) = case IntMap.maxViewWithKey c of
@@ -1464,7 +1463,7 @@ filterStack :: String -> [String] -> [String]
 #ifdef DEBUG_HIDE_INTERNALS
 filterStack prefix = filter (not . (prefix `isPrefixOf`))
 #else
-filterStack prefix = id
+filterStack _prefix = id
 #endif
 
 #ifdef DEBUG_CYCLES
