@@ -2367,8 +2367,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE buildDynamic #-}
   buildDynamic = buildDynamicSpiderEventM
   {-# INLINABLE headE #-}
-  headE = R.slowHeadE
---  headE (SpiderEvent e) = SpiderEvent <$> Reflex.Spider.Internal.headE e
+--  headE = R.slowHeadE
+  headE (SpiderEvent e) = SpiderEvent <$> Reflex.Spider.Internal.headE e
   {-# INLINABLE now #-}
   now = nowSpiderEventM
 
@@ -2390,8 +2390,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE buildDynamic #-}
   buildDynamic getV0 (SpiderEvent e) = SpiderPushM $ fmap (SpiderDynamic . dynamicDynIdentity) $ Reflex.Spider.Internal.buildDynamic (coerce getV0) $ coerce e
   {-# INLINABLE headE #-}
-  headE = R.slowHeadE
---  headE (SpiderEvent e) = SpiderPushM $ SpiderEvent <$> Reflex.Spider.Internal.headE e
+  -- headE = R.slowHeadE
+  headE (SpiderEvent e) = SpiderPushM $ SpiderEvent <$> Reflex.Spider.Internal.headE e
   {-# INLINABLE now #-}
   now = SpiderPushM nowSpiderEventM
 
@@ -2475,8 +2475,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE buildDynamic #-}
   buildDynamic getV0 e = SpiderHostFrame $ fmap (SpiderDynamic . dynamicDynIdentity) $ Reflex.Spider.Internal.buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
   {-# INLINABLE headE #-}
-  headE = R.slowHeadE
---  headE (SpiderEvent e) = SpiderHostFrame $ SpiderEvent <$> Reflex.Spider.Internal.headE e
+  -- headE = R.slowHeadE
+  headE (SpiderEvent e) = SpiderHostFrame $ SpiderEvent <$> Reflex.Spider.Internal.headE e
   {-# INLINABLE now #-}
   now = SpiderHostFrame Reflex.Class.now
 
