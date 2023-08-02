@@ -2224,13 +2224,6 @@ runFrame a = SpiderHost $ do
     --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
     sub <- newSubscriberSwitch subscribed
     subscription <- unSpiderHost $ runFrame $ {-# SCC "subscribeSwitch" #-} subscribe e sub --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-    {-
-    stackTrace <- liftIO $ fmap renderStack $ ccsToStrings =<< (getCCSOf $! switchSubscribedParent subscribed)
-    liftIO $ debugStrLn $ (++stackTrace) $ "subd' subscribed to " ++ case e of
-      EventRoot _ -> "EventRoot"
-      EventNever -> "EventNever"
-      _ -> "something else"
-    -}
     writeIORef (switchSubscribedCurrentParent subscribed) $! subscription
     return oldSubscription
   liftIO $ mapM_ unsubscribe mergeSubscriptionsToKill
