@@ -1069,13 +1069,6 @@ newtype SomeMergeInit x = SomeMergeInit { unSomeMergeInit :: EventM x () }
 newtype EventM x a = EventM { unEventM :: IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
 
-newtype MergeSubscribedParent x a = MergeSubscribedParent { unMergeSubscribedParent :: EventSubscription x }
-
-data MergeSubscribedParentWithMove x k a = MergeSubscribedParentWithMove
-  { _mergeSubscribedParentWithMove_subscription :: !(EventSubscription x)
-  , _mergeSubscribedParentWithMove_key :: !(IORef (k a))
-  }
-
 data HeightBag = HeightBag
   { _heightBag_size :: {-# UNPACK #-} !Int
   , _heightBag_contents :: !(IntMap Word) -- Number of excess in each bucket
