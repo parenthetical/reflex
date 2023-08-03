@@ -1232,7 +1232,7 @@ switch :: HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = unsafePerformIO $ do
   subscribedRef :: IORef (Maybe (SwitchSubscribed x a)) <- newIORef Nothing
   pure $ Event
-    $ wrap (\(!subscribed) ->
+    $ wrap (\(!subscribed :: SwitchSubscribed x a) ->
               EventSubscribed
               { eventSubscribedHeightRef = (commonSubscribedHeight . switchSubscribedCommon) subscribed
               , eventSubscribedRetained = toAny subscribed
@@ -1273,7 +1273,7 @@ coincidence :: HasSpiderTimeline x => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = unsafePerformIO $ do
   subscribedRef <- newIORef Nothing
   pure $ Event
-    $ wrap (\(!subscribed) ->
+    $ wrap (\(!subscribed :: CoincidenceSubscribed x a) ->
                EventSubscribed
                { eventSubscribedHeightRef = (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
                , eventSubscribedRetained = toAny subscribed
