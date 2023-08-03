@@ -1238,18 +1238,9 @@ switch switchParent =
     (\subscribed -> do
        unsubscribe =<< readIORef (switchSubscribedCurrentParent subscribed)
        finalize =<< readIORef (switchSubscribedOwnWeakInvalidator subscribed)) -- We don't need to get invalidated if we're dead
-    (\(!subscribed :: SwitchSubscribed x a) ->
-              EventSubscribed
-              { eventSubscribedHeightRef = (commonSubscribedHeight . switchSubscribedCommon) subscribed
-              , eventSubscribedRetained = toAny subscribed
-#ifdef DEBUG_CYCLES
-              , eventSubscribedGetParents = do
-                  s <- readIORef $ switchSubscribedCurrentParent subscribed
-                  return [_eventSubscription_subscribed s]
-              , eventSubscribedHasOwnHeightRef = True
-              , eventSubscribedWhoCreated = whoCreatedIORef $ (commonSubscribedCachedSubscribed . switchSubscribedCommon) subscribed
-#endif
-              })
+    (\subscribed -> do
+        s <- readIORef $ switchSubscribedCurrentParent subscribed
+        return [_eventSubscription_subscribed s])
     (\subscribedUnsafe -> do
         i <- liftIO $ newInvalidatorSwitch subscribedUnsafe
         mySub <- liftIO $ newSubscriberSwitch subscribedUnsafe
@@ -1277,20 +1268,11 @@ coincidence coincidenceParent =
   commonEvent
   coincidenceSubscribedCommon
   (unsubscribe . coincidenceSubscribedOuterParent)
-  (\(!subscribed :: CoincidenceSubscribed x a) ->
-             EventSubscribed
-             { eventSubscribedHeightRef = (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
-             , eventSubscribedRetained = toAny subscribed
-#ifdef DEBUG_CYCLES
-             , eventSubscribedGetParents = do
-                 innerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribed
-                 let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribed
-                     innerParents = maybeToList $ innerSubscription
-                 return $ outerParent : innerParents
-             , eventSubscribedHasOwnHeightRef = True
-             , eventSubscribedWhoCreated = whoCreatedIORef $ (commonSubscribedCachedSubscribed . coincidenceSubscribedCommon) subscribed
-#endif
-             })    
+  (\subscribed -> do
+    innerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribed
+    let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribed
+        innerParents = maybeToList $ innerSubscription
+    return $ outerParent : innerParents)
   (\subscribedUnsafe -> do
         -- TODO: is there a shared pattern with newSubscribedCoincidenceOuter and newSubscriberSwitch?
         subOuter <- liftIO $ newSubscriberCoincidenceOuter subscribedUnsafe
@@ -1786,12 +1768,24 @@ subscribeFanSubscribed k subscribed sub = do
 commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> CommonSubscribed s x a) ->
   (s x a -> IO ()) ->
-  (s x a -> EventSubscribed x) ->
+  (s x a -> (IO [EventSubscribed x])) ->
   (s x a -> EventM x (Maybe a, Height, CommonSubscribed s x a -> s x a)) ->
   Event x a
-commonEvent subscribedCommon cleanupSpecific tag foo = unsafePerformIO $ do
+commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
   subscribedRef__ :: IORef (Maybe (s x a)) <- newIORef Nothing
-  pure $ Event $ wrap tag $ \sub -> do
+  pure $ Event $ wrap
+            (\(!subscribed :: s x a) ->
+              EventSubscribed
+              { eventSubscribedHeightRef = (commonSubscribedHeight . subscribedCommon) subscribed
+              , eventSubscribedRetained = toAny subscribed
+#ifdef DEBUG_CYCLES
+              , eventSubscribedGetParents = eventSubscribedGetParents_ subscribed
+              , eventSubscribedHasOwnHeightRef = True
+              , eventSubscribedWhoCreated = whoCreatedIORef
+                                            $ (commonSubscribedCachedSubscribed . subscribedCommon) subscribed
+#endif
+              })  
+    $ \sub -> do
     mSubscribed <- liftIO $ readIORef $ subscribedRef__
     let cleanup subscribed = do
           cleanupSpecific subscribed
