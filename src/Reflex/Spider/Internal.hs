@@ -1232,10 +1232,13 @@ pull a = unsafePerformIO $ do
 
 {-# INLINABLE switch #-}
 switch :: HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switch switchParent = unsafePerformIO $ do
-  subscribedRef :: IORef (Maybe (SwitchSubscribed x a)) <- newIORef Nothing
-  pure $ Event
-    $ wrap (\(!subscribed :: SwitchSubscribed x a) ->
+switch switchParent = 
+    commonEvent
+    switchSubscribedCommon
+    (\subscribed -> do
+       unsubscribe =<< readIORef (switchSubscribedCurrentParent subscribed)
+       finalize =<< readIORef (switchSubscribedOwnWeakInvalidator subscribed)) -- We don't need to get invalidated if we're dead
+    (\(!subscribed :: SwitchSubscribed x a) ->
               EventSubscribed
               { eventSubscribedHeightRef = (commonSubscribedHeight . switchSubscribedCommon) subscribed
               , eventSubscribedRetained = toAny subscribed
@@ -1247,15 +1250,6 @@ switch switchParent = unsafePerformIO $ do
               , eventSubscribedWhoCreated = whoCreatedIORef $ (commonSubscribedCachedSubscribed . switchSubscribedCommon) subscribed
 #endif
               })
-    $ \sub ->
-    -- TODO: is (commonSubscribedOccurrence . switchSubscribedCommon) a hint things can be improved?
-    getCommonSubscribed
-    subscribedRef
-    switchSubscribedCommon
-    (\subscribed -> do
-       unsubscribe =<< readIORef (switchSubscribedCurrentParent subscribed)
-       finalize =<< readIORef (switchSubscribedOwnWeakInvalidator subscribed)) -- We don't need to get invalidated if we're dead
-    sub
     (\subscribedUnsafe -> do
         i <- liftIO $ newInvalidatorSwitch subscribedUnsafe
         mySub <- liftIO $ newSubscriberSwitch subscribedUnsafe
@@ -1279,48 +1273,43 @@ switch switchParent = unsafePerformIO $ do
                                    }))
 
 coincidence :: HasSpiderTimeline x => Event x (Event x a) -> Event x a
-coincidence coincidenceParent = unsafePerformIO $ do
-  subscribedRef <- newIORef Nothing
-  pure $ Event
-    $ wrap (\(!subscribed :: CoincidenceSubscribed x a) ->
-               EventSubscribed
-               { eventSubscribedHeightRef = (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
-               , eventSubscribedRetained = toAny subscribed
+coincidence coincidenceParent =
+  commonEvent
+  coincidenceSubscribedCommon
+  (unsubscribe . coincidenceSubscribedOuterParent)
+  (\(!subscribed :: CoincidenceSubscribed x a) ->
+             EventSubscribed
+             { eventSubscribedHeightRef = (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
+             , eventSubscribedRetained = toAny subscribed
 #ifdef DEBUG_CYCLES
-               , eventSubscribedGetParents = do
-                   innerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribed
-                   let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribed
-                       innerParents = maybeToList $ innerSubscription
-                   return $ outerParent : innerParents
-               , eventSubscribedHasOwnHeightRef = True
-               , eventSubscribedWhoCreated = whoCreatedIORef $ (commonSubscribedCachedSubscribed . coincidenceSubscribedCommon) subscribed
+             , eventSubscribedGetParents = do
+                 innerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribed
+                 let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribed
+                     innerParents = maybeToList $ innerSubscription
+                 return $ outerParent : innerParents
+             , eventSubscribedHasOwnHeightRef = True
+             , eventSubscribedWhoCreated = whoCreatedIORef $ (commonSubscribedCachedSubscribed . coincidenceSubscribedCommon) subscribed
 #endif
-               })
-    $ \sub ->
-    getCommonSubscribed
-    subscribedRef
-    coincidenceSubscribedCommon
-    (unsubscribe . coincidenceSubscribedOuterParent)
-    sub
-    (\subscribedUnsafe -> do
-          -- TODO: is there a shared pattern with newSubscribedCoincidenceOuter and newSubscriberSwitch?
-          subOuter <- liftIO $ newSubscriberCoincidenceOuter subscribedUnsafe
-          (outerSubscription@(EventSubscription _ outerSubd), outerOcc) <- subscribeAndRead coincidenceParent subOuter
-          outerHeight <- liftIO $ getEventSubscribedHeight outerSubd
-          (occ, height, mInnerSubd) <- case outerOcc of
-            Nothing -> return (Nothing, outerHeight, Nothing)
-            Just o -> do
-              (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight subscribedUnsafe
-              return (occ, height, Just innerSubd)
-          innerSubdRef <- liftIO $ newIORef mInnerSubd
-          scheduleClear innerSubdRef
-          pure (occ, height, \c ->
-                              CoincidenceSubscribed
-                             { coincidenceSubscribedCommon = c
-                             , coincidenceSubscribedOuter = subOuter
-                             , coincidenceSubscribedOuterParent = outerSubscription
-                             , coincidenceSubscribedInnerParent = innerSubdRef
-                             }))
+             })    
+  (\subscribedUnsafe -> do
+        -- TODO: is there a shared pattern with newSubscribedCoincidenceOuter and newSubscriberSwitch?
+        subOuter <- liftIO $ newSubscriberCoincidenceOuter subscribedUnsafe
+        (outerSubscription@(EventSubscription _ outerSubd), outerOcc) <- subscribeAndRead coincidenceParent subOuter
+        outerHeight <- liftIO $ getEventSubscribedHeight outerSubd
+        (occ, height, mInnerSubd) <- case outerOcc of
+          Nothing -> return (Nothing, outerHeight, Nothing)
+          Just o -> do
+            (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight subscribedUnsafe
+            return (occ, height, Just innerSubd)
+        innerSubdRef <- liftIO $ newIORef mInnerSubd
+        scheduleClear innerSubdRef
+        pure (occ, height, \c ->
+                            CoincidenceSubscribed
+                           { coincidenceSubscribedCommon = c
+                           , coincidenceSubscribedOuter = subOuter
+                           , coincidenceSubscribedOuterParent = outerSubscription
+                           , coincidenceSubscribedInnerParent = innerSubdRef
+                           }))
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> ResultM x b -> SpiderHost x b
@@ -1793,51 +1782,52 @@ subscribeFanSubscribed k subscribed sub = do
 
 
 -- TODO: why is there subscribedRef__ and subscribedRef?
-{-# INLINABLE getCommonSubscribed #-}
-getCommonSubscribed :: forall s x a. HasSpiderTimeline x =>
-  IORef (Maybe (s x a)) ->
+{-# INLINABLE commonEvent #-}
+commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> CommonSubscribed s x a) ->
   (s x a -> IO ()) ->
-  Subscriber x a ->
+  (s x a -> EventSubscribed x) ->
   (s x a -> EventM x (Maybe a, Height, CommonSubscribed s x a -> s x a)) ->
-  EventM x (WeakBagTicket, s x a, Maybe a)
-getCommonSubscribed subscribedRef__ subscribedCommon cleanupSpecific sub foo = do
-  mSubscribed <- liftIO $ readIORef $ subscribedRef__
-  let cleanup subscribed = do
-        cleanupSpecific subscribed
-        writeIORef ((commonSubscribedCachedSubscribed . subscribedCommon) subscribed) Nothing
-  case mSubscribed of
-    Just subscribed -> {-# SCC "hitCommon" #-} liftIO $ do
-      let common = subscribedCommon subscribed
-      sln <- WeakBag.insert sub (commonSubscribedSubscribers common) (commonSubscribedWeakSelf common) cleanup
-      occ <- readIORef $ commonSubscribedOccurrence common
-      return (sln, subscribed, occ)
-    Nothing -> {-# SCC "missCommon" #-} do
-      subscribedRef <- liftIO $ newIORef $ error "getCommonSubscribed: subscribed has not yet been created"
-      subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
-      (occ, height, fromCommon) <- foo subscribedUnsafe 
-      occRef <- liftIO $ newIORef occ
-      when (isJust occ) $ scheduleClear occRef
-      heightRef <- liftIO $ newIORef height
-      weakSelf <- liftIO $ newIORef $ error "getCommonSubscribed: weakSelf not yet initialized"
-      (subs, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanup
+  Event x a
+commonEvent subscribedCommon cleanupSpecific tag foo = unsafePerformIO $ do
+  subscribedRef__ :: IORef (Maybe (s x a)) <- newIORef Nothing
+  pure $ Event $ wrap tag $ \sub -> do
+    mSubscribed <- liftIO $ readIORef $ subscribedRef__
+    let cleanup subscribed = do
+          cleanupSpecific subscribed
+          writeIORef ((commonSubscribedCachedSubscribed . subscribedCommon) subscribed) Nothing
+    case mSubscribed of
+      Just subscribed -> {-# SCC "hitCommon" #-} liftIO $ do
+        let common = subscribedCommon subscribed
+        sln <- WeakBag.insert sub (commonSubscribedSubscribers common) (commonSubscribedWeakSelf common) cleanup
+        occ <- readIORef $ commonSubscribedOccurrence common
+        return (sln, subscribed, occ)
+      Nothing -> {-# SCC "missCommon" #-} do
+        subscribedRef <- liftIO $ newIORef $ error "commonEvent: subscribed has not yet been created"
+        subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
+        (occ, height, fromCommon) <- foo subscribedUnsafe 
+        occRef <- liftIO $ newIORef occ
+        when (isJust occ) $ scheduleClear occRef
+        heightRef <- liftIO $ newIORef height
+        weakSelf <- liftIO $ newIORef $ error "commonEvent: weakSelf not yet initialized"
+        (subs, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanup
 #ifdef DEBUG_NODEIDS
-      nid <- liftIO newNodeId
+        nid <- liftIO newNodeId
 #endif
-      let !subscribed :: s x a = fromCommon $ CommonSubscribed
-            { commonSubscribedCachedSubscribed = subscribedRef__
-            , commonSubscribedOccurrence = occRef
-            , commonSubscribedHeight = heightRef
-            , commonSubscribedSubscribers = subs
-            , commonSubscribedWeakSelf = weakSelf
+        let !subscribed :: s x a = fromCommon $ CommonSubscribed
+              { commonSubscribedCachedSubscribed = subscribedRef__
+              , commonSubscribedOccurrence = occRef
+              , commonSubscribedHeight = heightRef
+              , commonSubscribedSubscribers = subs
+              , commonSubscribedWeakSelf = weakSelf
 #ifdef DEBUG_NODEIDS
-            , commonSubscribedNodeId = nid
+              , commonSubscribedNodeId = nid
 #endif
-            }
-      liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug subscribed "commonSubscribedWeakSelf"
-      liftIO $ writeIORef subscribedRef $! subscribed
-      liftIO $ writeIORef subscribedRef__ $ Just subscribed
-      return (slnForSub, subscribed, occ)
+              }
+        liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug subscribed "commonSubscribedWeakSelf"
+        liftIO $ writeIORef subscribedRef $! subscribed
+        liftIO $ writeIORef subscribedRef__ $ Just subscribed
+        return (slnForSub, subscribed, occ)
 
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt =
