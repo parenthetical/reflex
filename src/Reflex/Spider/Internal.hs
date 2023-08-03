@@ -1768,7 +1768,7 @@ subscribeFanSubscribed k subscribed sub = do
 commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> CommonSubscribed s x a) ->
   (s x a -> IO ()) ->
-  (s x a -> (IO [EventSubscribed x])) ->
+  (s x a -> IO [EventSubscribed x]) ->
   (s x a -> EventM x (Maybe a, Height, CommonSubscribed s x a -> s x a)) ->
   Event x a
 commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
