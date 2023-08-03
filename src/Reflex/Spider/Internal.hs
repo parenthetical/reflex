@@ -1764,7 +1764,7 @@ subscribeFanSubscribed k subscribed sub = do
 
 
 -- TODO: why is there subscribedRef__ and subscribedRef?
-{-# INLINABLE commonEvent #-}
+{-# INLINE commonEvent #-}
 commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> CommonSubscribed s x a) ->
   (s x a -> IO ()) ->
