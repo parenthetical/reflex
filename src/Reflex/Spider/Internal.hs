@@ -493,6 +493,8 @@ newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId su
       forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
   }
 
+-- TODO: this all uses common and no switch specific things
+-- TODO: what are the similarities with newSubscriberCoincidenceInner?
 newSubscriberSwitch :: forall x a. HasSpiderTimeline x => SwitchSubscribed x a -> IO (Subscriber x a)
 newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $ Subscriber
   { subscriberPropagate = \a -> {-# SCC "traverseSwitch" #-} do
