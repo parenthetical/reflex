@@ -512,7 +512,8 @@ newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <
 newSubscriberCoincidenceOuter :: forall x b. HasSpiderTimeline x => CoincidenceSubscribed x b -> IO (Subscriber x (Event x b))
 newSubscriberCoincidenceOuter subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $ Subscriber
   { subscriberPropagate = \a -> {-# SCC "traverseCoincidenceOuter" #-} do
-      outerHeight <- liftIO $ readIORef $ (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
+      let subscribedCommon = coincidenceSubscribedCommon subscribed
+      outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
       tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
       (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight subscribed
       tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
@@ -523,13 +524,13 @@ newSubscriberCoincidenceOuter subscribed = debugSubscriber ("SubscriberCoinciden
       case occ of
         Nothing ->
           when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
-            writeIORef ((commonSubscribedHeight . coincidenceSubscribedCommon) subscribed) $! innerHeight
-            WeakBag.traverse_ ((commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed) $ invalidateSubscriberHeight outerHeight
-            WeakBag.traverse_ ((commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed) $ recalculateSubscriberHeight innerHeight
+            writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
+            WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight outerHeight
+            WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ recalculateSubscriberHeight innerHeight
         Just o -> do -- Since it's already firing, no need to adjust height
-          liftIO $ writeIORef ((commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed) occ
-          scheduleClear $ (commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed
-          propagate o $ (commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed
+          liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) occ
+          scheduleClear $ commonSubscribedOccurrence subscribedCommon
+          propagate o $ commonSubscribedSubscribers subscribedCommon
   , subscriberInvalidateHeight  = \_ -> invalidateCoincidenceHeight subscribed
   , subscriberRecalculateHeight = \_ -> recalculateCoincidenceHeight subscribed
   }
