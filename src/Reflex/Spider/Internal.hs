@@ -671,6 +671,7 @@ behaviorHoldIdentity = behaviorHold
 behaviorConst :: a -> Behavior x a
 behaviorConst !a = Behavior $ return a
 
+-- TODO: only used once
 behaviorPull :: Pull x a -> Behavior x a
 behaviorPull !p = Behavior $ do
     val <- liftIO $ readIORef $ pullValue p
@@ -934,6 +935,7 @@ hold v0 e = do
   defer $ SomeHoldInit h
   return h
 
+-- TODO: only used once
 {-# INLINE getHoldEventSubscription #-}
 getHoldEventSubscription :: forall p x. (HasSpiderTimeline x, Patch p) => Hold x p -> EventM x (EventSubscription x)
 getHoldEventSubscription h = do
@@ -1772,9 +1774,11 @@ commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> EventM x (Maybe a, Height, CommonSubscribed s x a -> s x a)) ->
   Event x a
 commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
+  -- TODO: Is this function actually doing cacheEvent? Can I use cacheEvent instead?
   subscribedRef__ :: IORef (Maybe (s x a)) <- newIORef Nothing
-  pure $ Event $ wrap
-            (\(!subscribed :: s x a) ->
+  pure
+    $ Event
+    $ wrap (\(!subscribed :: s x a) ->
               EventSubscribed
               { eventSubscribedHeightRef = (commonSubscribedHeight . subscribedCommon) subscribed
               , eventSubscribedRetained = toAny subscribed
@@ -2158,6 +2162,9 @@ runFrame a = SpiderHost $ do
   tracePropagate (Proxy::Proxy x) $ "Updating merges done"
   toReconnect <- readIORef toReconnectRef
   clearEventEnv env
+  -- TODO: Can this be made like SomeMergeUpdate for consistency? Or
+  -- unify this "run something to get subscriptions to kill" pattern
+  -- some other way?
   switchSubscriptionsToKill <- forM toReconnect $ \(SomeSwitchSubscribed subscribed) -> {-# SCC "switchSubscribed" #-} do
     oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribed
     wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribed
