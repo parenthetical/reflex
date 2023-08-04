@@ -1775,7 +1775,7 @@ commonEvent :: forall s x a. HasSpiderTimeline x =>
   Event x a
 commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
   -- TODO: Is this function actually doing cacheEvent? Can I use cacheEvent instead?
-  subscribedRef__ :: IORef (Maybe (s x a)) <- newIORef Nothing
+  mSubscribedRef :: IORef (Maybe (s x a)) <- newIORef Nothing
   pure
     $ Event
     $ wrap (\(!subscribed :: s x a) ->
@@ -1790,7 +1790,7 @@ commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = un
 #endif
               })  
     $ \sub -> do
-    mSubscribed <- liftIO $ readIORef $ subscribedRef__
+    mSubscribed <- liftIO $ readIORef $ mSubscribedRef
     let cleanup subscribed = do
           cleanupSpecific subscribed
           writeIORef ((commonSubscribedCachedSubscribed . subscribedCommon) subscribed) Nothing
@@ -1813,7 +1813,7 @@ commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = un
         nid <- liftIO newNodeId
 #endif
         let !subscribed :: s x a = fromCommon $ CommonSubscribed
-              { commonSubscribedCachedSubscribed = subscribedRef__
+              { commonSubscribedCachedSubscribed = mSubscribedRef
               , commonSubscribedOccurrence = occRef
               , commonSubscribedHeight = heightRef
               , commonSubscribedSubscribers = subs
@@ -1824,7 +1824,7 @@ commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = un
               }
         liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug subscribed "commonSubscribedWeakSelf"
         liftIO $ writeIORef subscribedRef $! subscribed
-        liftIO $ writeIORef subscribedRef__ $ Just subscribed
+        liftIO $ writeIORef mSubscribedRef $ Just subscribed
         return (slnForSub, subscribed, occ)
 
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
