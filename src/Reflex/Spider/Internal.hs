@@ -2462,6 +2462,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Refle
   {-# INLINABLE now #-}
   now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
 
+-- TODO: remove deprecated
 --------------------------------------------------------------------------------
 -- Deprecated items
 --------------------------------------------------------------------------------
