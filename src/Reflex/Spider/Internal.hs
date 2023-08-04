@@ -1641,26 +1641,23 @@ data FanInt x a = FanInt
 #endif
   }
 
-newFanInt :: IO (FanInt x a)
-newFanInt = do
-  subscribers <- FastMutableIntMap.newEmpty --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
-  subscriptionRef <- newIORef $ error "fanInt: no subscription"
-  occRef <- newIORef $ error "fanInt: no occurrence"
-#ifdef DEBUG_NODEIDS
-  nodeId <- newNodeId
-#endif
-  return $ FanInt
-    { _fanInt_subscribers = subscribers
-    , _fanInt_subscriptionRef = subscriptionRef
-    , _fanInt_occRef = occRef
-#ifdef DEBUG_NODEIDS
-    , _fanInt_nodeId = nodeId
-#endif
-    }
-
 fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
 fanInt p = unsafePerformIO $ do
-  self <- newFanInt
+  self <- do
+    subscribers <- FastMutableIntMap.newEmpty --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
+    subscriptionRef <- newIORef $ error "fanInt: no subscription"
+    occRef <- newIORef $ error "fanInt: no occurrence"
+#ifdef DEBUG_NODEIDS
+    nodeId <- newNodeId
+#endif
+    return $ FanInt
+      { _fanInt_subscribers = subscribers
+      , _fanInt_subscriptionRef = subscriptionRef
+      , _fanInt_occRef = occRef
+#ifdef DEBUG_NODEIDS
+      , _fanInt_nodeId = nodeId
+#endif
+      }
   pure $ EventSelectorInt $ \k -> Event $ \sub -> do
     isEmpty <- liftIO $ FastMutableIntMap.isEmpty (_fanInt_subscribers self)
     when isEmpty $ do -- This is the first subscriber, so we need to subscribe to our input
