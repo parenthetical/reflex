@@ -2182,6 +2182,9 @@ runFrame a = SpiderHost $ do
     subscription <- unSpiderHost $ runFrame $ {-# SCC "subscribeSwitch" #-} subscribe e sub --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
     writeIORef (switchSubscribedCurrentParent subscribed) $! subscription
     return oldSubscription
+  -- TODO: there is a pattern in the structure here? First unsubscribes, then invalidates, then calculates.
+  --   Could getting rid of the specific queues for these work? Instead there would be a queue for each.
+  --   This way patterns in the code might become more obvious.
   liftIO $ mapM_ unsubscribe mergeSubscriptionsToKill
   liftIO $ mapM_ unsubscribe switchSubscriptionsToKill
   forM_ toReconnect $ \(SomeSwitchSubscribed subscribed) -> {-# SCC "switchSubscribed" #-} do
@@ -2193,6 +2196,7 @@ runFrame a = SpiderHost $ do
       WeakBag.traverse_ ((commonSubscribedSubscribers . switchSubscribedCommon) subscribed) $ invalidateSubscriberHeight myHeight
   mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
   forM_ coincidenceInfos $ \(SomeResetCoincidence subscription mcs) -> do
+    -- TODO: could this unsubscribe be done at 'mergeSubscriptionsToKill/switchSubscriptionsToKill' time?
     unsubscribe subscription
     mapM_ invalidateCoincidenceHeight mcs
   forM_ coincidenceInfos $ \(SomeResetCoincidence _ mcs) -> mapM_ recalculateCoincidenceHeight mcs
