@@ -496,23 +496,29 @@ newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId su
 -- TODO: this all uses common and no switch specific things
 -- TODO: what are the similarities with newSubscriberCoincidenceInner?
 newSubscriberSwitch :: forall x a. HasSpiderTimeline x => SwitchSubscribed x a -> IO (Subscriber x a)
-newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $ Subscriber
+newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $
+ let subscribedCommon = switchSubscribedCommon subscribed
+ in Subscriber
   { subscriberPropagate = \a -> {-# SCC "traverseSwitch" #-} do
-      liftIO $ writeIORef ((commonSubscribedOccurrence . switchSubscribedCommon) subscribed) $ Just a
-      scheduleClear $ (commonSubscribedOccurrence . switchSubscribedCommon) subscribed
-      propagate a $ (commonSubscribedSubscribers . switchSubscribedCommon) subscribed
-  , subscriberInvalidateHeight = \_ -> do
-      oldHeight <- readIORef $ (commonSubscribedHeight . switchSubscribedCommon) subscribed
-      when (oldHeight /= invalidHeight) $ do
-        writeIORef ((commonSubscribedHeight . switchSubscribedCommon) subscribed) $! invalidHeight
-        WeakBag.traverse_ ((commonSubscribedSubscribers . switchSubscribedCommon) subscribed) $ invalidateSubscriberHeight oldHeight
-  , subscriberRecalculateHeight = (`updateSwitchHeight` subscribed)
+      liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) $ Just a
+      scheduleClear $ commonSubscribedOccurrence subscribedCommon
+      propagate a $ commonSubscribedSubscribers subscribedCommon
+  , subscriberInvalidateHeight = \_ ->
+      invalidateCommonHeight
+      (commonSubscribedHeight subscribedCommon)
+      (commonSubscribedSubscribers subscribedCommon)
+  , subscriberRecalculateHeight = \newHeight ->
+      updateCommonHeight
+      newHeight
+      (commonSubscribedHeight . switchSubscribedCommon $ subscribed)
+      (commonSubscribedSubscribers . switchSubscribedCommon $ subscribed)
     }
 
 newSubscriberCoincidenceOuter :: forall x b. HasSpiderTimeline x => CoincidenceSubscribed x b -> IO (Subscriber x (Event x b))
-newSubscriberCoincidenceOuter subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $ Subscriber
+newSubscriberCoincidenceOuter subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $
+ let subscribedCommon = coincidenceSubscribedCommon subscribed
+ in Subscriber
   { subscriberPropagate = \a -> {-# SCC "traverseCoincidenceOuter" #-} do
-      let subscribedCommon = coincidenceSubscribedCommon subscribed
       outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
       tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
       (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight subscribed
@@ -531,22 +537,40 @@ newSubscriberCoincidenceOuter subscribed = debugSubscriber ("SubscriberCoinciden
           liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) occ
           scheduleClear $ commonSubscribedOccurrence subscribedCommon
           propagate o $ commonSubscribedSubscribers subscribedCommon
-  , subscriberInvalidateHeight  = \_ -> invalidateCoincidenceHeight subscribed
-  , subscriberRecalculateHeight = \_ -> recalculateCoincidenceHeight subscribed
+  , subscriberInvalidateHeight  = \_ ->
+      invalidateCommonHeight
+      (commonSubscribedHeight subscribedCommon)
+      (commonSubscribedSubscribers subscribedCommon)
+  , subscriberRecalculateHeight = \_ ->
+      recalculateAndUpdateHeight
+      calculateCoincidenceHeight
+      coincidenceSubscribedCommon
+      subscribed
   }
 
 newSubscriberCoincidenceInner :: forall x a. HasSpiderTimeline x => CoincidenceSubscribed x a -> IO (Subscriber x a)
-newSubscriberCoincidenceInner subscribed = debugSubscriber ("SubscriberCoincidenceInner" <> showNodeId subscribed) $ Subscriber
+newSubscriberCoincidenceInner subscribed = debugSubscriber ("SubscriberCoincidenceInner" <> showNodeId subscribed) $
+ let subscribedCommon = coincidenceSubscribedCommon subscribed
+ in Subscriber
   { subscriberPropagate = \a -> {-# SCC "traverseCoincidenceInner" #-} do
-      occ <- liftIO $ readIORef $ (commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed
+      occ <- liftIO $ readIORef $ commonSubscribedOccurrence subscribedCommon
       case occ of
         Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
         Nothing -> do
-          liftIO $ writeIORef ((commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed) $ Just a
-          scheduleClear $ (commonSubscribedOccurrence . coincidenceSubscribedCommon) subscribed
-          propagate a $ (commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed
-  , subscriberInvalidateHeight  = \_ -> invalidateCoincidenceHeight subscribed
-  , subscriberRecalculateHeight = \_ -> recalculateCoincidenceHeight subscribed
+          -- TODO: identical code in newSubscriberCoincidenceOuter >> subscriberPropagate
+          -- except for occ/Just a
+          liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) $ Just a
+          scheduleClear $ commonSubscribedOccurrence subscribedCommon
+          propagate a $ commonSubscribedSubscribers subscribedCommon
+  , subscriberInvalidateHeight  = \_ ->
+      invalidateCommonHeight
+      (commonSubscribedHeight subscribedCommon)
+      (commonSubscribedSubscribers subscribedCommon)
+  , subscriberRecalculateHeight = \_ ->
+      recalculateAndUpdateHeight
+      calculateCoincidenceHeight
+      coincidenceSubscribedCommon
+      subscribed
   }
 
 invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
@@ -2199,12 +2223,17 @@ runFrame a = SpiderHost $ do
   forM_ coincidenceInfos $ \(SomeResetCoincidence subscription mcs) -> do
     -- TODO: could this unsubscribe be done at 'mergeSubscriptionsToKill/switchSubscriptionsToKill' time?
     unsubscribe subscription
-    mapM_ invalidateCoincidenceHeight mcs
-  forM_ coincidenceInfos $ \(SomeResetCoincidence _ mcs) -> mapM_ recalculateCoincidenceHeight mcs
+    mapM_ (\subscribed ->
+             let subscribedCommon = coincidenceSubscribedCommon subscribed
+             in invalidateCommonHeight
+                (commonSubscribedHeight subscribedCommon)
+                (commonSubscribedSubscribers subscribedCommon))
+       mcs
+  forM_ coincidenceInfos $ \(SomeResetCoincidence _ mcs) ->
+    mapM_ (recalculateAndUpdateHeight calculateCoincidenceHeight coincidenceSubscribedCommon) mcs
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
-  forM_ toReconnect $ \(SomeSwitchSubscribed subscribed) -> do
-    height <- calculateSwitchHeight subscribed
-    updateSwitchHeight height subscribed
+  forM_ toReconnect $ \(SomeSwitchSubscribed subscribed) ->
+    recalculateAndUpdateHeight calculateSwitchHeight switchSubscribedCommon subscribed
   return result
 
 newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
@@ -2231,29 +2260,30 @@ succHeight h@(Height a) =
   then invalidHeight
   else Height $ succ a
 
-invalidateCoincidenceHeight :: CoincidenceSubscribed x a -> IO ()
-invalidateCoincidenceHeight subscribed = do
-  oldHeight <- readIORef $ (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
+-- TODO: for invalidateCommonHeight, updateCommonHeight, etc. under here: find commonalities
+invalidateCommonHeight :: IORef Height -> WeakBag (Subscriber x a) -> IO ()
+invalidateCommonHeight heightRef subscribers = do
+  oldHeight <- readIORef heightRef
   when (oldHeight /= invalidHeight) $ do
-    writeIORef ((commonSubscribedHeight . coincidenceSubscribedCommon) subscribed) $! invalidHeight
-    WeakBag.traverse_ ((commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed) $ invalidateSubscriberHeight oldHeight
+    writeIORef heightRef $! invalidHeight
+    WeakBag.traverse_ subscribers $ invalidateSubscriberHeight oldHeight
 
-updateSwitchHeight :: Height -> SwitchSubscribed x a -> IO ()
-updateSwitchHeight new subscribed = do
-  oldHeight <- readIORef $ (commonSubscribedHeight . switchSubscribedCommon) subscribed
+updateCommonHeight :: Height -> IORef Height -> WeakBag (Subscriber x a) -> IO ()
+updateCommonHeight new heightRef subscribers = do
+  oldHeight <- readIORef heightRef
   when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
     when (new /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-      writeIORef ((commonSubscribedHeight . switchSubscribedCommon) subscribed) $! new
-      WeakBag.traverse_ ((commonSubscribedSubscribers . switchSubscribedCommon) subscribed) $ recalculateSubscriberHeight new
+      writeIORef heightRef $! new
+      WeakBag.traverse_ subscribers $ recalculateSubscriberHeight new
 
-recalculateCoincidenceHeight :: CoincidenceSubscribed x a -> IO ()
-recalculateCoincidenceHeight subscribed = do
-  oldHeight <- readIORef $ (commonSubscribedHeight . coincidenceSubscribedCommon) subscribed
-  when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-    height <- calculateCoincidenceHeight subscribed
-    when (height /= invalidHeight) $ do
-      writeIORef ((commonSubscribedHeight . coincidenceSubscribedCommon) subscribed) $! height
-      WeakBag.traverse_ ((commonSubscribedSubscribers . coincidenceSubscribedCommon) subscribed) $ recalculateSubscriberHeight height
+recalculateAndUpdateHeight :: (t -> IO Height) -> (t -> CommonSubscribed s x a) -> t -> IO ()
+recalculateAndUpdateHeight calculate getCommon subscribed =
+  let subscribedCommon = getCommon subscribed
+  in do height <- calculate subscribed
+        updateCommonHeight
+              height
+              (commonSubscribedHeight subscribedCommon)
+              (commonSubscribedSubscribers subscribedCommon)
 
 calculateSwitchHeight :: SwitchSubscribed x a -> IO Height
 calculateSwitchHeight subscribed = getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef (switchSubscribedCurrentParent subscribed)
