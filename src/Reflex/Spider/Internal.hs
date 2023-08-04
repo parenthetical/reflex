@@ -2109,6 +2109,8 @@ fanG e = unsafePerformIO $ do
         }
   pure $ EventSelectorG $ \k -> eventFan k f
 
+-- TODO: Getting rid of all these different types which get initialized at the same time anyway
+--   might lead to patterns showing up in code.
 runHoldInits :: HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeDynInit x] -> IORef [SomeMergeInit x] -> EventM x ()
 runHoldInits holdInitRef dynInitRef mergeInitRef = do
   holdInits <- liftIO $ readIORef holdInitRef
