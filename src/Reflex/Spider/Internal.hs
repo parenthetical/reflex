@@ -322,8 +322,7 @@ nowSpiderEventM =
 now :: (MonadIO m, Defer (Some Clear) m, HasSpiderTimeline x
        ) => m (Event x ())
 now = do
-  nowOrNot <- liftIO $ newIORef $ Just ()
-  scheduleClear nowOrNot
+  nowOrNot <- newAndScheduleClear $ Just ()
   return . Event $ \_ -> do
     occ <- liftIO . readIORef $ nowOrNot
     return ( EventSubscription (return ()) eventSubscribedNow
@@ -365,15 +364,12 @@ cacheEvent e =
               (parentSub, occ) <- subscribeAndRead e $ Subscriber
 #endif
                   { subscriberPropagate = \a -> do
-                      liftIO $ writeIORef occRef (Just a)
-                      scheduleClear occRef
+                      writeAndScheduleClear occRef . Just $ a
                       propagateFast a subscribers
                   , subscriberInvalidateHeight = FastWeakBag.traverse_ subscribers . invalidateSubscriberHeight
                   , subscriberRecalculateHeight = FastWeakBag.traverse_ subscribers . recalculateSubscriberHeight
                   }
-              when (isJust occ) $ do
-                liftIO $ writeIORef occRef occ -- Set the initial value of occRef; we don't need to do this if occ is Nothing
-                scheduleClear occRef
+              when (isJust occ) $ writeAndScheduleClear occRef occ
               let !subscribed = CacheSubscribed
                     { _cacheSubscribed_subscribers = subscribers
                     , _cacheSubscribed_parent = parentSub
@@ -478,8 +474,7 @@ newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId su
   { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
       subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribed
       tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-      liftIO $ writeIORef (fanSubscribedOccurrence subscribed) $ Just a
-      scheduleClear $ fanSubscribedOccurrence subscribed
+      writeAndScheduleClear (fanSubscribedOccurrence subscribed) . Just $ a
       let f _ (Pair v subsubs) = do
             propagate v $ _fanSubscribedChildren_list subsubs
             return $ Constant ()
@@ -499,10 +494,10 @@ newSubscriberSwitch :: forall x a. HasSpiderTimeline x => SwitchSubscribed x a -
 newSubscriberSwitch subscribed = debugSubscriber ("SubscriberCoincidenceOuter" <> showNodeId subscribed) $
  let subscribedCommon = switchSubscribedCommon subscribed
  in Subscriber
-  { subscriberPropagate = \a -> {-# SCC "traverseSwitch" #-} do
-      liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) $ Just a
-      scheduleClear $ commonSubscribedOccurrence subscribedCommon
-      propagate a $ commonSubscribedSubscribers subscribedCommon
+  { subscriberPropagate = {-# SCC "traverseSwitch" #-}
+      writeAndScheduleClearAndPropagate
+           (commonSubscribedOccurrence subscribedCommon)
+           (commonSubscribedSubscribers subscribedCommon)
   , subscriberInvalidateHeight = \_ ->
       invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
   , subscriberRecalculateHeight =
@@ -517,12 +512,8 @@ newSubscriberCoincidenceInner subscribed = debugSubscriber ("SubscriberCoinciden
       occ <- liftIO $ readIORef $ commonSubscribedOccurrence subscribedCommon
       case occ of
         Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
-        Nothing -> do
-          -- TODO: identical code in newSubscriberCoincidenceOuter >> subscriberPropagate
-          -- except for occ/Just a
-          liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) $ Just a
-          scheduleClear $ commonSubscribedOccurrence subscribedCommon
-          propagate a $ commonSubscribedSubscribers subscribedCommon
+        Nothing ->
+          writeAndScheduleClearAndPropagate (commonSubscribedOccurrence subscribedCommon) (commonSubscribedSubscribers subscribedCommon) a
   , subscriberInvalidateHeight  = \_ ->
       invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
   , subscriberRecalculateHeight = \_ ->
@@ -874,6 +865,29 @@ instance HasSpiderTimeline x => Defer (Some Clear) (EventM x) where
 {-# INLINE scheduleClear #-}
 scheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> m ()
 scheduleClear r = defer $ Some $ Clear r
+
+{-# INLINE writeAndScheduleClear #-}
+writeAndScheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> Maybe a -> m ()
+writeAndScheduleClear ref val = do
+  liftIO $ writeIORef ref val
+  scheduleClear ref
+
+{-# INLINE writeAndScheduleClearAndPropagate #-}
+writeAndScheduleClearAndPropagate :: HasSpiderTimeline x =>
+  IORef (Maybe a) -> WeakBag (Subscriber x a) -> a -> EventM x ()
+writeAndScheduleClearAndPropagate ref subscribers val = do
+  liftIO $ writeIORef ref (Just val)
+  scheduleClear ref
+  propagate val subscribers
+
+
+{-# INLINE newAndScheduleClear #-}
+newAndScheduleClear :: Defer (Some Clear) m => Maybe a -> m (IORef (Maybe a))
+newAndScheduleClear occ = do
+  occRef <- liftIO $ newIORef occ
+  when (isJust occ) $ scheduleClear occRef
+  pure occRef
+  
 
 instance HasSpiderTimeline x => Defer (Some IntClear) (EventM x) where
   {-# INLINE getDeferralQueue #-}
@@ -1268,18 +1282,18 @@ coincidence coincidenceParent =
              (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight subscribed
              tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
              tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
-             liftIO $ writeIORef (coincidenceSubscribedInnerParent subscribed) $ Just innerSubd
-             scheduleClear $ coincidenceSubscribedInnerParent subscribed
+             writeAndScheduleClear (coincidenceSubscribedInnerParent subscribed) . Just $ innerSubd
              case occ of
                Nothing ->
                  when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
                    writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
                    WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight outerHeight
                    WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ recalculateSubscriberHeight innerHeight
-               Just o -> do -- Since it's already firing, no need to adjust height
-                 liftIO $ writeIORef (commonSubscribedOccurrence subscribedCommon) occ
-                 scheduleClear $ commonSubscribedOccurrence subscribedCommon
-                 propagate o $ commonSubscribedSubscribers subscribedCommon
+               Just o -> -- Since it's already firing, no need to adjust height
+                 writeAndScheduleClearAndPropagate
+                   (commonSubscribedOccurrence subscribedCommon)
+                   (commonSubscribedSubscribers subscribedCommon)
+                   o
          , subscriberInvalidateHeight  = \_ ->
              invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
          , subscriberRecalculateHeight = \_ ->
@@ -1295,8 +1309,7 @@ coincidence coincidenceParent =
         Just o -> do
           (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight subscribed
           return (occ, height, Just innerSubd)
-      innerSubdRef <- liftIO $ newIORef mInnerSubd
-      scheduleClear innerSubdRef
+      innerSubdRef <- newAndScheduleClear mInnerSubd
       pure (occ, height, \c ->
                           CoincidenceSubscribed
                          { coincidenceSubscribedCommon = c
@@ -1726,8 +1739,7 @@ getFanSubscribed k f sub = do
       weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
       (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
       subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
-      occRef <- liftIO $ newIORef parentOcc
-      when (isJust parentOcc) $ scheduleClear occRef
+      occRef <- newAndScheduleClear parentOcc
 #ifdef DEBUG_NODEIDS
       nid <- liftIO newNodeId
 #endif
@@ -1811,8 +1823,7 @@ commonEvent subscribedCommon cleanupSpecific eventSubscribedGetParents_ foo = un
         subscribedRef <- liftIO $ newIORef $ error "commonEvent: subscribed has not yet been created"
         subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
         (occ, height, fromCommon) <- foo subscribedUnsafe 
-        occRef <- liftIO $ newIORef occ
-        when (isJust occ) $ scheduleClear occRef
+        occRef <- newAndScheduleClear occ
         heightRef <- liftIO $ newIORef height
         weakSelf <- liftIO $ newIORef $ error "commonEvent: weakSelf not yet initialized"
         (subs, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanup
@@ -2474,17 +2485,15 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
   {-# INLINABLE subscribeEvent #-}
   subscribeEvent e = SpiderHostFrame $ do
     --TODO: Unsubscribe eventually (manually and/or with weak ref)
-    val <- liftIO $ newIORef Nothing
+    valRef <- liftIO $ newIORef Nothing
     subscription <- subscribe (unSpiderEvent e) $ Subscriber
-      { subscriberPropagate = \a -> do
-          liftIO $ writeIORef val $ Just a
-          scheduleClear val
+      { subscriberPropagate = writeAndScheduleClear valRef . Just
       , subscriberInvalidateHeight = \_ -> return ()
       , subscriberRecalculateHeight = \_ -> return ()
       }
     return $ SpiderEventHandle
       { spiderEventHandleSubscription = subscription
-      , spiderEventHandleValue = val
+      , spiderEventHandleValue = valRef
       }
 
 instance HasSpiderTimeline x => Reflex.Host.Class.ReflexHost (SpiderTimeline x) where
