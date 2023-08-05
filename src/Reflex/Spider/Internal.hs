@@ -2187,6 +2187,7 @@ runFrame a = SpiderHost $ do
   -- TODO: Can this be made like SomeMergeUpdate for consistency? Or
   -- unify this "run something to get subscriptions to kill" pattern
   -- some other way?
+  -- TODO: I meant that maybe the code below can be put in the definition for switch to make patterns obvious, but I'm not sure that's a good idea.
   switchSubscriptionsToKill <- forM toReconnect $ \(SomeSwitchSubscribed subscribed) -> {-# SCC "switchSubscribed" #-} do
     oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribed
     wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribed
@@ -2200,8 +2201,9 @@ runFrame a = SpiderHost $ do
     e <- runBehaviorM (readBehaviorTracked (switchSubscribedParent subscribed)) (Just (wi', switchSubscribedBehaviorParents subscribed)) $ eventEnvHoldInits env
     runEventM $ runHoldInits (eventEnvHoldInits env) (eventEnvDynInits env) (eventEnvMergeInits env) --TODO: Is this actually OK? It seems like it should be, since we know that no events are firing at this point, but it still seems inelegant
     --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
-    sub <- newSubscriberSwitch subscribed
-    subscription <- unSpiderHost $ runFrame $ {-# SCC "subscribeSwitch" #-} subscribe e sub --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+    subscription <- unSpiderHost .
+      runFrame . subscribe e =<< {-# SCC "subscribeSwitch" #-}
+         newSubscriberSwitch subscribed --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
     writeIORef (switchSubscribedCurrentParent subscribed) $! subscription
     return oldSubscription
   -- TODO: there is a pattern in the structure here? First unsubscribes, then invalidates, then calculates.
