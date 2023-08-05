@@ -1785,7 +1785,6 @@ subscribeFanSubscribed k subscribed sub = do
     Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-} WeakBag.insert sub list weakSelf cleanupFanSubscribed
 
 
--- TODO: why is there subscribedRef__ and subscribedRef?
 {-# INLINE commonEvent #-}
 commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> CommonSubscribed s x a) ->
