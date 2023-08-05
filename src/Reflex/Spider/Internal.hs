@@ -249,6 +249,13 @@ newtype Event x a = Event { unEvent :: Subscriber x a -> EventM x (EventSubscrip
 subscribeAndRead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
 subscribeAndRead = unEvent
 
+subscribeAndReadWithHeight :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Height, Maybe a)
+subscribeAndReadWithHeight e subscriber = do
+  (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e subscriber
+  height <- liftIO $ getEventSubscribedHeight subd
+  pure (subscription, height, occ)
+  
+
 {-# RULES
 "cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
 "cacheEvent/pushCheap" forall f e. pushCheap f (cacheEvent e) = cacheEvent (pushCheap f e)
@@ -441,16 +448,6 @@ eventHold !h = Event $ subscribeHoldEvent h
 
 eventDyn :: (HasSpiderTimeline x, Patch p) => Dyn x p -> Event x p
 eventDyn !j = Event $ \sub -> getDynHold j >>= \h -> subscribeHoldEvent h sub
-
-{-# INLINE subscribeCoincidenceInner #-}
-subscribeCoincidenceInner :: HasSpiderTimeline x => Event x a -> Height -> CoincidenceSubscribed x a -> EventM x (Maybe a, Height, EventSubscribed x)
-subscribeCoincidenceInner inner outerHeight subscribedUnsafe = do
-  subInner <- liftIO $ newSubscriberCoincidenceInner subscribedUnsafe
-  (subscription@(EventSubscription _ innerSubd), innerOcc) <- subscribeAndRead inner subInner
-  innerHeight <- liftIO $ getEventSubscribedHeight innerSubd
-  let height = max innerHeight outerHeight
-  defer $ SomeResetCoincidence subscription $ if height > outerHeight then Just subscribedUnsafe else Nothing
-  return (innerOcc, height, innerSubd)
 
 --------------------------------------------------------------------------------
 -- Subscriber
@@ -1277,33 +1274,42 @@ coincidence coincidenceParent =
         innerParent = maybeToList maybeInnerSubscription
     return $ outerParent : innerParent)
   (\subscribed -> do -- TODO: subscribed was originally called 'subscribedUnsafe', why? Probably because it might not be initialized so you have to be lazy in examining it?
-      -- TODO: is there a shared pattern with newSubscribedCoincidenceOuter and newSubscriberSwitch?
-      subOuter <- liftIO $ flip (newSubscriberCommon "SubscriberCoincidenceOuter" coincidenceSubscribedCommon) subscribed $ \subscribedCommon a -> {-# SCC "traverseCoincidenceOuter" #-} do
-        outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
-        tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
-        (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight subscribed
-        tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
-        tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
-        writeAndScheduleClear (coincidenceSubscribedInnerParent subscribed) . Just $ innerSubd
-        case occ of
-          Nothing ->
-            when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
-              writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
-              WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight outerHeight
-              WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ recalculateSubscriberHeight innerHeight
-          Just o -> -- Since it's already firing, no need to adjust height
-            writeAndScheduleClearAndPropagate
-              (commonSubscribedOccurrence subscribedCommon)
-              (commonSubscribedSubscribers subscribedCommon)
-              o
-      -- TODO: look for the subscribeAndRead-only-use-subd-for-height pattern elsewhere in the code
-      (outerSubscription@(EventSubscription _ outerSubd), outerOcc) <-
-        subscribeAndRead coincidenceParent subOuter
-      outerHeight <- liftIO $ getEventSubscribedHeight outerSubd
+      -- {-# INLINE subscribeCoincidenceInner #-}
+      let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height, EventSubscribed x)
+          subscribeCoincidenceInner inner outerHeight = do
+            subInner <- liftIO $ newSubscriberCoincidenceInner subscribed
+            (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <- subscribeAndReadWithHeight inner subInner
+            let height = max innerHeight outerHeight
+            defer $ SomeResetCoincidence subscription $
+              if height > outerHeight then Just subscribed else Nothing
+            return (innerOcc, height, innerSubd)
+      subOuter <- liftIO $
+        flip (newSubscriberCommon "SubscriberCoincidenceOuter" coincidenceSubscribedCommon) subscribed
+        $ \subscribedCommon a -> {-# SCC "traverseCoincidenceOuter" #-} do
+          outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
+          tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
+          (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
+          tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
+          tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
+          writeAndScheduleClear (coincidenceSubscribedInnerParent subscribed) . Just $ innerSubd
+          case occ of
+            Nothing ->
+              when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
+                writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
+                WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
+                  $ invalidateSubscriberHeight outerHeight
+                WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
+                  $ recalculateSubscriberHeight innerHeight
+            Just o -> -- Since it's already firing, no need to adjust height
+              writeAndScheduleClearAndPropagate
+                (commonSubscribedOccurrence subscribedCommon)
+                (commonSubscribedSubscribers subscribedCommon)
+                o
+      (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent subOuter
       (occ, height, mInnerSubd) <- case outerOcc of
         Nothing -> return (Nothing, outerHeight, Nothing)
         Just o -> do
-          (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight subscribed
+          (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight
           return (occ, height, Just innerSubd)
       innerSubdRef <- newAndScheduleClear mInnerSubd
       pure (occ, height, \c ->
