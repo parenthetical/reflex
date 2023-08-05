@@ -1250,9 +1250,8 @@ switch switchParent =
         parentsRef <- liftIO $ newIORef []
         holdInits <- getDeferralQueue
         e <- liftIO $ runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits
-        (subscription@(EventSubscription _ subd), parentOcc) <- subscribeAndRead e mySub
+        (subscription, height, parentOcc) <- subscribeAndReadWithHeight e mySub
         subscriptionRef <- liftIO $ newIORef subscription
-        height <- liftIO $ getEventSubscribedHeight subd
         pure (parentOcc, height, \c ->
                                      SwitchSubscribed
                                    { switchSubscribedCommon = c
