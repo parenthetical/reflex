@@ -1243,14 +1243,15 @@ switch switchParent =
         return [_eventSubscription_subscribed s])
     (\subscribedUnsafe -> do
         i <- liftIO $ newInvalidatorSwitch subscribedUnsafe
-        mySub <- liftIO $ newSubscriberSwitch subscribedUnsafe
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorSwitch"
-        wiRef <- liftIO $ newIORef wi
         -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
         parentsRef <- liftIO $ newIORef []
         holdInits <- getDeferralQueue
-        e <- liftIO $ runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits
-        (subscription, height, parentOcc) <- subscribeAndReadWithHeight e mySub
+        (subscription, height, parentOcc) <-
+          join $ subscribeAndReadWithHeight
+          <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
+          <*> liftIO (newSubscriberSwitch subscribedUnsafe)
+        wiRef <- liftIO $ newIORef wi
         subscriptionRef <- liftIO $ newIORef subscription
         pure (parentOcc, height, \c ->
                                      SwitchSubscribed
