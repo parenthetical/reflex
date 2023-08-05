@@ -1681,8 +1681,7 @@ fanInt p = unsafePerformIO $ do
             liftIO $ writeIORef (_fanInt_occRef self) m
             scheduleIntClear $ _fanInt_occRef self
             FastMutableIntMap.forIntersectionWithImmutable_ (_fanInt_subscribers self) m $ \b v ->  --TODO: Do we need to know that no subscribers are being added as we traverse?
-              FastWeakBag.traverse_ b $ \s ->
-                subscriberPropagate s v
+              propagateFast v b
         , subscriberInvalidateHeight = \old ->
             FastMutableIntMap.for_ (_fanInt_subscribers self) $ \b ->
               FastWeakBag.traverse_ b $ \s ->
