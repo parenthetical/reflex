@@ -1966,12 +1966,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
         , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
         }
-  let invalidateMyHeight = do
-          oldHeight <- readIORef heightRef
-          -- If the height used to be valid, it must be invalid now; we should never have *more* heights than we have parents
-          when (oldHeight /= invalidHeight) $ do
-            writeIORef heightRef $! invalidHeight
-            subscriberInvalidateHeight sub oldHeight
+  let invalidateMyHeight = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
   let recalculateMyHeight = do
           currentHeight <- readIORef $ heightRef
           -- revalidateMergeHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
@@ -2257,13 +2252,18 @@ succHeight h@(Height a) =
   then invalidHeight
   else Height $ succ a
 
--- TODO: for invalidateCommonHeight, updateCommonHeight, etc. under here: find commonalities
-invalidateCommonHeight :: IORef Height -> WeakBag (Subscriber x a) -> IO ()
-invalidateCommonHeight heightRef subscribers = do
+-- TODO: what should this function be called?
+invalidateHeightRef :: IORef Height -> (Height -> IO ()) -> IO ()
+invalidateHeightRef heightRef doOnInvalidate = do
   oldHeight <- readIORef heightRef
+  -- Don't do anything if the height is already invalid
   when (oldHeight /= invalidHeight) $ do
     writeIORef heightRef $! invalidHeight
-    WeakBag.traverse_ subscribers $ invalidateSubscriberHeight oldHeight
+    doOnInvalidate oldHeight
+
+invalidateCommonHeight :: IORef Height -> WeakBag (Subscriber x a) -> IO ()
+invalidateCommonHeight heightRef subscribers =
+  invalidateHeightRef heightRef (WeakBag.traverse_ subscribers . invalidateSubscriberHeight)
 
 updateCommonHeight :: IORef Height -> WeakBag (Subscriber x a) -> Height -> IO ()
 updateCommonHeight heightRef subscribers newHeight = do
