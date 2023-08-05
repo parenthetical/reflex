@@ -1678,6 +1678,7 @@ fanInt p = unsafePerformIO $ do
       let desc = "fanInt" <> showNodeId self <> ", k = "  <> show k
       (subscription, parentOcc) <- subscribeAndRead p $ debugSubscriber' desc $ Subscriber
         { subscriberPropagate = \m -> do
+            -- TODO: this is like writeAndScheduleClearAndPropagate
             liftIO $ writeIORef (_fanInt_occRef self) m
             scheduleIntClear $ _fanInt_occRef self
             FastMutableIntMap.forIntersectionWithImmutable_ (_fanInt_subscribers self) m $ \b v ->  --TODO: Do we need to know that no subscribers are being added as we traverse?
