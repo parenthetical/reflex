@@ -1286,10 +1286,10 @@ coincidence coincidenceParent =
         flip (newSubscriberCommon "SubscriberCoincidenceOuter" coincidenceSubscribedCommon) subscribed
         $ \subscribedCommon a -> {-# SCC "traverseCoincidenceOuter" #-} do
           outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
-          tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
+          -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
           (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
-          tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
-          tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
+          -- tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
+          -- tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
           writeAndScheduleClear (coincidenceSubscribedInnerParent subscribed) innerSubd
           case occ of
             Nothing ->
