@@ -1211,6 +1211,9 @@ switch switchParent =
         i <- liftIO $ newInvalidatorSwitch subscribedUnsafe
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorSwitch"
         -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
+        -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
+        --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
+        --          in Behavior to fix that TODO?
         parentsRef <- liftIO $ newIORef []
         holdInits <- getDeferralQueue
         (subscription, height, parentOcc) <-
