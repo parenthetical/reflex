@@ -918,32 +918,6 @@ hold v0 e = do
   defer $ SomeHoldInit h
   return h
 
--- TODO: only used once
-{-# INLINE getHoldEventSubscription #-}
-getHoldEventSubscription :: forall p x. (HasSpiderTimeline x, Patch p) => Hold x p -> EventM x (EventSubscription x)
-getHoldEventSubscription h = do
-  ep <- liftIO $ readIORef $ holdParent h
-  case ep of
-    Just subd -> return subd
-    Nothing -> do
-      let e = holdEvent h
-      subscriptionRef <- liftIO $ newIORef $ error "getHoldEventSubscription: subdRef uninitialized"
-      (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e =<< liftIO (newSubscriberHold h)
-      liftIO $ writeIORef subscriptionRef $! subscription
-      case occ of
-        Nothing -> return ()
-        Just o -> do
-          old <- liftIO $ readIORef $ holdValue h
-          case apply o old of
-            Nothing -> return ()
-            Just new -> do
-              -- Need to evaluate these so that we don't retain the Hold itself
-              v <- liftIO $ evaluate $ holdValue h
-              i <- liftIO $ evaluate $ holdInvalidators h
-              defer $ SomeAssignment v i new
-      liftIO $ writeIORef (holdParent h) $ Just subscription
-      return subscription
-
 type BehaviorEnv x = (Maybe (Weak (Invalidator x), IORef [SomeBehaviorSubscribed x]), IORef [SomeHoldInit x])
 
 -- BehaviorM can sample behaviors
@@ -2106,7 +2080,27 @@ runHoldInits holdInitRef dynInitRef mergeInitRef = do
     runHoldInits holdInitRef dynInitRef mergeInitRef
 
 initHold :: HasSpiderTimeline x => SomeHoldInit x -> EventM x ()
-initHold (SomeHoldInit h) = void $ getHoldEventSubscription h
+initHold (SomeHoldInit h) =  do
+  ep <- liftIO $ readIORef $ holdParent h
+  case ep of
+    Just _subd -> pure ()
+    Nothing -> do
+      let e = holdEvent h
+      subscriptionRef <- liftIO $ newIORef $ error "getHoldEventSubscription: subdRef uninitialized"
+      (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e =<< liftIO (newSubscriberHold h)
+      liftIO $ writeIORef subscriptionRef $! subscription
+      case occ of
+        Nothing -> return ()
+        Just o -> do
+          old <- liftIO $ readIORef $ holdValue h
+          case apply o old of
+            Nothing -> return ()
+            Just new -> do
+              -- Need to evaluate these so that we don't retain the Hold itself
+              v <- liftIO $ evaluate $ holdValue h
+              i <- liftIO $ evaluate $ holdInvalidators h
+              defer $ SomeAssignment v i new
+      liftIO $ writeIORef (holdParent h) $ Just subscription
 
 initDyn :: HasSpiderTimeline x => SomeDynInit x -> EventM x ()
 initDyn (SomeDynInit d) = void $ getDynHold d
