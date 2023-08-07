@@ -1219,9 +1219,9 @@ switch switchParent =
         (subscription, height, parentOcc) <-
           join $ subscribeAndReadWithHeight
           <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
-          <*> liftIO (newSubscriberCommon "SubscriberSwitch" (\doPropagate a -> -- TODO: SubscriberSwitch is created in runFrame as well, why? Refactor to one place only??
-                                                                  {-# SCC "traverseSwitch" #-}
-                                                                  doPropagate a)
+          <*> liftIO (newSubscriberCommon "SubscriberSwitch"
+                      -- TODO: SubscriberSwitch is created in runFrame as well, why? Refactor to one place only??
+                      (\doPropagate -> {-# SCC "traverseSwitch" #-} doPropagate)
                       . subscribedCommon_
                       $ subscribedUnsafe)
         wiRef <- liftIO $ newIORef wi
