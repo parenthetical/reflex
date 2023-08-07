@@ -1256,11 +1256,12 @@ switch switchParent =
                                                    , switchSubscribedCurrentParent = subscriptionRef
                                                    }))
 
+-- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
 coincidence :: forall x a. HasSpiderTimeline x => Event x (Event x a) -> Event x a
 coincidence coincidenceParent =
   commonEvent
-  (unsubscribe . coincidenceSubscribedOuterParent)
-  (\subscribedSpecific -> do
+  (unsubscribe . coincidenceSubscribedOuterParent) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
+  (\subscribedSpecific -> do -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
     maybeInnerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribedSpecific
     let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
         innerParent = maybeToList maybeInnerSubscription
@@ -2271,6 +2272,9 @@ recalculateAndUpdateHeight calculate (ASubscribed subscribedSpecific subscribedC
   updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
      =<< calculate subscribedSpecific
 
+-- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
+--     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
+--     of all used heights.
 -- TODO: calculate functions only use specific
 calculateSwitchHeight :: SwitchSubscribed_ x a -> IO Height
 calculateSwitchHeight =
@@ -2280,7 +2284,7 @@ calculateCoincidenceHeight :: CoincidenceSubscribed_ x a -> IO Height
 calculateCoincidenceHeight subscribedSpecific = do
   outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
   innerHeight <- maybe (return zeroHeight) getEventSubscribedHeight =<< readIORef (coincidenceSubscribedInnerParent subscribedSpecific)
-  return $ if outerHeight == invalidHeight || innerHeight == invalidHeight
+  return $ if outerHeight == invalidHeight || innerHeight == invalidHeight -- TODO: why not order heights with invalid as Top?
            then invalidHeight
            else max outerHeight innerHeight
 
