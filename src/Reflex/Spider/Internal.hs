@@ -2215,11 +2215,25 @@ runFrame a = SpiderHost $ do
     mapM_ (\(ASubscribed _subscribedSpecific subscribedCommon) ->
              invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon))
        mcs
+  -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
+  --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
+  --     of all used heights.
+  -- TODO: calculate functions only use specific
+  let recalculateAndUpdateHeight :: forall s b. (s x b -> IO Height) -> ASubscribed s x b -> IO ()
+      recalculateAndUpdateHeight calculate (ASubscribed subscribedSpecific subscribedCommon) =
+        updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
+        =<< calculate subscribedSpecific
   forM_ coincidenceInfos $ \(SomeResetCoincidence _ mcs) ->
-    mapM_ (recalculateAndUpdateHeight calculateCoincidenceHeight) mcs
+    forM_ mcs . recalculateAndUpdateHeight $ \subscribedSpecific -> do
+        outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
+        innerHeight <- maybe (return zeroHeight) getEventSubscribedHeight =<< readIORef (coincidenceSubscribedInnerParent subscribedSpecific)
+        return $ if outerHeight == invalidHeight || innerHeight == invalidHeight -- TODO: why not order heights with invalid as Top?
+                 then invalidHeight
+                 else max outerHeight innerHeight
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
   forM_ toReconnect $ \(SomeSwitchSubscribed subscribed) ->
-    recalculateAndUpdateHeight calculateSwitchHeight subscribed
+    flip recalculateAndUpdateHeight subscribed
+    $ getEventSubscribedHeight . _eventSubscription_subscribed <=< readIORef . switchSubscribedCurrentParent
   return result
 
 newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
@@ -2266,27 +2280,6 @@ updateCommonHeight heightRef subscribers newHeight = do
     when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
       writeIORef heightRef $! newHeight
       WeakBag.traverse_ subscribers $ recalculateSubscriberHeight newHeight
-
-recalculateAndUpdateHeight :: (s x a -> IO Height) -> ASubscribed s x a -> IO ()
-recalculateAndUpdateHeight calculate (ASubscribed subscribedSpecific subscribedCommon) =
-  updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
-     =<< calculate subscribedSpecific
-
--- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
---     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
---     of all used heights.
--- TODO: calculate functions only use specific
-calculateSwitchHeight :: SwitchSubscribed_ x a -> IO Height
-calculateSwitchHeight =
-  getEventSubscribedHeight . _eventSubscription_subscribed <=< readIORef . switchSubscribedCurrentParent
-
-calculateCoincidenceHeight :: CoincidenceSubscribed_ x a -> IO Height
-calculateCoincidenceHeight subscribedSpecific = do
-  outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
-  innerHeight <- maybe (return zeroHeight) getEventSubscribedHeight =<< readIORef (coincidenceSubscribedInnerParent subscribedSpecific)
-  return $ if outerHeight == invalidHeight || innerHeight == invalidHeight -- TODO: why not order heights with invalid as Top?
-           then invalidHeight
-           else max outerHeight innerHeight
 
 data SomeSwitchSubscribed x = forall a. SomeSwitchSubscribed {-# NOUNPACK #-} (SwitchSubscribed x a)
 
