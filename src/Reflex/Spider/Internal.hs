@@ -507,20 +507,16 @@ newSubscriberCommon debugName propagateSpecific subscribedCommon =
         updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
     }
 
--- TODO: have these take CommonSubscribed, and then occ and
---   subscribers. The more specific the easier it will be to find
---   patterns.
 -- TODO: Why are newSubscriberSwitch and newSubscriberCoincidenceInner different in this way?
-newSubscriberSwitch :: forall x a. HasSpiderTimeline x => SwitchSubscribed x a -> IO (Subscriber x a)
+newSubscriberSwitch :: forall s x a. HasSpiderTimeline x => CommonSubscribed s x a -> IO (Subscriber x a)
 newSubscriberSwitch =
   newSubscriberCommon "SubscriberCoincidenceOuter" (\subscribedCommon ->
     {-# SCC "traverseSwitch" #-}
     writeAndScheduleClearAndPropagate
              (commonSubscribedOccurrence subscribedCommon)
              (commonSubscribedSubscribers subscribedCommon))
-  . subscribedCommon_
 
-newSubscriberCoincidenceInner :: forall x a. HasSpiderTimeline x => CoincidenceSubscribed x a -> IO (Subscriber x a)
+newSubscriberCoincidenceInner :: forall s x a. HasSpiderTimeline x => CommonSubscribed s x a -> IO (Subscriber x a)
 newSubscriberCoincidenceInner =
   newSubscriberCommon "SubscriberCoincidenceInner" (\subscribedCommon a -> do
     occ <- liftIO $ readIORef $ commonSubscribedOccurrence subscribedCommon
@@ -531,7 +527,6 @@ newSubscriberCoincidenceInner =
            (commonSubscribedOccurrence subscribedCommon)
            (commonSubscribedSubscribers subscribedCommon)
            a)
-  . subscribedCommon_
 
 invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
 invalidateSubscriberHeight = flip subscriberInvalidateHeight
@@ -1267,7 +1262,7 @@ switch switchParent =
         (subscription, height, parentOcc) <-
           join $ subscribeAndReadWithHeight
           <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
-          <*> liftIO (newSubscriberSwitch subscribedUnsafe)
+          <*> liftIO (newSubscriberSwitch . subscribedCommon_ $ subscribedUnsafe)
         wiRef <- liftIO $ newIORef wi
         subscriptionRef <- liftIO $ newIORef subscription
         pure (parentOcc, height, SwitchSubscribed_ { switchSubscribedOwnInvalidator = i
@@ -1291,7 +1286,7 @@ coincidence coincidenceParent =
       -- {-# INLINE subscribeCoincidenceInner #-}
       let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height, EventSubscribed x)
           subscribeCoincidenceInner inner outerHeight = do
-            subInner <- liftIO $ newSubscriberCoincidenceInner subscribed
+            subInner <- liftIO $ newSubscriberCoincidenceInner subscribedCommon
             (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <- subscribeAndReadWithHeight inner subInner
             let height = max innerHeight outerHeight
             defer $ SomeResetCoincidence subscription $
@@ -2193,7 +2188,7 @@ runFrame a = SpiderHost $ do
   -- unify this "run something to get subscriptions to kill" pattern
   -- some other way?
   -- TODO: I meant that maybe the code below can be put in the definition for switch to make patterns obvious, but I'm not sure that's a good idea.
-  switchSubscriptionsToKill <- forM toReconnect $ \(SomeSwitchSubscribed subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> {-# SCC "switchSubscribed" #-} do
+  switchSubscriptionsToKill <- forM toReconnect $ \(SomeSwitchSubscribed (ASubscribed subscribedSpecific subscribedCommon)) -> {-# SCC "switchSubscribed" #-} do
     oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
     wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribedSpecific
     traceInvalidate $ "Finalizing invalidator for Switch" <> showNodeId subscribedCommon
@@ -2210,7 +2205,7 @@ runFrame a = SpiderHost $ do
     --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
     subscription <- unSpiderHost .
       runFrame . subscribe e =<< {-# SCC "subscribeSwitch" #-}
-         newSubscriberSwitch subscribed --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+         newSubscriberSwitch subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
     writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
     return oldSubscription
   -- TODO: there is a pattern in the structure here? First unsubscribes, then invalidates, then calculates.
@@ -2218,7 +2213,7 @@ runFrame a = SpiderHost $ do
   --   This way patterns in the code might become more obvious.
   liftIO $ mapM_ unsubscribe mergeSubscriptionsToKill
   liftIO $ mapM_ unsubscribe switchSubscriptionsToKill
-  forM_ toReconnect $ \(SomeSwitchSubscribed subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> {-# SCC "switchSubscribed" #-} do
+  forM_ toReconnect $ \(SomeSwitchSubscribed (ASubscribed subscribedSpecific subscribedCommon)) -> {-# SCC "switchSubscribed" #-} do
     EventSubscription _ subd' <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
     parentHeight <- getEventSubscribedHeight subd'
     myHeight <- readIORef $ commonSubscribedHeight subscribedCommon
