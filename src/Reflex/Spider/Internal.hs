@@ -489,44 +489,24 @@ newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId su
       forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
   }
 
-
--- TODO: can we make this take CommonSubscribed instead of ASubscribed
-newSubscriberCommon :: forall {k} {x1} {s :: k -> * -> *} {x2 :: k} {a1} {a2}.
-  (HasSpiderTimeline x1, HasNodeId (CommonSubscribed s x2 a1)) =>
-  String
-  -> (CommonSubscribed s x2 a1 -> a2 -> EventM x1 ())
+-- TODO: this only uses occRef, subscribers, nodeId, and heightRef. Is this another hint that the more minimal "CommonSubscribed"
+--     which only has these is a good idea?
+newSubscriberCommon :: (HasSpiderTimeline x1, HasSpiderTimeline x2)
+  => String
+  -> ((a1 -> EventM x2 ()) -> a2 -> EventM x1 ())
   -> CommonSubscribed s x2 a1
   -> IO (Subscriber x1 a2)
 newSubscriberCommon debugName propagateSpecific subscribedCommon =
   debugSubscriber (debugName <> showNodeId subscribedCommon) $
   Subscriber
-    { subscriberPropagate = propagateSpecific subscribedCommon
+    { subscriberPropagate =
+      propagateSpecific
+      $ writeAndScheduleClearAndPropagate (commonSubscribedOccurrence subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
     , subscriberInvalidateHeight = \_ ->
         invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
     , subscriberRecalculateHeight =
         updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
     }
-
--- TODO: Why are newSubscriberSwitch and newSubscriberCoincidenceInner different in this way?
-newSubscriberSwitch :: forall s x a. HasSpiderTimeline x => CommonSubscribed s x a -> IO (Subscriber x a)
-newSubscriberSwitch =
-  newSubscriberCommon "SubscriberCoincidenceOuter" (\subscribedCommon ->
-    {-# SCC "traverseSwitch" #-}
-    writeAndScheduleClearAndPropagate
-             (commonSubscribedOccurrence subscribedCommon)
-             (commonSubscribedSubscribers subscribedCommon))
-
-newSubscriberCoincidenceInner :: forall s x a. HasSpiderTimeline x => CommonSubscribed s x a -> IO (Subscriber x a)
-newSubscriberCoincidenceInner =
-  newSubscriberCommon "SubscriberCoincidenceInner" (\subscribedCommon a -> do
-    occ <- liftIO $ readIORef $ commonSubscribedOccurrence subscribedCommon
-    case occ of
-      Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
-      Nothing ->
-        writeAndScheduleClearAndPropagate
-           (commonSubscribedOccurrence subscribedCommon)
-           (commonSubscribedSubscribers subscribedCommon)
-           a)
 
 invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
 invalidateSubscriberHeight = flip subscriberInvalidateHeight
@@ -1262,7 +1242,11 @@ switch switchParent =
         (subscription, height, parentOcc) <-
           join $ subscribeAndReadWithHeight
           <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
-          <*> liftIO (newSubscriberSwitch . subscribedCommon_ $ subscribedUnsafe)
+          <*> liftIO (newSubscriberCommon "SubscriberSwitch" (\doPropagate a -> -- TODO: SubscriberSwitch is created in runFrame as well, why? Refactor to one place only??
+                                                                  {-# SCC "traverseSwitch" #-}
+                                                                  doPropagate a)
+                      . subscribedCommon_
+                      $ subscribedUnsafe)
         wiRef <- liftIO $ newIORef wi
         subscriptionRef <- liftIO $ newIORef subscription
         pure (parentOcc, height, SwitchSubscribed_ { switchSubscribedOwnInvalidator = i
@@ -1286,7 +1270,11 @@ coincidence coincidenceParent =
       -- {-# INLINE subscribeCoincidenceInner #-}
       let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height, EventSubscribed x)
           subscribeCoincidenceInner inner outerHeight = do
-            subInner <- liftIO $ newSubscriberCoincidenceInner subscribedCommon
+            subInner <- liftIO $ flip (newSubscriberCommon "SubscriberCoincidenceInner") subscribedCommon $ \doPropagate a -> do
+                                      occ <- liftIO $ readIORef (commonSubscribedOccurrence subscribedCommon)
+                                      case occ of
+                                        Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
+                                        Nothing -> doPropagate a
             (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <- subscribeAndReadWithHeight inner subInner
             let height = max innerHeight outerHeight
             defer $ SomeResetCoincidence subscription $
@@ -1294,7 +1282,7 @@ coincidence coincidenceParent =
             return (innerOcc, height, innerSubd)
       subOuter <- liftIO $
         flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed)
-        $ \subscribedCommon a -> {-# SCC "traverseCoincidenceOuter" #-} do
+        $ \doPropagate a -> {-# SCC "traverseCoincidenceOuter" #-} do
           outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
           -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
           (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
@@ -1309,11 +1297,7 @@ coincidence coincidenceParent =
                   $ invalidateSubscriberHeight outerHeight
                 WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
                   $ recalculateSubscriberHeight innerHeight
-            Just o -> -- Since it's already firing, no need to adjust height
-              writeAndScheduleClearAndPropagate
-                (commonSubscribedOccurrence subscribedCommon)
-                (commonSubscribedSubscribers subscribedCommon)
-                o
+            Just o -> doPropagate o -- Since it's already firing, no need to adjust height
       (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent subOuter
       (occ, height, mInnerSubd) <- case outerOcc of
         Nothing -> return (Nothing, outerHeight, Nothing)
@@ -2205,7 +2189,10 @@ runFrame a = SpiderHost $ do
     --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
     subscription <- unSpiderHost .
       runFrame . subscribe e =<< {-# SCC "subscribeSwitch" #-}
-         newSubscriberSwitch subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+         newSubscriberCommon "SubscriberSwitch" (\doPropagate a ->
+                                                    {-# SCC "traverseSwitch" #-}
+                                                    doPropagate a)
+         subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
     writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
     return oldSubscription
   -- TODO: there is a pattern in the structure here? First unsubscribes, then invalidates, then calculates.
