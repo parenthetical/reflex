@@ -53,12 +53,12 @@ flag fast-weak
 
 flag debug-propagation
   description: Enable debugging of spider internals
-  default: True
+  default: False
   manual: True
 
 flag debug-cycles
   description: Enable debugging of event cycles
-  default: True
+  default: False
   manual: True
 
 flag split-these
