@@ -425,23 +425,11 @@ wrap tag getSpecificSubscribed sub = do
   let es = tag subd
   return (EventSubscription (WeakBag.remove sln >> touch sln) es, occ)
 
-eventRoot :: (GCompare k, HasSpiderTimeline x) => k a -> Root x k -> Event x a
-eventRoot !k !r = Event $ wrap eventSubscribedRoot $ liftIO . getRootSubscribed k r
-
 subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
 subscribeAndReadNever = return (EventSubscription (return ()) eventSubscribedNever, Nothing)
 
 eventNever :: Event x a
 eventNever = Event $ const subscribeAndReadNever
-
-eventFan :: (GCompare k, HasSpiderTimeline x) => k a -> Fan x k v -> Event x (v a)
-eventFan !k !f = Event $ wrap eventSubscribedFan $ getFanSubscribed k f
-
-eventHold :: Hold x p -> Event x p
-eventHold !h = Event $ subscribeHoldEvent h
-
-eventDyn :: (HasSpiderTimeline x, Patch p) => Dyn x p -> Event x p
-eventDyn !j = Event $ \sub -> getDynHold j >>= \h -> subscribeHoldEvent h sub
 
 --------------------------------------------------------------------------------
 -- Subscriber
@@ -451,32 +439,6 @@ data Subscriber x a = Subscriber
   { subscriberPropagate :: !(a -> EventM x ())
   , subscriberInvalidateHeight :: !(Height -> IO ())
   , subscriberRecalculateHeight :: !(Height -> IO ())
-  }
-
-newSubscriberHold :: (HasSpiderTimeline x, Patch p) => Hold x p -> IO (Subscriber x p)
-newSubscriberHold h = return $ Subscriber
-  { subscriberPropagate = {-# SCC "traverseHold" #-} propagateSubscriberHold h
-  , subscriberInvalidateHeight = \_ -> return ()
-  , subscriberRecalculateHeight = \_ -> return ()
-  }
-
-newSubscriberFan :: forall x k v. (HasSpiderTimeline x, GCompare k) => FanSubscribed x k v -> IO (Subscriber x (DMap k v))
-newSubscriberFan subscribed = debugSubscriber ("SubscriberFan " <> showNodeId subscribed)  $ Subscriber
-  { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-      subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribed
-      tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-      writeAndScheduleClear (fanSubscribedOccurrence subscribed) a
-      let f _ (Pair v subsubs) = do
-            propagate v $ _fanSubscribedChildren_list subsubs
-            return $ Constant ()
-      _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
-      return ()
-  , subscriberInvalidateHeight = \old -> do
-      subscribers <- readIORef $ fanSubscribedSubscribers subscribed
-      forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
-  , subscriberRecalculateHeight = \new -> do
-      subscribers <- readIORef $ fanSubscribedSubscribers subscribed
-      forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
   }
 
 -- TODO: this only uses occRef, subscribers, nodeId, and heightRef. Is this another hint that the more minimal "CommonSubscribed"
@@ -489,9 +451,9 @@ newSubscriberCommon :: (HasSpiderTimeline x1, HasSpiderTimeline x2)
 newSubscriberCommon debugName propagateSpecific subscribedCommon =
   debugSubscriber (debugName <> showNodeId subscribedCommon) $
   Subscriber
-    { subscriberPropagate =
-      propagateSpecific
-      $ writeAndScheduleClearAndPropagate (commonSubscribedOccurrence subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
+    { subscriberPropagate = propagateSpecific $ \val -> do
+        writeAndScheduleClear (commonSubscribedOccurrence subscribedCommon) val
+        propagate val (commonSubscribedSubscribers subscribedCommon)
     , subscriberInvalidateHeight = \_ ->
         invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
     , subscriberRecalculateHeight =
@@ -621,34 +583,6 @@ behaviorHoldIdentity = behaviorHold
 behaviorConst :: a -> Behavior x a
 behaviorConst !a = Behavior $ return a
 
--- TODO: only used once
-behaviorPull :: Pull x a -> Behavior x a
-behaviorPull !p = Behavior $ do
-    val <- liftIO $ readIORef $ pullValue p
-    case val of
-      Just subscribed -> do
-        askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
-        askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (pullSubscribedInvalidators subscribed) (wi:))
-        liftIO $ touch $ pullSubscribedOwnInvalidator subscribed
-        return $ pullSubscribedValue subscribed
-      Nothing -> do
-        i <- liftIO $ newInvalidatorPull p
-        wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorPull"
-        parentsRef <- liftIO $ newIORef []
-        holdInits <- askBehaviorHoldInits
-        a <- liftIO $ runReaderIO (unBehaviorM $ pullCompute p) (Just (wi, parentsRef), holdInits)
-        invsRef <- liftIO . newIORef . maybeToList =<< askInvalidator
-        parents <- liftIO $ readIORef parentsRef
-        let subscribed = PullSubscribed
-              { pullSubscribedValue = a
-              , pullSubscribedInvalidators = invsRef
-              , pullSubscribedOwnInvalidator = i
-              , pullSubscribedParents = parents
-              }
-        liftIO $ writeIORef (pullValue p) $ Just subscribed
-        askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
-        return a
-
 behaviorDyn :: Patch p => Dyn x p -> Behavior x (PatchTarget p)
 behaviorDyn !d = Behavior $ readHoldTracked =<< getDynHold d
 
@@ -686,7 +620,7 @@ deriving instance (HasSpiderTimeline x) => Functor (Dynamic x target)
 dynamicHold :: Hold x p -> DynamicS x p
 dynamicHold !h = Dynamic
   { dynamicCurrent = behaviorHold h
-  , dynamicUpdated = eventHold h
+  , dynamicUpdated = Event $ subscribeHoldEvent h
   }
 
 dynamicHoldIdentity :: Hold x (Identity a) -> DynamicS x (Identity a)
@@ -701,7 +635,7 @@ dynamicConst !a = Dynamic
 dynamicDyn :: (HasSpiderTimeline x, Patch p) => Dyn x p -> DynamicS x p
 dynamicDyn !d = Dynamic
   { dynamicCurrent = behaviorDyn d
-  , dynamicUpdated = eventDyn d
+  , dynamicUpdated = Event $ \sub -> getDynHold d >>= \h -> subscribeHoldEvent h sub
   }
 
 dynamicDynIdentity :: HasSpiderTimeline x => Dyn x (Identity a) -> DynamicS x (Identity a)
@@ -848,15 +782,6 @@ writeAndScheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> a -> m ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
   scheduleClear ref
-
-{-# INLINE writeAndScheduleClearAndPropagate #-}
-writeAndScheduleClearAndPropagate :: HasSpiderTimeline x =>
-  IORef (Maybe a) -> WeakBag (Subscriber x a) -> a -> EventM x ()
-writeAndScheduleClearAndPropagate ref subscribers val = do
-  liftIO $ writeIORef ref (Just val)
-  scheduleClear ref
-  propagate val subscribers
-
 
 {-# INLINE newAndScheduleClear #-}
 newAndScheduleClear :: Defer (Some Clear) m => Maybe a -> m (IORef (Maybe a))
@@ -1178,13 +1103,38 @@ pull a = unsafePerformIO $ do
 #ifdef DEBUG_NODEIDS
   nid <- newNodeId
 #endif
-  pure $ behaviorPull $ Pull
-    { pullCompute = a
-    , pullValue = ref
+  let !p = Pull
+        { pullCompute = a
+        , pullValue = ref
 #ifdef DEBUG_NODEIDS
-    , pullNodeId = nid
+        , pullNodeId = nid
 #endif
-    }
+        }
+  pure $ Behavior $ do
+    val <- liftIO $ readIORef $ pullValue p
+    case val of
+      Just subscribed -> do
+        askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
+        askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (pullSubscribedInvalidators subscribed) (wi:))
+        liftIO $ touch $ pullSubscribedOwnInvalidator subscribed
+        return $ pullSubscribedValue subscribed
+      Nothing -> do
+        i <- liftIO $ newInvalidatorPull p
+        wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorPull"
+        parentsRef <- liftIO $ newIORef []
+        holdInits <- askBehaviorHoldInits
+        a <- liftIO $ runReaderIO (unBehaviorM $ pullCompute p) (Just (wi, parentsRef), holdInits)
+        invsRef <- liftIO . newIORef . maybeToList =<< askInvalidator
+        parents <- liftIO $ readIORef parentsRef
+        let subscribed = PullSubscribed
+              { pullSubscribedValue = a
+              , pullSubscribedInvalidators = invsRef
+              , pullSubscribedOwnInvalidator = i
+              , pullSubscribedParents = parents
+              }
+        liftIO $ writeIORef (pullValue p) $ Just subscribed
+        askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
+        return a
 
 
 {-# INLINABLE switch #-}
@@ -1477,23 +1427,6 @@ instance Show EventLoopException where
 #endif
 
 
-{-# INLINE propagateSubscriberHold #-}
-propagateSubscriberHold :: forall x p. (HasSpiderTimeline x, Patch p) => Hold x p -> p -> EventM x ()
-propagateSubscriberHold h a = do
-  {-# SCC "trace" #-} when debugPropagate $ traceM (Proxy :: Proxy x) $ liftIO $ do
-    invalidators <- liftIO $ readIORef $ holdInvalidators h
-    return $ "SubscriberHold" <> showNodeId h <> ": " ++ show (length invalidators)
-
-  v <- {-# SCC "read" #-} liftIO $ readIORef $ holdValue h
-  case {-# SCC "apply" #-} apply a v of
-    Nothing -> return ()
-    Just v' -> do
-      {-# SCC "trace2" #-} withIncreasedDepth (Proxy :: Proxy x) $
-        tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId h)
-      vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ holdValue h
-      iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ holdInvalidators h
-      defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
-
 data SomeResetCoincidence x = forall a. SomeResetCoincidence !(EventSubscription x) !(Maybe (CoincidenceSubscribed x a)) -- The CoincidenceSubscriber will be present only if heights need to be reset
 
 runBehaviorM :: BehaviorM x a -> Maybe (Weak (Invalidator x), IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
@@ -1683,7 +1616,7 @@ fanIntSubscribed ticket self = do
 
 
 {-# INLINABLE getFanSubscribed #-}
-getFanSubscribed :: (HasSpiderTimeline x, GCompare k) => k a -> Fan x k v -> Subscriber x (v a) -> EventM x (WeakBagTicket, FanSubscribed x k v, Maybe (v a))
+getFanSubscribed :: forall x k v a. (HasSpiderTimeline x, GCompare k) => k a -> Fan x k v -> Subscriber x (v a) -> EventM x (WeakBagTicket, FanSubscribed x k v, Maybe (v a))
 getFanSubscribed k f sub = do
   mSubscribed <- liftIO $ readIORef $ fanSubscribed f
   case mSubscribed of
@@ -1694,7 +1627,23 @@ getFanSubscribed k f sub = do
     Nothing -> {-# SCC "missFan" #-} do
       subscribedRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribedRef not yet initialized"
       subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
-      s <- liftIO $ newSubscriberFan subscribedUnsafe
+      s <- liftIO $ debugSubscriber ("SubscriberFan " <> showNodeId subscribedUnsafe)  $ Subscriber
+        { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
+            subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
+            tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+            writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
+            let f _ (Pair v subsubs) = do
+                  propagate v $ _fanSubscribedChildren_list subsubs
+                  return $ Constant ()
+            _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
+            return ()
+        , subscriberInvalidateHeight = \old -> do
+            subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+            forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
+        , subscriberRecalculateHeight = \new -> do
+            subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+            forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
+        }
       (subscription, parentOcc) <- subscribeAndRead (fanParent f) s
       weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
       (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
@@ -2054,11 +2003,11 @@ fanG e = unsafePerformIO $ do
         { fanParent = e
         , fanSubscribed = ref
         }
-  pure $ EventSelectorG $ \k -> eventFan k f
+  pure $ EventSelectorG $ \(!k) -> Event $ wrap eventSubscribedFan $ getFanSubscribed k f
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
-runHoldInits :: HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeDynInit x] -> IORef [SomeMergeInit x] -> EventM x ()
+runHoldInits :: forall x. HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeDynInit x] -> IORef [SomeMergeInit x] -> EventM x ()
 runHoldInits holdInitRef dynInitRef mergeInitRef = do
   holdInits <- liftIO $ readIORef holdInitRef
   dynInits <- liftIO $ readIORef dynInitRef
@@ -2074,7 +2023,24 @@ runHoldInits holdInitRef dynInitRef mergeInitRef = do
         Nothing -> do
           let e = holdEvent h
           subscriptionRef <- liftIO $ newIORef $ error "getHoldEventSubscription: subdRef uninitialized"
-          (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e =<< liftIO (newSubscriberHold h)
+          (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
+             { subscriberPropagate = {-# SCC "traverseHold" #-} \a -> do
+                {-# SCC "trace" #-} when debugPropagate $ traceM (Proxy :: Proxy x) $ liftIO $ do
+                  invalidators <- liftIO $ readIORef $ holdInvalidators h
+                  return $ "SubscriberHold" <> showNodeId h <> ": " ++ show (length invalidators)
+              
+                v <- {-# SCC "read" #-} liftIO $ readIORef $ holdValue h
+                case {-# SCC "apply" #-} apply a v of
+                  Nothing -> return ()
+                  Just v' -> do
+                    {-# SCC "trace2" #-} withIncreasedDepth (Proxy :: Proxy x) $
+                      tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId h)
+                    vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ holdValue h
+                    iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ holdInvalidators h
+                    defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
+             , subscriberInvalidateHeight = \_ -> return ()
+             , subscriberRecalculateHeight = \_ -> return ()
+             }
           liftIO $ writeIORef subscriptionRef $! subscription
           case occ of
             Nothing -> return ()
@@ -2687,7 +2653,7 @@ newFanEventWithTriggerIO f = do
         , rootSubscribed = subscribedRef
         , rootInit = f
         }
-  return $ EventSelector $ \k -> eventRoot k r
+  return $ EventSelector $ \(!k) -> Event $ wrap eventSubscribedRoot $ liftIO . getRootSubscribed k r
 
 newtype ReadPhase x a = ReadPhase (ResultM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
