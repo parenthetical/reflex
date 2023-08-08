@@ -326,10 +326,6 @@ data CacheSubscribed x a
 #endif
                      }
 
-nowSpiderEventM :: (HasSpiderTimeline x) => EventM x (R.Event (SpiderTimeline x) ())
-nowSpiderEventM =
-  SpiderEvent <$> now
-
 now :: (MonadIO m, Defer (Some Clear) m, HasSpiderTimeline x
        ) => m (Event x ())
 now = do
@@ -2324,7 +2320,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
 --  headE = R.slowHeadE
   headE (SpiderEvent e) = SpiderEvent <$> Reflex.Spider.Internal.headE e
   {-# INLINABLE now #-}
-  now = nowSpiderEventM
+  now = SpiderEvent <$> now
 
 instance Reflex.Class.MonadSample (SpiderTimeline x) (SpiderPullM x) where
   {-# INLINABLE sample #-}
@@ -2347,7 +2343,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   -- headE = R.slowHeadE
   headE (SpiderEvent e) = SpiderPushM $ SpiderEvent <$> Reflex.Spider.Internal.headE e
   {-# INLINABLE now #-}
-  now = SpiderPushM nowSpiderEventM
+  now = SpiderPushM $ SpiderEvent <$> now
 
 
 instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) where
