@@ -447,9 +447,9 @@ newSubscriberCommon :: (HasSpiderTimeline x1, HasSpiderTimeline x2)
   => String
   -> ((a1 -> EventM x2 ()) -> a2 -> EventM x1 ())
   -> CommonSubscribed s x2 a1
-  -> IO (Subscriber x1 a2)
+  -> Subscriber x1 a2
 newSubscriberCommon debugName propagateSpecific subscribedCommon =
-  debugSubscriber (debugName <> showNodeId subscribedCommon) $
+  debugSubscriber' (debugName <> showNodeId subscribedCommon) $
   Subscriber
     { subscriberPropagate = propagateSpecific $ \val -> do
         writeAndScheduleClear (commonSubscribedOccurrence subscribedCommon) val
@@ -1143,7 +1143,7 @@ switch switchParent =
         (subscription, height, parentOcc) <-
           join $ subscribeAndReadWithHeight
           <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
-          <*> liftIO (newSubscriberCommon "SubscriberSwitch"
+          <*> pure (newSubscriberCommon "SubscriberSwitch"
                       -- TODO: SubscriberSwitch is created in runFrame as well, why? Refactor to one place only??
                       (\doPropagate -> {-# SCC "traverseSwitch" #-} doPropagate)
                       . subscribedCommon_
@@ -1172,7 +1172,7 @@ coincidence coincidenceParent =
       -- {-# INLINE subscribeCoincidenceInner #-}
       let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height, EventSubscribed x)
           subscribeCoincidenceInner inner outerHeight = do
-            subInner <- liftIO $ flip (newSubscriberCommon "SubscriberCoincidenceInner") subscribedCommon $ \doPropagate a -> do
+            let subInner = flip (newSubscriberCommon "SubscriberCoincidenceInner") subscribedCommon $ \doPropagate a -> do
                                       occ <- liftIO $ readIORef (commonSubscribedOccurrence subscribedCommon)
                                       case occ of
                                         Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
@@ -1182,24 +1182,24 @@ coincidence coincidenceParent =
             defer $ SomeResetCoincidence subscription $
               if height > outerHeight then Just subscribed else Nothing
             return (innerOcc, height, innerSubd)
-      subOuter <- liftIO $
-        flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed)
-        $ \doPropagate a -> {-# SCC "traverseCoincidenceOuter" #-} do
-          outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
-          -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
-          (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
-          -- tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
-          -- tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
-          writeAndScheduleClear (coincidenceSubscribedInnerParent subscribedSpecific) innerSubd
-          case occ of
-            Nothing ->
-              when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
-                writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
-                WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
-                  $ invalidateSubscriberHeight outerHeight
-                WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
-                  $ recalculateSubscriberHeight innerHeight
-            Just o -> doPropagate o -- Since it's already firing, no need to adjust height
+      let subOuter =
+           flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed)
+           $ \doPropagate a -> {-# SCC "traverseCoincidenceOuter" #-} do
+             outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
+             -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
+             (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
+             -- tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
+             -- tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
+             writeAndScheduleClear (coincidenceSubscribedInnerParent subscribedSpecific) innerSubd
+             case occ of
+               Nothing ->
+                 when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
+                   writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
+                   WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
+                     $ invalidateSubscriberHeight outerHeight
+                   WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
+                     $ recalculateSubscriberHeight innerHeight
+               Just o -> doPropagate o -- Since it's already firing, no need to adjust height
       (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent subOuter
       (occ, height, mInnerSubd) <- case outerOcc of
         Nothing -> return (Nothing, outerHeight, Nothing)
@@ -1343,15 +1343,9 @@ traceInvalidate _ = return ()
 traceInvalidateHeight :: String -> IO ()
 traceInvalidateHeight _ = return ()
 
-{-# INLINE debugSubscriber #-}
-debugSubscriber :: String -> Subscriber x a -> IO (Subscriber x a)
-debugSubscriber _ = return
-
 {-# INLINE debugSubscriber' #-}
 debugSubscriber' :: String -> Subscriber x a -> Subscriber x a
 debugSubscriber' _ = id
-
-
 
 {-# INLINE trace #-}
 trace :: (CanTrace x m) => proxy x ->  String -> m ()
@@ -1611,23 +1605,23 @@ getFanSubscribed k f sub = do
     Nothing -> {-# SCC "missFan" #-} do
       subscribedRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribedRef not yet initialized"
       subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
-      s <- liftIO $ debugSubscriber ("SubscriberFan " <> showNodeId subscribedUnsafe)  $ Subscriber
-        { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-            subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
-            tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-            writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
-            let f _ (Pair v subsubs) = do
-                  propagate v $ _fanSubscribedChildren_list subsubs
-                  return $ Constant ()
-            _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
-            return ()
-        , subscriberInvalidateHeight = \old -> do
-            subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-            forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
-        , subscriberRecalculateHeight = \new -> do
-            subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-            forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
-        }
+      let s = debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
+           { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
+               subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
+               tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+               writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
+               let f _ (Pair v subsubs) = do
+                     propagate v $ _fanSubscribedChildren_list subsubs
+                     return $ Constant ()
+               _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
+               return ()
+           , subscriberInvalidateHeight = \old -> do
+               subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+               forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
+           , subscriberRecalculateHeight = \new -> do
+               subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+               forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
+           }
       (subscription, parentOcc) <- subscribeAndRead (fanParent f) s
       weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
       (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
@@ -2120,7 +2114,7 @@ runFrame a = SpiderHost $ do
     runEventM $ runHoldInits (eventEnvHoldInits env) (eventEnvDynInits env) (eventEnvMergeInits env) --TODO: Is this actually OK? It seems like it should be, since we know that no events are firing at this point, but it still seems inelegant
     --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
     subscription <- unSpiderHost .
-      runFrame . subscribe e =<< {-# SCC "subscribeSwitch" #-}
+      runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-}
          newSubscriberCommon "SubscriberSwitch" (\doPropagate a ->
                                                     {-# SCC "traverseSwitch" #-}
                                                     doPropagate a)
