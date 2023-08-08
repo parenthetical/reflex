@@ -1056,22 +1056,6 @@ newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (DynType x p) }
 newMapDyn :: HasSpiderTimeline x => (a -> b) -> DynamicS x (Identity a) -> DynamicS x (Identity b)
 newMapDyn f d = dynamicDynIdentity $ unsafeBuildDynamic (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
 
---TODO: Avoid the duplication between this and R.zipDynWith
-zipDynWith :: HasSpiderTimeline x => (a -> b -> c) -> DynamicS x (Identity a) -> DynamicS x (Identity b) -> DynamicS x (Identity c)
-zipDynWith f da db =
-  let eab = align (dynamicUpdated da) (dynamicUpdated db)
-      ec = flip push eab $ \o -> do
-        (a, b) <- case o of
-          This (Identity a) -> do
-            b <- readBehaviorUntracked $ dynamicCurrent db
-            return (a, b)
-          That (Identity b) -> do
-            a <- readBehaviorUntracked $ dynamicCurrent da
-            return (a, b)
-          These (Identity a) (Identity b) -> return (a, b)
-        return $ Just $ Identity $ f a b
-  in dynamicDynIdentity $ unsafeBuildDynamic (f <$> readBehaviorUntracked (dynamicCurrent da) <*> readBehaviorUntracked (dynamicCurrent db)) ec
-
 buildDynamic :: (Defer (SomeDynInit x) m, Patch p) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
 buildDynamic readV0 v' = do
   result <- liftIO $ newIORef $ BuildDyn (readV0, v')
@@ -2339,9 +2323,9 @@ mapDynamicSpider f = SpiderDynamic . newMapDyn f . unSpiderDynamic
 instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
   pure = SpiderDynamic . dynamicConst
 #if MIN_VERSION_base(4,10,0)
-  liftA2 f a b = SpiderDynamic $ Reflex.Spider.Internal.zipDynWith f (unSpiderDynamic a) (unSpiderDynamic b)
+  liftA2 f a b = R.zipDynWith f a b
 #endif
-  SpiderDynamic a <*> SpiderDynamic b = SpiderDynamic $ Reflex.Spider.Internal.zipDynWith ($) a b
+  a <*> b = R.zipDynWith ($) a b
   a *> b = R.unsafeBuildDynamic (R.sample $ R.current b) $ R.leftmost [R.updated b, R.tag (R.current b) $ R.updated a]
   (<*) = flip (*>) -- There are no effects, so order doesn't matter
 
