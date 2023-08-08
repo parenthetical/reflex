@@ -388,38 +388,32 @@ cacheEvent e =
               subscribedTicket <- liftIO $ mkFastWeakTicket subscribed
               liftIO $ writeIORef mSubscribedRef =<< getFastWeakTicketWeak subscribedTicket
               return subscribedTicket
-          liftIO $ cacheSubscription sub mSubscribedRef subscribedTicket
-
-cacheSubscription :: Subscriber x a -> IORef (FastWeak (CacheSubscribed x a))
-                  -> FastWeakTicket (CacheSubscribed x a) -> IO (EventSubscription x, Maybe a)
-cacheSubscription sub mSubscribedRef subscribedTicket = do
-  subscribed <- getFastWeakTicketValue subscribedTicket
-  ticket <- FastWeakBag.insert sub $ _cacheSubscribed_subscribers subscribed
-  occ <- readIORef $ _cacheSubscribed_occurrence subscribed
-
-  let parentSub = _cacheSubscribed_parent subscribed
-      es = EventSubscription
-        { _eventSubscription_unsubscribe = do
-          FastWeakBag.remove ticket
-
-          isEmpty <- FastWeakBag.isEmpty $ _cacheSubscribed_subscribers subscribed
-          when isEmpty $ do
-            writeIORef mSubscribedRef emptyFastWeak
-            unsubscribe parentSub
-          touch ticket
-          touch subscribedTicket
-        , _eventSubscription_subscribed = EventSubscribed
-          { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub
-          , eventSubscribedRetained = toAny subscribedTicket
+          -- Cache subscription:
+          liftIO $ do
+            subscribed <- getFastWeakTicketValue subscribedTicket
+            ticket <- FastWeakBag.insert sub $ _cacheSubscribed_subscribers subscribed
+            occ <- readIORef $ _cacheSubscribed_occurrence subscribed
+            let parentSub = _cacheSubscribed_parent subscribed
+                es = EventSubscription
+                  { _eventSubscription_unsubscribe = do
+                    FastWeakBag.remove ticket
+                    isEmpty <- FastWeakBag.isEmpty $ _cacheSubscribed_subscribers subscribed
+                    when isEmpty $ do
+                      writeIORef mSubscribedRef emptyFastWeak
+                      unsubscribe parentSub
+                    touch ticket
+                    touch subscribedTicket
+                  , _eventSubscription_subscribed = EventSubscribed
+                    { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub
+                    , eventSubscribedRetained = toAny subscribedTicket
 #ifdef DEBUG_CYCLES
-          , eventSubscribedGetParents = return [_eventSubscription_subscribed parentSub]
-          , eventSubscribedHasOwnHeightRef = False
-          , eventSubscribedWhoCreated = whoCreatedIORef mSubscribedRef
+                    , eventSubscribedGetParents = return [_eventSubscription_subscribed parentSub]
+                    , eventSubscribedHasOwnHeightRef = False
+                    , eventSubscribedWhoCreated = whoCreatedIORef mSubscribedRef
 #endif
-          }
-        }
-  return (es, occ)
-
+                    }
+                  }
+            return (es, occ)
 
 subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
 subscribe e s = fst <$> subscribeAndRead e s
