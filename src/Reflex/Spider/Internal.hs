@@ -285,24 +285,22 @@ terminalSubscriber p = Subscriber
   , subscriberRecalculateHeight = \_ -> return ()
   }
 
--- | Subscribe to an Event only for the duration of one occurrence
-{-# INLINE subscribeAndReadHead #-}
-subscribeAndReadHead :: HasSpiderTimeline x => Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
-subscribeAndReadHead e sub = do
-  subscriptionRef <- liftIO $ newIORef $ error "subscribeAndReadHead: not initialized"
-  (subscription, occ) <- subscribeAndRead e $ debugSubscriber' "head" $ sub
-    { subscriberPropagate = \a -> do
-        liftIO $ unsubscribe =<< readIORef subscriptionRef
-        subscriberPropagate sub a
-    }
-  liftIO $ case occ of
-    Nothing -> writeIORef subscriptionRef $! subscription
-    Just _ -> unsubscribe subscription
-  return (subscription, occ)
-
 --TODO: Make this lazy in its input event
-headE :: (MonadIO m, Defer (SomeMergeInit x) m, HasSpiderTimeline x) => Event x a -> m (Event x a)
+headE :: forall x m a. (Defer (SomeMergeInit x) m, HasSpiderTimeline x) => Event x a -> m (Event x a)
 headE originalE = do
+  let -- | Subscribe to an Event only for the duration of one occurrence
+      subscribeAndReadHead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
+      subscribeAndReadHead e sub = do
+        subscriptionRef <- liftIO $ newIORef $ error "subscribeAndReadHead: not initialized"
+        (subscription, occ) <- subscribeAndRead e $ debugSubscriber' "head" $ sub
+          { subscriberPropagate = \a -> do
+              liftIO $ unsubscribe =<< readIORef subscriptionRef
+              subscriberPropagate sub a
+          }
+        liftIO $ case occ of
+          Nothing -> writeIORef subscriptionRef $! subscription
+          Just _ -> unsubscribe subscription
+        return (subscription, occ)
   parent <- liftIO $ newIORef $ Just originalE
   defer $ SomeMergeInit $ do --TODO: Rename SomeMergeInit appropriately
     let clearParent = liftIO $ writeIORef parent Nothing
