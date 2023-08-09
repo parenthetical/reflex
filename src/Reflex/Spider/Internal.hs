@@ -977,11 +977,6 @@ data FanSubscribed x k v
 #endif
                    }
 
-data Fan x k v
-   = Fan { fanParent :: !(Event x (DMap k v))
-         , fanSubscribed :: !(IORef (Maybe (FanSubscribed x k v)))
-         }
-
 -- TODO: Would something like 'CommonSubscribed' with only HeightRef, Occ, Subscribers, nodeId be useful?
 --       IIRC these are repeated more in the code while the rest might be specific to switch and coincidence.
 -- Common between switch and coincidence
@@ -1585,59 +1580,6 @@ fanIntSubscribed ticket self = do
     }
 
 
-{-# INLINABLE getFanSubscribed #-}
-getFanSubscribed :: forall x k v a. (HasSpiderTimeline x, GCompare k) => k a -> Fan x k v -> Subscriber x (v a) -> EventM x (WeakBagTicket, FanSubscribed x k v, Maybe (v a))
-getFanSubscribed k f sub = do
-  mSubscribed <- liftIO $ readIORef $ fanSubscribed f
-  case mSubscribed of
-    Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
-      sln <- subscribeFanSubscribed k subscribed sub
-      occ <- readIORef $ fanSubscribedOccurrence subscribed
-      return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
-    Nothing -> {-# SCC "missFan" #-} do
-      subscribedRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribedRef not yet initialized"
-      subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
-      let s = debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
-           { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-               subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
-               tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-               writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
-               let f _ (Pair v subsubs) = do
-                     propagate v $ _fanSubscribedChildren_list subsubs
-                     return $ Constant ()
-               _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
-               return ()
-           , subscriberInvalidateHeight = \old -> do
-               subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-               forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
-           , subscriberRecalculateHeight = \new -> do
-               subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-               forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
-           }
-      (subscription, parentOcc) <- subscribeAndRead (fanParent f) s
-      weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
-      (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
-      subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
-      occRef <- newAndScheduleClear parentOcc
-#ifdef DEBUG_NODEIDS
-      nid <- liftIO newNodeId
-#endif
-      let subscribed = FanSubscribed
-            { fanSubscribedCachedSubscribed = fanSubscribed f
-            , fanSubscribedOccurrence = occRef
-            , fanSubscribedParent = subscription
-            , fanSubscribedSubscribers = subscribersRef
-#ifdef DEBUG_NODEIDS
-            , fanSubscribedNodeId = nid
-#endif
-            }
-      let !self = (k, subscribed)
-      liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
-      liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
-      liftIO $ writeIORef subscribedRef $! subscribed
-      liftIO $ writeIORef (fanSubscribed f) $ Just subscribed
-      return (slnForSub, subscribed, coerce $ DMap.lookup k =<< parentOcc)
-
 cleanupFanSubscribed :: GCompare k => (k a, FanSubscribed x k v) -> IO ()
 cleanupFanSubscribed (k, subscribed) = do
   subscribers <- readIORef $ fanSubscribedSubscribers subscribed
@@ -1966,14 +1908,59 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
 newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
 
-fanG :: (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
+fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
   ref <- newIORef Nothing
-  let f = Fan
-        { fanParent = e
-        , fanSubscribed = ref
-        }
-  pure $ EventSelectorG $ \(!k) -> Event $ wrap eventSubscribedFan $ getFanSubscribed k f
+  pure $ EventSelectorG $ \(!k) -> Event $ wrap eventSubscribedFan $ \sub -> do
+    mSubscribed <- liftIO $ readIORef $ ref
+    case mSubscribed of
+      Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
+        sln <- subscribeFanSubscribed k subscribed sub
+        occ <- readIORef $ fanSubscribedOccurrence subscribed
+        return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
+      Nothing -> {-# SCC "missFan" #-} do
+        subscribedRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribedRef not yet initialized"
+        subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
+        let s = debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
+             { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
+                 subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
+                 tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+                 writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
+                 let f _ (Pair v subsubs) = do
+                       propagate v $ _fanSubscribedChildren_list subsubs
+                       return $ Constant ()
+                 _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
+                 return ()
+             , subscriberInvalidateHeight = \old -> do
+                 subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+                 forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
+             , subscriberRecalculateHeight = \new -> do
+                 subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+                 forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
+             }
+        (subscription, parentOcc) <- subscribeAndRead e s
+        weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
+        (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
+        subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
+        occRef <- newAndScheduleClear parentOcc
+#ifdef DEBUG_NODEIDS
+        nid <- liftIO newNodeId
+#endif
+        let subscribed = FanSubscribed
+              { fanSubscribedCachedSubscribed = ref
+              , fanSubscribedOccurrence = occRef
+              , fanSubscribedParent = subscription
+              , fanSubscribedSubscribers = subscribersRef
+#ifdef DEBUG_NODEIDS
+              , fanSubscribedNodeId = nid
+#endif
+              }
+        let !self = (k, subscribed)
+        liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
+        liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
+        liftIO $ writeIORef subscribedRef $! subscribed
+        liftIO $ writeIORef ref $ Just subscribed
+        return (slnForSub, subscribed, coerce $ DMap.lookup k =<< parentOcc)
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
