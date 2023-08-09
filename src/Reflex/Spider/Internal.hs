@@ -174,12 +174,14 @@ instance HasNodeId (Hold x p) where
 instance HasNodeId (CommonSubscribed s x a) where
   getNodeId = commonSubscribedNodeId
 
+-- TODO: delete instance
 instance HasNodeId (SwitchSubscribed x a) where
   getNodeId = commonSubscribedNodeId . subscribedCommon_
 
 instance HasNodeId (FanSubscribed x v a) where
   getNodeId = fanSubscribedNodeId
 
+-- TODO: delete instance
 instance HasNodeId (CoincidenceSubscribed x a) where
   getNodeId = commonSubscribedNodeId . subscribedCommon_
 
@@ -967,6 +969,9 @@ data FanSubscribed x k v
 #endif
                    }
 
+-- TODO: FanSubscribed also has/had cached subscribed, occurrence,
+--     subscribers, but not height or weakself, but it has
+--     subscribedParent which is like switchSubscribedCurrentParent/coincidenceSubscribedOuterParent
 -- TODO: Would something like 'CommonSubscribed' with only HeightRef, Occ, Subscribers, nodeId be useful?
 --       IIRC these are repeated more in the code while the rest might be specific to switch and coincidence.
 -- Common between switch and coincidence
