@@ -1874,7 +1874,8 @@ fanG e = unsafePerformIO $ do
               -- Not necessary in this case, because this whole FanSubscribed is dead:
               -- writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
               writeIORef ref Nothing
-            else writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
+            else
+              writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
     mSubscribed <- liftIO $ readIORef $ ref
     case mSubscribed of
       Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
@@ -1885,9 +1886,14 @@ fanG e = unsafePerformIO $ do
               let !self = (k, subscribed)
               weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
               (list, sln) <- WeakBag.singleton sub weakSelf cleanupFanSubscribed
-              writeIORef (fanSubscribedSubscribers subscribed) $! DMap.insertWith (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible") k (FanSubscribedChildren list self weakSelf) subscribers
+              writeIORef (fanSubscribedSubscribers subscribed)
+                $! DMap.insertWith (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible")
+                   k
+                   (FanSubscribedChildren list self weakSelf)
+                   subscribers
               return sln
-            Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-} WeakBag.insert sub list weakSelf cleanupFanSubscribed
+            Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-}
+              WeakBag.insert sub list weakSelf cleanupFanSubscribed
         occ <- readIORef $ fanSubscribedOccurrence subscribed
         return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
       Nothing -> {-# SCC "missFan" #-} do
@@ -1898,17 +1904,19 @@ fanG e = unsafePerformIO $ do
                  subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
                  tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
                  writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
-                 let f _ (Pair v subsubs) = do
-                       propagate v $ _fanSubscribedChildren_list subsubs
-                       return $ Constant ()
-                 _ <- DMap.traverseWithKey f $ DMap.intersectionWithKey (\_ -> Pair) a subs --TODO: Would be nice to have DMap.traverse_
+                 _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
+                                               propagate v $ _fanSubscribedChildren_list subsubs
+                                               return $ Constant ())
+                      $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
                  return ()
              , subscriberInvalidateHeight = \old -> do
                  subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-                 forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
+                 forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+                   WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
              , subscriberRecalculateHeight = \new -> do
                  subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-                 forM_ (DMap.toList subscribers) $ \(_ :=> v) -> WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
+                 forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+                   WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
              }
         (subscription, parentOcc) <- subscribeAndRead e s
         weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
