@@ -1456,11 +1456,15 @@ zeroRef = unsafePerformIO $ newIORef zeroHeight
 
 getRootSubscribed :: forall k x a. (GCompare k, HasSpiderTimeline x) => k a -> Root x k -> Subscriber x a -> IO (WeakBagTicket, RootSubscribed x a, Maybe a)
 getRootSubscribed k r sub = do
+  let cleanupRootSubscribed :: RootSubscribed x a -> IO ()
+      cleanupRootSubscribed self@RootSubscribed { rootSubscribedKey = k, rootSubscribedCachedSubscribed = cached } = do
+        rootSubscribedUninit self
+        modifyIORef' cached $ DMap.delete k
   mSubscribed <- readIORef $ rootSubscribed r
   let getOcc = fmap (coerce . DMap.lookup k) $ readIORef $ rootOccurrence r
   case DMap.lookup k mSubscribed of
     Just subscribed -> {-# SCC "hitRoot" #-} do
-      sln <- subscribeRootSubscribed subscribed sub
+      sln <- WeakBag.insert sub (rootSubscribedSubscribers subscribed) (rootSubscribedWeakSelf subscribed) cleanupRootSubscribed
       occ <- getOcc
       return (sln, subscribed, occ)
     Nothing -> {-# SCC "missRoot" #-} do
@@ -1501,18 +1505,6 @@ getRootSubscribed k r sub = do
       modifyIORef' (rootSubscribed r) $ DMap.insertWith (error $ "getRootSubscribed: duplicate key inserted into Root") k subscribed --TODO: I think we can just write back mSubscribed rather than re-reading it
       occ <- getOcc
       return (sln, subscribed, occ)
-
-#ifdef USE_TEMPLATE_HASKELL
-{-# ANN cleanupRootSubscribed "HLint: ignore Redundant bracket" #-}
-#endif
-cleanupRootSubscribed :: RootSubscribed x a -> IO ()
-cleanupRootSubscribed self@RootSubscribed { rootSubscribedKey = k, rootSubscribedCachedSubscribed = cached } = do
-  rootSubscribedUninit self
-  modifyIORef' cached $ DMap.delete k
-
-{-# INLINE subscribeRootSubscribed #-}
-subscribeRootSubscribed :: RootSubscribed x a -> Subscriber x a -> IO WeakBagTicket
-subscribeRootSubscribed subscribed sub = WeakBag.insert sub (rootSubscribedSubscribers subscribed) (rootSubscribedWeakSelf subscribed) cleanupRootSubscribed
 
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
