@@ -1575,18 +1575,6 @@ fanInt p = unsafePerformIO $ do
           }
       return (EventSubscription (FastWeakBag.remove ticket) subscribed, IntMap.lookup k currentOcc)
 
--- Used for fanInt & fanG
-cleanupFanSubscribed :: GCompare k => (k a, FanSubscribed x k v) -> IO ()
-cleanupFanSubscribed (k, subscribed) = do
-  subscribers <- readIORef $ fanSubscribedSubscribers subscribed
-  let reducedSubscribers = DMap.delete k subscribers
-  if DMap.null reducedSubscribers
-    then do
-      unsubscribe $ fanSubscribedParent subscribed
-      -- Not necessary in this case, because this whole FanSubscribed is dead: writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
-      writeIORef (fanSubscribedCachedSubscribed subscribed) Nothing
-    else writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
-
 {-# INLINE commonEvent #-}
 commonEvent :: forall s x a. HasSpiderTimeline x =>
   (s x a -> IO ()) ->
@@ -1716,7 +1704,6 @@ mergeWithMove nt =
 checkCycle :: HasSpiderTimeline x => EventSubscribed x -> EventM x ()
 checkCycle subscribed = liftIO $ do
     height <- readIORef (eventSubscribedHeightRef subscribed)
-
     -- currentHeight <- getCurrentHeight
     -- when (height <= currentHeight) $ if height /= invalidHeight
     --     then do
@@ -1895,6 +1882,16 @@ fanG e = unsafePerformIO $ do
   ref <- newIORef Nothing
   pure $ EventSelectorG $ \(!k) -> Event $ wrap eventSubscribedFan $ \sub -> do
     mSubscribed <- liftIO $ readIORef $ ref
+    let cleanupFanSubscribed :: (k a, FanSubscribed x k v) -> IO ()
+        cleanupFanSubscribed (k, subscribed) = do
+          subscribers <- readIORef $ fanSubscribedSubscribers subscribed
+          let reducedSubscribers = DMap.delete k subscribers
+          if DMap.null reducedSubscribers
+            then do
+              unsubscribe $ fanSubscribedParent subscribed
+              -- Not necessary in this case, because this whole FanSubscribed is dead: writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
+              writeIORef (fanSubscribedCachedSubscribed subscribed) Nothing
+            else writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
     case mSubscribed of
       Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
         sln <- do
