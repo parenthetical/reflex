@@ -1178,8 +1178,7 @@ coincidence coincidenceParent =
               if height > outerHeight then Just subscribed else Nothing
             return (innerOcc, height, innerSubd)
       let subOuter =
-           flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed)
-           $ \doPropagate a -> {-# SCC "traverseCoincidenceOuter" #-} do
+           flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed) $ \doPropagate a -> {-# SCC "traverseCoincidenceOuter" #-} do
              outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
              -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
              (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
@@ -1563,23 +1562,20 @@ fanInt p = unsafePerformIO $ do
       ticket <- liftIO $ FastWeakBag.insert sub b
       currentOcc <- readIORef (_fanInt_occRef self)
 
-      subscribed <- fanIntSubscribed ticket self
+      subscribed <- do
+        subscribedParent <- _eventSubscription_subscribed <$> readIORef (_fanInt_subscriptionRef self)
+        return $ EventSubscribed
+          { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
+          , eventSubscribedRetained = toAny (_fanInt_subscriptionRef self, ticket)
+#ifdef DEBUG_CYCLES
+          , eventSubscribedGetParents = return [subscribedParent]
+          , eventSubscribedHasOwnHeightRef = False
+          , eventSubscribedWhoCreated = whoCreatedIORef $ _fanInt_subscriptionRef self
+#endif
+          }
       return (EventSubscription (FastWeakBag.remove ticket) subscribed, IntMap.lookup k currentOcc)
 
-fanIntSubscribed :: FastWeakBagTicket k -> FanInt x a -> IO (EventSubscribed x)
-fanIntSubscribed ticket self = do
-  subscribedParent <- _eventSubscription_subscribed <$> readIORef (_fanInt_subscriptionRef self)
-  return $ EventSubscribed
-    { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
-    , eventSubscribedRetained = toAny (_fanInt_subscriptionRef self, ticket)
-#ifdef DEBUG_CYCLES
-    , eventSubscribedGetParents = return [subscribedParent]
-    , eventSubscribedHasOwnHeightRef = False
-    , eventSubscribedWhoCreated = whoCreatedIORef $ _fanInt_subscriptionRef self
-#endif
-    }
-
-
+-- Used for fanInt & fanG
 cleanupFanSubscribed :: GCompare k => (k a, FanSubscribed x k v) -> IO ()
 cleanupFanSubscribed (k, subscribed) = do
   subscribers <- readIORef $ fanSubscribedSubscribers subscribed
@@ -1590,20 +1586,6 @@ cleanupFanSubscribed (k, subscribed) = do
       -- Not necessary in this case, because this whole FanSubscribed is dead: writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
       writeIORef (fanSubscribedCachedSubscribed subscribed) Nothing
     else writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
-
-{-# INLINE subscribeFanSubscribed #-}
-subscribeFanSubscribed :: GCompare k => k a -> FanSubscribed x k v -> Subscriber x (v a) -> IO WeakBagTicket
-subscribeFanSubscribed k subscribed sub = do
-  subscribers <- readIORef $ fanSubscribedSubscribers subscribed
-  case DMap.lookup k subscribers of
-    Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
-      let !self = (k, subscribed)
-      weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
-      (list, sln) <- WeakBag.singleton sub weakSelf cleanupFanSubscribed
-      writeIORef (fanSubscribedSubscribers subscribed) $! DMap.insertWith (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible") k (FanSubscribedChildren list self weakSelf) subscribers
-      return sln
-    Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-} WeakBag.insert sub list weakSelf cleanupFanSubscribed
-
 
 {-# INLINE commonEvent #-}
 commonEvent :: forall s x a. HasSpiderTimeline x =>
@@ -1915,7 +1897,16 @@ fanG e = unsafePerformIO $ do
     mSubscribed <- liftIO $ readIORef $ ref
     case mSubscribed of
       Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
-        sln <- subscribeFanSubscribed k subscribed sub
+        sln <- do
+          subscribers <- readIORef $ fanSubscribedSubscribers subscribed
+          case DMap.lookup k subscribers of
+            Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
+              let !self = (k, subscribed)
+              weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
+              (list, sln) <- WeakBag.singleton sub weakSelf cleanupFanSubscribed
+              writeIORef (fanSubscribedSubscribers subscribed) $! DMap.insertWith (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible") k (FanSubscribedChildren list self weakSelf) subscribers
+              return sln
+            Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-} WeakBag.insert sub list weakSelf cleanupFanSubscribed
         occ <- readIORef $ fanSubscribedOccurrence subscribed
         return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
       Nothing -> {-# SCC "missFan" #-} do
