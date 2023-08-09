@@ -1864,7 +1864,6 @@ fanG e = unsafePerformIO $ do
 #endif
                 })
    $ \sub -> do
-    mSubscribed <- liftIO $ readIORef $ ref
     let cleanupFanSubscribed :: (k a, FanSubscribed x k v) -> IO ()
         cleanupFanSubscribed (k, subscribed) = do
           subscribers <- readIORef $ fanSubscribedSubscribers subscribed
@@ -1873,9 +1872,11 @@ fanG e = unsafePerformIO $ do
           if DMap.null reducedSubscribers
             then do
               unsubscribe $ fanSubscribedParent subscribed
-              -- Not necessary in this case, because this whole FanSubscribed is dead: writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
+              -- Not necessary in this case, because this whole FanSubscribed is dead:
+              -- writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
               writeIORef (fanSubscribedCachedSubscribed subscribed) Nothing
             else writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
+    mSubscribed <- liftIO $ readIORef $ ref
     case mSubscribed of
       Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
         sln <- do
@@ -1891,8 +1892,8 @@ fanG e = unsafePerformIO $ do
         occ <- readIORef $ fanSubscribedOccurrence subscribed
         return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
       Nothing -> {-# SCC "missFan" #-} do
-        subscribedRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribedRef not yet initialized"
-        subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
+        subscribedUnsafe <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
+                           $ unsafeInterleaveIO $ readIORef $ ref
         let s = debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
              { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
                  subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
@@ -1930,7 +1931,6 @@ fanG e = unsafePerformIO $ do
         let !self = (k, subscribed)
         liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
         liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
-        liftIO $ writeIORef subscribedRef $! subscribed
         liftIO $ writeIORef ref $ Just subscribed
         return (slnForSub, subscribed, coerce $ DMap.lookup k =<< parentOcc)
 
