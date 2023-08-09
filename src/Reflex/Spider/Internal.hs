@@ -528,17 +528,6 @@ eventSubscribedNow = EventSubscribed
 #endif
   }
 
-eventSubscribedFan :: FanSubscribed x k v -> EventSubscribed x
-eventSubscribedFan !subscribed = EventSubscribed
-  { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
-  , eventSubscribedRetained = toAny subscribed
-#ifdef DEBUG_CYCLES
-  , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
-  , eventSubscribedHasOwnHeightRef = False
-  , eventSubscribedWhoCreated = whoCreatedIORef $ fanSubscribedCachedSubscribed subscribed
-#endif
-  }
-
 getEventSubscribedHeight :: EventSubscribed x -> IO Height
 getEventSubscribedHeight es = readIORef $ eventSubscribedHeightRef es
 
@@ -1859,12 +1848,23 @@ newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Even
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
   ref <- newIORef Nothing
-  pure $ EventSelectorG $ \(!k) -> Event $ wrap eventSubscribedFan $ \sub -> do
+  pure $ EventSelectorG $ \(!k) -> Event
+   $ wrap (\(!subscribed) -> EventSubscribed
+                { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
+                , eventSubscribedRetained = toAny subscribed
+#ifdef DEBUG_CYCLES
+                , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
+                , eventSubscribedHasOwnHeightRef = False
+                , eventSubscribedWhoCreated = whoCreatedIORef $ fanSubscribedCachedSubscribed subscribed
+#endif
+                })
+   $ \sub -> do
     mSubscribed <- liftIO $ readIORef $ ref
     let cleanupFanSubscribed :: (k a, FanSubscribed x k v) -> IO ()
         cleanupFanSubscribed (k, subscribed) = do
           subscribers <- readIORef $ fanSubscribedSubscribers subscribed
           let reducedSubscribers = DMap.delete k subscribers
+          -- When we don't have any subscribers, unsubscribe from e
           if DMap.null reducedSubscribers
             then do
               unsubscribe $ fanSubscribedParent subscribed
