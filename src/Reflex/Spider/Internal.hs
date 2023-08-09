@@ -168,12 +168,8 @@ class HasNodeId a where
 instance HasNodeId (CacheSubscribed x a) where
   getNodeId = _cacheSubscribed_nodeId
 
-instance HasNodeId (FanInt x a) where
-  getNodeId = _fanInt_nodeId
-
 instance HasNodeId (Hold x p) where
   getNodeId = holdNodeId
-
 
 instance HasNodeId (CommonSubscribed s x a) where
   getNodeId = commonSubscribedNodeId
@@ -782,6 +778,13 @@ writeAndScheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> a -> m ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
   scheduleClear ref
+
+{-# INLINE writeAndScheduleIntClear #-}
+writeAndScheduleIntClear :: Defer (Some IntClear) m => IORef (IntMap a) -> IntMap a -> m ()
+writeAndScheduleIntClear ref val = do
+  liftIO $ writeIORef ref val
+  scheduleIntClear ref
+
 
 {-# INLINE newAndScheduleClear #-}
 newAndScheduleClear :: Defer (Some Clear) m => Maybe a -> m (IORef (Maybe a))
@@ -1502,75 +1505,53 @@ getRootSubscribed k r sub = do
 
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
-data FanInt x a = FanInt
-  { _fanInt_subscribers :: {-# UNPACK #-} !(FastMutableIntMap (FastWeakBag (Subscriber x a))) --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
-  , _fanInt_subscriptionRef :: {-# UNPACK #-} !(IORef (EventSubscription x)) -- This should have a valid subscription iff subscribers is non-empty
-  , _fanInt_occRef :: {-# UNPACK #-} !(IORef (IntMap a))
-#ifdef DEBUG_NODEIDS
-  , _fanInt_nodeId :: {-# UNPACK #-} !Int
-#endif
-  }
-
 fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
 fanInt p = unsafePerformIO $ do
-  self <- do
-    subscribers <- FastMutableIntMap.newEmpty --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
-    subscriptionRef <- newIORef $ error "fanInt: no subscription"
-    occRef <- newIORef $ error "fanInt: no occurrence"
+  subscribers <- FastMutableIntMap.newEmpty --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
+  subscriptionRef <- newIORef $ error "fanInt: no subscription"
+  occRef <- newIORef $ error "fanInt: no occurrence"
 #ifdef DEBUG_NODEIDS
-    nodeId <- newNodeId
+  nodeId <- newNodeId
 #endif
-    return $ FanInt
-      { _fanInt_subscribers = subscribers
-      , _fanInt_subscriptionRef = subscriptionRef
-      , _fanInt_occRef = occRef
-#ifdef DEBUG_NODEIDS
-      , _fanInt_nodeId = nodeId
-#endif
-      }
   pure $ EventSelectorInt $ \k -> Event $ \sub -> do
-    isEmpty <- liftIO $ FastMutableIntMap.isEmpty (_fanInt_subscribers self)
+    isEmpty <- liftIO $ FastMutableIntMap.isEmpty subscribers
     when isEmpty $ do -- This is the first subscriber, so we need to subscribe to our input
-      let desc = "fanInt" <> showNodeId self <> ", k = "  <> show k
+      let desc = "fanInt" <> showNodeId' nodeId <> ", k = "  <> show k
       (subscription, parentOcc) <- subscribeAndRead p $ debugSubscriber' desc $ Subscriber
         { subscriberPropagate = \m -> do
             -- TODO: this is like writeAndScheduleClearAndPropagate
-            liftIO $ writeIORef (_fanInt_occRef self) m
-            scheduleIntClear $ _fanInt_occRef self
-            FastMutableIntMap.forIntersectionWithImmutable_ (_fanInt_subscribers self) m $ \b v ->  --TODO: Do we need to know that no subscribers are being added as we traverse?
+            writeAndScheduleIntClear occRef m
+            FastMutableIntMap.forIntersectionWithImmutable_ subscribers m $ \b v ->  --TODO: Do we need to know that no subscribers are being added as we traverse?
               propagateFast v b
         , subscriberInvalidateHeight = \old ->
-            FastMutableIntMap.for_ (_fanInt_subscribers self) $ \b ->
+            FastMutableIntMap.for_ subscribers $ \b ->
               FastWeakBag.traverse_ b $ \s ->
                 subscriberInvalidateHeight s old
         , subscriberRecalculateHeight = \new ->
-            FastMutableIntMap.for_ (_fanInt_subscribers self) $ \b ->
+            FastMutableIntMap.for_ subscribers $ \b ->
               FastWeakBag.traverse_ b $ \s ->
                 subscriberRecalculateHeight s new
         }
-      liftIO $ do
-        writeIORef (_fanInt_subscriptionRef self) subscription
-        writeIORef (_fanInt_occRef self) $ fromMaybe IntMap.empty parentOcc
-      scheduleIntClear $ _fanInt_occRef self
+      liftIO $ writeIORef subscriptionRef subscription
+      writeAndScheduleIntClear occRef $ fromMaybe IntMap.empty parentOcc
     liftIO $ do
-      b <- FastMutableIntMap.lookup (_fanInt_subscribers self) k >>= \case
+      b <- FastMutableIntMap.lookup subscribers k >>= \case
         Nothing -> do
           b <- FastWeakBag.empty
-          FastMutableIntMap.insert (_fanInt_subscribers self) k b
+          FastMutableIntMap.insert subscribers k b
           return b
         Just b -> return b
       ticket <- liftIO $ FastWeakBag.insert sub b
-      currentOcc <- readIORef (_fanInt_occRef self)
-
+      currentOcc <- readIORef occRef
       subscribed <- do
-        subscribedParent <- _eventSubscription_subscribed <$> readIORef (_fanInt_subscriptionRef self)
+        subscribedParent <- _eventSubscription_subscribed <$> readIORef subscriptionRef
         return $ EventSubscribed
           { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
-          , eventSubscribedRetained = toAny (_fanInt_subscriptionRef self, ticket)
+          , eventSubscribedRetained = toAny (subscriptionRef, ticket)
 #ifdef DEBUG_CYCLES
           , eventSubscribedGetParents = return [subscribedParent]
           , eventSubscribedHasOwnHeightRef = False
-          , eventSubscribedWhoCreated = whoCreatedIORef $ _fanInt_subscriptionRef self
+          , eventSubscribedWhoCreated = whoCreatedIORef subscriptionRef
 #endif
           }
       return (EventSubscription (FastWeakBag.remove ticket) subscribed, IntMap.lookup k currentOcc)
