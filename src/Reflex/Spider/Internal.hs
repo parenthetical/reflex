@@ -2178,6 +2178,7 @@ invalidHeightBeingTraversed :: Height
 invalidHeightBeingTraversed = Height (-1001)
 #endif
 
+-- Only used in merge
 {-# INLINE succHeight #-}
 succHeight :: Height -> Height
 succHeight h@(Height a) =
@@ -2208,6 +2209,8 @@ updateCommonHeight heightRef subscribers newHeight = do
 
 data SomeSwitchSubscribed x = forall a. SomeSwitchSubscribed {-# NOUNPACK #-} (SwitchSubscribed x a)
 
+-- TODO: explain what this does
+-- Only used in runFrame
 invalidate :: IORef [SomeSwitchSubscribed x] -> WeakList (Invalidator x) -> IO (WeakList (Invalidator x))
 invalidate toReconnectRef wis = do
   forM_ wis $ \wi -> do
