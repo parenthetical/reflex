@@ -960,8 +960,7 @@ data FanSubscribedChildren x k v a = FanSubscribedChildren
   }
 
 data FanSubscribed x k v
-   = FanSubscribed { fanSubscribedCachedSubscribed :: !(IORef (Maybe (FanSubscribed x k v)))
-                   , fanSubscribedOccurrence :: !(IORef (Maybe (DMap k v)))
+   = FanSubscribed { fanSubscribedOccurrence :: !(IORef (Maybe (DMap k v)))
                    , fanSubscribedSubscribers :: !(IORef (DMap k (FanSubscribedChildren x k v))) -- This DMap should never be empty
                    , fanSubscribedParent :: !(EventSubscription x)
 #ifdef DEBUG_NODEIDS
@@ -1856,11 +1855,11 @@ fanG e = unsafePerformIO $ do
   pure $ EventSelectorG $ \(!k) -> Event
    $ wrap (\(!subscribed) -> EventSubscribed
                 { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
-                , eventSubscribedRetained = toAny subscribed
+                , eventSubscribedRetained = toAny (subscribed, ref)
 #ifdef DEBUG_CYCLES
                 , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
                 , eventSubscribedHasOwnHeightRef = False
-                , eventSubscribedWhoCreated = whoCreatedIORef $ fanSubscribedCachedSubscribed subscribed
+                , eventSubscribedWhoCreated = whoCreatedIORef $ ref
 #endif
                 })
    $ \sub -> do
@@ -1874,7 +1873,7 @@ fanG e = unsafePerformIO $ do
               unsubscribe $ fanSubscribedParent subscribed
               -- Not necessary in this case, because this whole FanSubscribed is dead:
               -- writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
-              writeIORef (fanSubscribedCachedSubscribed subscribed) Nothing
+              writeIORef ref Nothing
             else writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
     mSubscribed <- liftIO $ readIORef $ ref
     case mSubscribed of
@@ -1920,8 +1919,7 @@ fanG e = unsafePerformIO $ do
         nid <- liftIO newNodeId
 #endif
         let subscribed = FanSubscribed
-              { fanSubscribedCachedSubscribed = ref
-              , fanSubscribedOccurrence = occRef
+              { fanSubscribedOccurrence = occRef
               , fanSubscribedParent = subscription
               , fanSubscribedSubscribers = subscribersRef
 #ifdef DEBUG_NODEIDS
