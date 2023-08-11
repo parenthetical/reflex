@@ -961,8 +961,7 @@ data FanSubscribedChildren x k v a = FanSubscribedChildren
   }
 
 data FanSubscribed x k v
-   = FanSubscribed { fanSubscribedOccurrence :: !(IORef (Maybe (DMap k v)))
-                   , fanSubscribedSubscribers :: !(IORef (DMap k (FanSubscribedChildren x k v))) -- This DMap should never be empty
+   = FanSubscribed { fanSubscribedSubscribers :: !(IORef (DMap k (FanSubscribedChildren x k v))) -- This DMap should never be empty
                    , fanSubscribedParent :: !(EventSubscription x)
 #ifdef DEBUG_NODEIDS
                    , fanSubscribedNodeId :: Int
@@ -1853,6 +1852,7 @@ newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Even
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
   ref <- newIORef Nothing
+  occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
   pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
     let cleanupFanSubscribed :: (k a, FanSubscribed x k v) -> IO ()
         cleanupFanSubscribed (k, subscribed) = do
@@ -1899,8 +1899,7 @@ fanG e = unsafePerformIO $ do
               return sln
             Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-}
               WeakBag.insert sub list weakSelf cleanupFanSubscribed
-        occ <- readIORef $ fanSubscribedOccurrence subscribed
-        pure . getSubscription sln subscribed $ DMap.lookup k =<< occ
+        getSubscription sln subscribed . (DMap.lookup k =<<) <$> readIORef occRef
       Nothing -> {-# SCC "missFan" #-} do
         subscribedUnsafe <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
                             $ unsafeInterleaveIO $ readIORef $ ref
@@ -1908,7 +1907,7 @@ fanG e = unsafePerformIO $ do
           { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
               subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
               tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-              writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
+              writeAndScheduleClear occRef a
               _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
                                             propagate v $ _fanSubscribedChildren_list subsubs
                                             return $ Constant ())
@@ -1926,13 +1925,12 @@ fanG e = unsafePerformIO $ do
         weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
         (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
         subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
-        occRef <- newAndScheduleClear parentOcc
+        mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
 #ifdef DEBUG_NODEIDS
         nid <- liftIO newNodeId
 #endif
         let subscribed = FanSubscribed
-              { fanSubscribedOccurrence = occRef
-              , fanSubscribedParent = subscription
+              { fanSubscribedParent = subscription
               , fanSubscribedSubscribers = subscribersRef
 #ifdef DEBUG_NODEIDS
               , fanSubscribedNodeId = nid
