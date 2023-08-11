@@ -1867,7 +1867,6 @@ fanG e = unsafePerformIO $ do
               writeIORef ref Nothing
             else
               writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
-    mSubscribed <- liftIO $ readIORef $ ref
     let getSubscription sln subscribed occ =
           ( EventSubscription
             (WeakBag.remove sln >> touch sln)
@@ -1882,7 +1881,7 @@ fanG e = unsafePerformIO $ do
              })
           , occ
           )
-    case mSubscribed of
+    (liftIO . readIORef $ ref) >>= \case
       Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
         sln <- do
           subscribers <- readIORef $ fanSubscribedSubscribers subscribed
