@@ -26,6 +26,7 @@
 #endif
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE PartialTypeSignatures #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
@@ -1852,17 +1853,23 @@ newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Even
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
   ref <- newIORef Nothing
-  pure $ EventSelectorG $ \(!k) -> Event
-   $ wrap (\(!subscribed) -> EventSubscribed
-                { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
-                , eventSubscribedRetained = toAny (subscribed, ref)
+  pure $ EventSelectorG $ \(!k) ->
+   let wrap' getSpecificSubscribed sub = do
+         (sln, subscribed, occ) <- getSpecificSubscribed sub
+         return ( EventSubscription
+                  (WeakBag.remove sln >> touch sln)
+                  (EventSubscribed
+                   { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
+                   , eventSubscribedRetained = toAny (subscribed, ref)
 #ifdef DEBUG_CYCLES
-                , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
-                , eventSubscribedHasOwnHeightRef = False
-                , eventSubscribedWhoCreated = whoCreatedIORef $ ref
+                   , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
+                   , eventSubscribedHasOwnHeightRef = False
+                   , eventSubscribedWhoCreated = whoCreatedIORef $ ref
 #endif
-                })
-   $ \sub -> do
+                   })
+                , occ
+                )
+   in Event $ wrap' $ \sub -> do
     let cleanupFanSubscribed :: (k a, FanSubscribed x k v) -> IO ()
         cleanupFanSubscribed (k, subscribed) = do
           subscribers <- readIORef $ fanSubscribedSubscribers subscribed
@@ -1898,27 +1905,26 @@ fanG e = unsafePerformIO $ do
         return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
       Nothing -> {-# SCC "missFan" #-} do
         subscribedUnsafe <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
-                           $ unsafeInterleaveIO $ readIORef $ ref
-        let s = debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
-             { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-                 subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
-                 tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-                 writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
-                 _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
-                                               propagate v $ _fanSubscribedChildren_list subsubs
-                                               return $ Constant ())
-                      $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
-                 return ()
-             , subscriberInvalidateHeight = \old -> do
-                 subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-                 forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-                   WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
-             , subscriberRecalculateHeight = \new -> do
-                 subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
-                 forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-                   WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
-             }
-        (subscription, parentOcc) <- subscribeAndRead e s
+                            $ unsafeInterleaveIO $ readIORef $ ref
+        (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
+          { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
+              subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
+              tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+              writeAndScheduleClear (fanSubscribedOccurrence subscribedUnsafe) a
+              _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
+                                            propagate v $ _fanSubscribedChildren_list subsubs
+                                            return $ Constant ())
+                   $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
+              return ()
+          , subscriberInvalidateHeight = \old -> do
+              subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+              forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+                WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
+          , subscriberRecalculateHeight = \new -> do
+              subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+              forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+                WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
+          }
         weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
         (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
         subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
