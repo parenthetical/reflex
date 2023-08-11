@@ -179,9 +179,6 @@ instance HasNodeId (CommonSubscribed s x a) where
 instance HasNodeId (SwitchSubscribed x a) where
   getNodeId = commonSubscribedNodeId . subscribedCommon_
 
-instance HasNodeId (FanSubscribed x v a) where
-  getNodeId = fanSubscribedNodeId
-
 -- TODO: delete instance
 instance HasNodeId (CoincidenceSubscribed x a) where
   getNodeId = commonSubscribedNodeId . subscribedCommon_
@@ -963,9 +960,6 @@ data FanSubscribedChildren x k v a = FanSubscribedChildren
 data FanSubscribed x k v
    = FanSubscribed { fanSubscribedSubscribers :: !(IORef (DMap k (FanSubscribedChildren x k v))) -- This DMap should never be empty
                    , fanSubscribedParent :: !(EventSubscription x)
-#ifdef DEBUG_NODEIDS
-                   , fanSubscribedNodeId :: Int
-#endif
                    }
 
 -- TODO: FanSubscribed also has/had cached subscribed, occurrence,
@@ -1900,9 +1894,15 @@ fanG e = unsafePerformIO $ do
               WeakBag.insert sub list weakSelf cleanupFanSubscribed
         getSubscription sln subscribed . (DMap.lookup k =<<) <$> readIORef occRef
       Nothing -> {-# SCC "missFan" #-} do
+        nid <-
+#ifdef DEBUG_NODEIDS
+          liftIO newNodeId
+#else
+          pure undefined
+#endif
         subscribedUnsafe <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
                             $ unsafeInterleaveIO $ readIORef $ ref
-        (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId subscribedUnsafe) $ Subscriber
+        (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nid) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
               subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
               tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
@@ -1925,15 +1925,9 @@ fanG e = unsafePerformIO $ do
         (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
         subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
         mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
-#ifdef DEBUG_NODEIDS
-        nid <- liftIO newNodeId
-#endif
         let subscribed = FanSubscribed
               { fanSubscribedParent = subscription
               , fanSubscribedSubscribers = subscribersRef
-#ifdef DEBUG_NODEIDS
-              , fanSubscribedNodeId = nid
-#endif
               }
         let !self = (k, subscribed)
         liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
