@@ -951,16 +951,6 @@ heightBagVerify b@(HeightBag s c) = if
 heightBagVerify = id
 #endif
 
-data FanSubscribedChildren x k v a = FanSubscribedChildren
-  { _fanSubscribedChildren_list :: !(WeakBag (Subscriber x (v a)))
-  , _fanSubscribedChildren_self :: {-# NOUNPACK #-} !(k a, EventSubscription x, FanSubscribed x k v)
-  , _fanSubscribedChildren_weakSelf :: !(IORef (Weak (k a, EventSubscription x, FanSubscribed x k v)))
-  }
-
-newtype FanSubscribed x k v
-   = FanSubscribed { fanSubscribedSubscribers :: IORef (DMap k (FanSubscribedChildren x k v)) -- This DMap should never be empty
-                   }
-
 -- TODO: FanSubscribed also has/had cached subscribed, occurrence,
 --     subscribers, but not height or weakself, but it has
 --     subscribedParent which is like switchSubscribedCurrentParent/coincidenceSubscribedOuterParent
@@ -1842,14 +1832,22 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
 newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
 
+data FanSubscribedChildren x k v a = FanSubscribedChildren
+  { _fanSubscribedChildren_list :: !(WeakBag (Subscriber x (v a)))
+  , _fanSubscribedChildren_self :: {-# NOUNPACK #-} !(k a, EventSubscription x, FanSubscribers x k v)
+  , _fanSubscribedChildren_weakSelf :: !(IORef (Weak (k a, EventSubscription x, FanSubscribers x k v)))
+  }
+
+type FanSubscribers x k v = IORef (DMap k (FanSubscribedChildren x k v)) -- This DMap should never be empty
+
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
-  ref :: (IORef (Maybe (EventSubscription x, FanSubscribed x k v))) <- newIORef Nothing
+  ref :: (IORef (Maybe (EventSubscription x, FanSubscribers x k v))) <- newIORef Nothing
   occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
   pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
-    let cleanupFanSubscribed :: (k a, EventSubscription x, FanSubscribed x k v) -> IO ()
-        cleanupFanSubscribed (k, parentSubscription, subscribed) = do
-          subscribers <- readIORef $ fanSubscribedSubscribers subscribed
+    let cleanupFanSubscribed :: (k a, EventSubscription x, FanSubscribers x k v) -> IO ()
+        cleanupFanSubscribed (k, parentSubscription, subscribersRef) = do
+          subscribers <- readIORef $ subscribersRef
           let reducedSubscribers = DMap.delete k subscribers
           -- When we don't have any subscribers, unsubscribe from e
           if DMap.null reducedSubscribers
@@ -1859,7 +1857,7 @@ fanG e = unsafePerformIO $ do
               -- writeIORef (fanSubscribedSubscribers subscribed) reducedSubscribers
               writeIORef ref Nothing
             else
-              writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
+              writeIORef subscribersRef $! reducedSubscribers
     let getSubscription sln subscribed parentSubscription occ =
           ( EventSubscription
             (WeakBag.remove sln >> touch sln)
@@ -1875,15 +1873,15 @@ fanG e = unsafePerformIO $ do
           , occ
           )
     (liftIO . readIORef $ ref) >>= \case
-      Just (parentSubscription, subscribed) -> {-# SCC "hitFan" #-} liftIO $ do
+      Just (parentSubscription, subscribersRef) -> {-# SCC "hitFan" #-} liftIO $ do
         sln <- do
-          subscribers <- readIORef $ fanSubscribedSubscribers subscribed
+          subscribers <- readIORef subscribersRef
           case DMap.lookup k subscribers of
             Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
-              let !self = (k, parentSubscription, subscribed)
+              let !self = (k, parentSubscription, subscribersRef)
               weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
               (list, sln) <- WeakBag.singleton sub weakSelf cleanupFanSubscribed
-              writeIORef (fanSubscribedSubscribers subscribed)
+              writeIORef subscribersRef
                 $! DMap.insertWith (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible")
                    k
                    (FanSubscribedChildren list self weakSelf)
@@ -1891,7 +1889,7 @@ fanG e = unsafePerformIO $ do
               return sln
             Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-}
               WeakBag.insert sub list weakSelf cleanupFanSubscribed
-        getSubscription sln subscribed parentSubscription . (DMap.lookup k =<<) <$> readIORef occRef
+        getSubscription sln subscribersRef parentSubscription . (DMap.lookup k =<<) <$> readIORef occRef
       Nothing -> {-# SCC "missFan" #-} do
         nid <-
 #ifdef DEBUG_NODEIDS
@@ -1899,11 +1897,11 @@ fanG e = unsafePerformIO $ do
 #else
           pure undefined
 #endif
-        ~(parentSubscription,subscribedUnsafe) <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
+        ~(parentSubscription, subscribersRef) <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
                             $ unsafeInterleaveIO $ readIORef $ ref
         (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nid) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-              subs <- liftIO $ readIORef $ fanSubscribedSubscribers subscribedUnsafe
+              subs <- liftIO $ readIORef subscribersRef
               tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
               writeAndScheduleClear occRef a
               _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
@@ -1912,11 +1910,11 @@ fanG e = unsafePerformIO $ do
                    $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
               return ()
           , subscriberInvalidateHeight = \old -> do
-              subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+              subscribers <- readIORef subscribersRef
               forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
                 WeakBag.traverse_ (_fanSubscribedChildren_list v) $ invalidateSubscriberHeight old
           , subscriberRecalculateHeight = \new -> do
-              subscribers <- readIORef $ fanSubscribedSubscribers subscribedUnsafe
+              subscribers <- readIORef subscribersRef
               forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
                 WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
           }
@@ -1924,12 +1922,11 @@ fanG e = unsafePerformIO $ do
         (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
         subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
         mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
-        let subscribed = FanSubscribed subscribersRef
-        let !self = (k, subscription, subscribed)
+        let !self = (k, subscription, subscribersRef)
         liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
         liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
-        liftIO $ writeIORef ref $ Just (subscription, subscribed)
-        pure . getSubscription slnForSub subscribed parentSubscription $ DMap.lookup k =<< parentOcc
+        liftIO $ writeIORef ref $ Just (subscription, subscribersRef)
+        pure . getSubscription slnForSub subscribersRef parentSubscription $ DMap.lookup k =<< parentOcc
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
