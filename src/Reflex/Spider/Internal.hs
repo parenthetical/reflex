@@ -1853,23 +1853,7 @@ newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Even
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
   ref <- newIORef Nothing
-  pure $ EventSelectorG $ \(!k) ->
-   let wrap' getSpecificSubscribed sub = do
-         (sln, subscribed, occ) <- getSpecificSubscribed sub
-         return ( EventSubscription
-                  (WeakBag.remove sln >> touch sln)
-                  (EventSubscribed
-                   { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
-                   , eventSubscribedRetained = toAny (subscribed, ref)
-#ifdef DEBUG_CYCLES
-                   , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
-                   , eventSubscribedHasOwnHeightRef = False
-                   , eventSubscribedWhoCreated = whoCreatedIORef $ ref
-#endif
-                   })
-                , occ
-                )
-   in Event $ wrap' $ \sub -> do
+  pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
     let cleanupFanSubscribed :: (k a, FanSubscribed x k v) -> IO ()
         cleanupFanSubscribed (k, subscribed) = do
           subscribers <- readIORef $ fanSubscribedSubscribers subscribed
@@ -1884,6 +1868,20 @@ fanG e = unsafePerformIO $ do
             else
               writeIORef (fanSubscribedSubscribers subscribed) $! reducedSubscribers
     mSubscribed <- liftIO $ readIORef $ ref
+    let getSubscription sln subscribed occ =
+          ( EventSubscription
+            (WeakBag.remove sln >> touch sln)
+            (EventSubscribed
+             { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ fanSubscribedParent subscribed
+             , eventSubscribedRetained = toAny (subscribed, ref)
+#ifdef DEBUG_CYCLES
+             , eventSubscribedGetParents = return [_eventSubscription_subscribed $ fanSubscribedParent subscribed]
+             , eventSubscribedHasOwnHeightRef = False
+             , eventSubscribedWhoCreated = whoCreatedIORef $ ref
+#endif
+             })
+          , occ
+          )
     case mSubscribed of
       Just subscribed -> {-# SCC "hitFan" #-} liftIO $ do
         sln <- do
@@ -1902,7 +1900,7 @@ fanG e = unsafePerformIO $ do
             Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-}
               WeakBag.insert sub list weakSelf cleanupFanSubscribed
         occ <- readIORef $ fanSubscribedOccurrence subscribed
-        return (sln, subscribed, coerce $ DMap.lookup k =<< occ)
+        pure . getSubscription sln subscribed $ DMap.lookup k =<< occ
       Nothing -> {-# SCC "missFan" #-} do
         subscribedUnsafe <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
                             $ unsafeInterleaveIO $ readIORef $ ref
@@ -1944,7 +1942,7 @@ fanG e = unsafePerformIO $ do
         liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
         liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
         liftIO $ writeIORef ref $ Just subscribed
-        return (slnForSub, subscribed, coerce $ DMap.lookup k =<< parentOcc)
+        pure . getSubscription slnForSub subscribed $ DMap.lookup k =<< parentOcc
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
