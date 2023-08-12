@@ -14,6 +14,7 @@ module Data.WeakBag
   , empty
   , singleton
   , insert
+  , insert'
   , traverse
   , traverse_
   , remove
@@ -73,6 +74,30 @@ insert a (WeakBag nextId children) wbRef finalizer = {-# SCC "insert" #-} do
             in (csWithoutMe, csWithoutMe)
           when (IntMap.null csWithoutMe) $ finalizer b
   wa <- mkWeakPtr a' $ Just cleanup
+  atomicModifyIORef' children $ \cs -> (IntMap.insert myId wa cs, ())
+  return $ WeakBagTicket
+    { _weakBagTicket_weakItem = wa
+    , _weakBagTicket_item = a'
+    }
+
+
+-- | Insert an item into a 'WeakBag'.
+{-# INLINE insert' #-}
+insert' :: a -- ^ The item
+       -> WeakBag a -- ^ The 'WeakBag' to insert into
+       -> IO () -- ^ A callback to be invoked when the item is removed
+                       -- (whether automatically by the item being garbage
+                       -- collected or manually via 'remove')
+       -> IO WeakBagTicket -- ^ Returns a 'WeakBagTicket' that ensures the item
+                           -- is retained and allows the item to be removed.
+insert' a (WeakBag nextId children) finalizer = {-# SCC "insert" #-} do
+  a' <- evaluate a
+  myId <- atomicModifyIORef' nextId $ \n -> (succ n, n)
+  wa <- mkWeakPtr a' $ Just $ do
+          csWithoutMe <- atomicModifyIORef children $ \cs ->
+            let !csWithoutMe = IntMap.delete myId cs
+            in (csWithoutMe, csWithoutMe)
+          when (IntMap.null csWithoutMe) finalizer
   atomicModifyIORef' children $ \cs -> (IntMap.insert myId wa cs, ())
   return $ WeakBagTicket
     { _weakBagTicket_weakItem = wa
