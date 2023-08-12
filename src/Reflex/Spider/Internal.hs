@@ -1858,12 +1858,12 @@ fanG e = unsafePerformIO $ do
               writeIORef ref Nothing
             else
               writeIORef subscribersRef $! reducedSubscribers
-    let getSubscription sln subscribed parentSubscription occ =
+    let getSubscription sln subscribersRef parentSubscription occ =
           ( EventSubscription
             (WeakBag.remove sln >> touch sln)
             (EventSubscribed
              { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ parentSubscription
-             , eventSubscribedRetained = toAny (subscribed, parentSubscription, ref)
+             , eventSubscribedRetained = toAny (subscribersRef, parentSubscription, ref)
 #ifdef DEBUG_CYCLES
              , eventSubscribedGetParents = return [_eventSubscription_subscribed parentSubscription]
              , eventSubscribedHasOwnHeightRef = False
