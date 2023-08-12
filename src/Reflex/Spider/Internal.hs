@@ -1882,7 +1882,8 @@ fanG e = unsafePerformIO $ do
               weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
               (list, sln) <- WeakBag.singleton sub weakSelf cleanupFanSubscribed
               writeIORef subscribersRef
-                $! DMap.insertWith (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible")
+                $! DMap.insertWith
+                   (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible")
                    k
                    (FanSubscribedChildren list self weakSelf)
                    subscribers
@@ -1897,12 +1898,14 @@ fanG e = unsafePerformIO $ do
 #else
           pure undefined
 #endif
-        ~(parentSubscription, subscribersRef) <- liftIO $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
-                            $ unsafeInterleaveIO $ readIORef $ ref
+        ~(parentSubscription, subscribersRef) <- liftIO
+              $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
+              $ unsafeInterleaveIO $ readIORef $ ref
         (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nid) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
               subs <- liftIO $ readIORef subscribersRef
-              tracePropagate (Proxy :: Proxy x) $ show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+              tracePropagate (Proxy :: Proxy x) $
+                      show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
               writeAndScheduleClear occRef a
               _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
                                             propagate v $ _fanSubscribedChildren_list subsubs
