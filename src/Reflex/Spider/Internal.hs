@@ -1845,6 +1845,7 @@ fanG e = unsafePerformIO $ do
   ref :: (IORef (Maybe (EventSubscription x, FanSubscribers x k v))) <- newIORef Nothing
   occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
   pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
+    -- AFAICT from WeakBag.insert impl, this gets called only when the WeakBag for a key is empty:
     let cleanupFanSubscribed :: (k a, EventSubscription x, FanSubscribers x k v) -> IO ()
         cleanupFanSubscribed (k, parentSubscription, subscribersRef) = do
           subscribers <- readIORef $ subscribersRef
@@ -1874,9 +1875,11 @@ fanG e = unsafePerformIO $ do
           )
     (liftIO . readIORef $ ref) >>= \case
       Just (parentSubscription, subscribersRef) -> {-# SCC "hitFan" #-} liftIO $ do
+        -- We're initialized:
         sln <- do
           subscribers <- readIORef subscribersRef
           case DMap.lookup k subscribers of
+            -- No WeakBag of subscribers yet for this key:
             Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
               let !self = (k, parentSubscription, subscribersRef)
               weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
@@ -1892,6 +1895,7 @@ fanG e = unsafePerformIO $ do
               WeakBag.insert sub list weakSelf cleanupFanSubscribed
         getSubscription sln subscribersRef parentSubscription . (DMap.lookup k =<<) <$> readIORef occRef
       Nothing -> {-# SCC "missFan" #-} do
+        -- Not initialized: subscribe to parent.
         nid <-
 #ifdef DEBUG_NODEIDS
           liftIO newNodeId
@@ -1921,12 +1925,12 @@ fanG e = unsafePerformIO $ do
               forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
                 WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
           }
+        let !self = (k, subscription, subscribersRef)
         weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
         (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
         subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
-        mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
-        let !self = (k, subscription, subscribersRef)
         liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
+        mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
         liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
         liftIO $ writeIORef ref $ Just (subscription, subscribersRef)
         pure . getSubscription slnForSub subscribersRef parentSubscription $ DMap.lookup k =<< parentOcc
