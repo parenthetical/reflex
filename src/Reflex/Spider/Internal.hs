@@ -1834,20 +1834,21 @@ newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Even
 
 data FanSubscribedChildren x k v a = FanSubscribedChildren
   { _fanSubscribedChildren_list :: !(WeakBag (Subscriber x (v a)))
-  , _fanSubscribedChildren_self :: {-# NOUNPACK #-} !(k a, EventSubscription x, FanSubscribers x k v)
-  , _fanSubscribedChildren_weakSelf :: !(IORef (Weak (k a, EventSubscription x, FanSubscribers x k v)))
+  , _fanSubscribedChildren_self :: {-# NOUNPACK #-} !(EventSubscription x)
+  , _fanSubscribedChildren_weakSelf :: !(IORef (Weak (EventSubscription x)))
   }
 
 type FanSubscribers x k v = IORef (DMap k (FanSubscribedChildren x k v)) -- This DMap should never be empty
 
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
 fanG e = unsafePerformIO $ do
-  ref :: (IORef (Maybe (EventSubscription x, FanSubscribers x k v))) <- newIORef Nothing
+  ref :: (IORef (Maybe (EventSubscription x))) <- newIORef Nothing
   occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
+  subscribersRef :: FanSubscribers x k v <- newIORef DMap.empty
   pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
     -- AFAICT from WeakBag.insert impl, this gets called only when the WeakBag for a key is empty:
-    let cleanupFanSubscribed :: (k a, EventSubscription x, FanSubscribers x k v) -> IO ()
-        cleanupFanSubscribed (k, parentSubscription, subscribersRef) = do
+    let cleanupFanSubscribed :: EventSubscription x -> IO ()
+        cleanupFanSubscribed parentSubscription = do
           subscribers <- readIORef $ subscribersRef
           let reducedSubscribers = DMap.delete k subscribers
           -- When we don't have any subscribers, unsubscribe from e
@@ -1859,7 +1860,7 @@ fanG e = unsafePerformIO $ do
               writeIORef ref Nothing
             else
               writeIORef subscribersRef $! reducedSubscribers
-    let getSubscription sln subscribersRef parentSubscription occ =
+    let getSubscription sln parentSubscription occ =
           ( EventSubscription
             (WeakBag.remove sln >> touch sln)
             (EventSubscribed
@@ -1874,26 +1875,25 @@ fanG e = unsafePerformIO $ do
           , occ
           )
     (liftIO . readIORef $ ref) >>= \case
-      Just (parentSubscription, subscribersRef) -> {-# SCC "hitFan" #-} liftIO $ do
+      Just parentSubscription -> {-# SCC "hitFan" #-} liftIO $ do
         -- We're initialized:
         sln <- do
           subscribers <- readIORef subscribersRef
           case DMap.lookup k subscribers of
             -- No WeakBag of subscribers yet for this key:
             Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
-              let !self = (k, parentSubscription, subscribersRef)
-              weakSelf <- newIORef =<< mkWeakPtrWithDebug self "FanSubscribed"
-              (list, sln) <- WeakBag.singleton sub weakSelf cleanupFanSubscribed
+              weakParentSubscription <- newIORef =<< mkWeakPtrWithDebug parentSubscription "FanSubscribed"
+              (list, sln) <- WeakBag.singleton sub weakParentSubscription cleanupFanSubscribed
               writeIORef subscribersRef
                 $! DMap.insertWith
                    (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible")
                    k
-                   (FanSubscribedChildren list self weakSelf)
+                   (FanSubscribedChildren list parentSubscription weakParentSubscription)
                    subscribers
               return sln
-            Just (FanSubscribedChildren list _ weakSelf) -> {-# SCC "hitSubscribeFanSubscribed" #-}
-              WeakBag.insert sub list weakSelf cleanupFanSubscribed
-        getSubscription sln subscribersRef parentSubscription . (DMap.lookup k =<<) <$> readIORef occRef
+            Just (FanSubscribedChildren list _ weakParentSubscription) -> {-# SCC "hitSubscribeFanSubscribed" #-}
+              WeakBag.insert sub list weakParentSubscription cleanupFanSubscribed
+        getSubscription sln parentSubscription . (DMap.lookup k =<<) <$> readIORef occRef
       Nothing -> {-# SCC "missFan" #-} do
         -- Not initialized: subscribe to parent.
         nid <-
@@ -1902,7 +1902,7 @@ fanG e = unsafePerformIO $ do
 #else
           pure undefined
 #endif
-        ~(parentSubscription, subscribersRef) <- liftIO
+        parentSubscription <- liftIO
               $ fmap (fromMaybe (error "getFanSubscribed: subscribedRef not yet initialized"))
               $ unsafeInterleaveIO $ readIORef $ ref
         (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nid) $ Subscriber
@@ -1925,15 +1925,19 @@ fanG e = unsafePerformIO $ do
               forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
                 WeakBag.traverse_ (_fanSubscribedChildren_list v) $ recalculateSubscriberHeight new
           }
-        let !self = (k, subscription, subscribersRef)
-        weakSelf <- liftIO $ newIORef $ error "getFanSubscribed: weakSelf not yet initialized"
-        (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanupFanSubscribed
-        subscribersRef <- liftIO $ newIORef $ error "getFanSubscribed: subscribersRef not yet initialized"
-        liftIO $ writeIORef subscribersRef $! DMap.singleton k $ FanSubscribedChildren subsForK self weakSelf
+        weakSubscription <- liftIO $ newIORef $ error "getFanSubscribed: weakSubscription not yet initialized"
+        (subsForK, slnForSub) <- liftIO $ WeakBag.singleton sub weakSubscription cleanupFanSubscribed
+        subscribers <- liftIO $ readIORef subscribersRef
+        liftIO $ writeIORef subscribersRef
+                $! DMap.insertWith
+                   (error "subscribeFanSubscribed: key that we just failed to find is present - should be impossible")
+                   k
+                   (FanSubscribedChildren subsForK subscription weakSubscription)
+                   subscribers
         mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
-        liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug self "FanSubscribed"
-        liftIO $ writeIORef ref $ Just (subscription, subscribersRef)
-        pure . getSubscription slnForSub subscribersRef parentSubscription $ DMap.lookup k =<< parentOcc
+        liftIO $ writeIORef weakSubscription =<< evaluate =<< mkWeakPtrWithDebug subscription "FanSubscribed"
+        liftIO $ writeIORef ref $ Just subscription
+        pure . getSubscription slnForSub parentSubscription $ DMap.lookup k =<< parentOcc
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
