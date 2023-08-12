@@ -1860,21 +1860,7 @@ fanG e = unsafePerformIO $ do
               writeIORef ref Nothing
             else
               writeIORef subscribersRef $! reducedSubscribers
-    let getSubscription sln parentSubscription occ =
-          ( EventSubscription
-            (WeakBag.remove sln >> touch sln)
-            (EventSubscribed
-             { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ parentSubscription
-             , eventSubscribedRetained = toAny (subscribersRef, parentSubscription, ref)
-#ifdef DEBUG_CYCLES
-             , eventSubscribedGetParents = return [_eventSubscription_subscribed parentSubscription]
-             , eventSubscribedHasOwnHeightRef = False
-             , eventSubscribedWhoCreated = whoCreatedIORef $ ref
-#endif
-             })
-          , occ
-          )
-    (liftIO . readIORef $ ref) >>= \case
+    (sln, parentSubscription, occ) <- (liftIO . readIORef $ ref) >>= \case
       Just parentSubscription -> {-# SCC "hitFan" #-} liftIO $ do
         -- We're initialized:
         sln <- do
@@ -1893,7 +1879,7 @@ fanG e = unsafePerformIO $ do
               return sln
             Just (FanSubscribedChildren list _ weakParentSubscription) -> {-# SCC "hitSubscribeFanSubscribed" #-}
               WeakBag.insert sub list weakParentSubscription cleanupFanSubscribed
-        getSubscription sln parentSubscription . (DMap.lookup k =<<) <$> readIORef occRef
+        (sln, parentSubscription,) . (DMap.lookup k =<<) <$> readIORef occRef
       Nothing -> {-# SCC "missFan" #-} do
         -- Not initialized: subscribe to parent.
         nid <-
@@ -1937,7 +1923,20 @@ fanG e = unsafePerformIO $ do
         mapM_ (writeAndScheduleClear occRef) parentOcc -- TODO: looks inelegant, can we group the things which want Just occ?
         liftIO $ writeIORef weakSubscription =<< evaluate =<< mkWeakPtrWithDebug subscription "FanSubscribed"
         liftIO $ writeIORef ref $ Just subscription
-        pure . getSubscription slnForSub parentSubscription $ DMap.lookup k =<< parentOcc
+        pure (slnForSub, parentSubscription, DMap.lookup k =<< parentOcc)
+    pure ( EventSubscription
+            (WeakBag.remove sln >> touch sln)
+            (EventSubscribed
+             { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed $ parentSubscription
+             , eventSubscribedRetained = toAny (subscribersRef, parentSubscription, ref)
+#ifdef DEBUG_CYCLES
+             , eventSubscribedGetParents = return [_eventSubscription_subscribed parentSubscription]
+             , eventSubscribedHasOwnHeightRef = False
+             , eventSubscribedWhoCreated = whoCreatedIORef $ ref
+#endif
+             })
+          , occ
+          )
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
