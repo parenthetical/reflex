@@ -203,6 +203,9 @@ debugPropagate = False
 debugInvalidateHeight = False
 debugInvalidate = False
 
+nodeId :: Int 
+nodeId = error "nodeId was evaluated without DEBUG turned on"
+
 -- This must be inline, or error messages will cause memory leaks due to retaining the node in question
 {-# INLINE showNodeId #-}
 showNodeId :: a -> String
