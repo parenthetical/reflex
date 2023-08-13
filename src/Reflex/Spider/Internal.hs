@@ -362,11 +362,7 @@ cacheEvent e =
 #endif
               subscribers <- liftIO FastWeakBag.empty
               occRef <- liftIO $ newIORef Nothing -- This should never be read prior to being set below
-#ifdef DEBUG_NODEIDS
               (parentSub, occ) <- subscribeAndRead e $ debugSubscriber' ("cacheEvent" <> showNodeId' nodeId) $ Subscriber
-#else
-              (parentSub, occ) <- subscribeAndRead e $ Subscriber
-#endif
                   { subscriberPropagate = \a -> do
                       writeAndScheduleClear occRef a
                       propagateFast a subscribers
