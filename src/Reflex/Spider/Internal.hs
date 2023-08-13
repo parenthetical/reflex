@@ -1483,7 +1483,7 @@ fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
 fanInt p = unsafePerformIO $ do
   subscribers <- FastMutableIntMap.newEmpty --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
   subscriptionRef <- newIORef $ error "fanInt: no subscription"
-  occRef <- newIORef $ error "fanInt: no occurrence"
+  occRef <- newIORef mempty
 #ifdef DEBUG_NODEIDS
   nodeId <- newNodeId
 #endif
@@ -1507,7 +1507,7 @@ fanInt p = unsafePerformIO $ do
                 subscriberRecalculateHeight s new
         }
       liftIO $ writeIORef subscriptionRef subscription
-      writeAndScheduleIntClear occRef $ fromMaybe IntMap.empty parentOcc
+      mapM_ (writeAndScheduleIntClear occRef) parentOcc
     liftIO $ do
       b <- FastMutableIntMap.lookup subscribers k >>= \case
         Nothing -> do
