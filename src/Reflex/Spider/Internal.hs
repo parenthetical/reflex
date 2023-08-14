@@ -1722,30 +1722,30 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
   let {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead isInit e = do -- not isInit == isUpdate
         let addAccum !a = do
-                 oldAccum <- liftIO (readIORef $ accumRef)
-                 liftIO $ writeIORef accumRef $! (a <> oldAccum) -- left-biased generally but there shouldn't be dup'd keys
-                 when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
-                   checkCycle subscribed
-                   let scheduleMerge' initialHeight = do
-                         scheduleMerge initialHeight $ do
-                           height <- liftIO $ readIORef heightRef
-                           currentHeight <- getCurrentHeight
-                           case height `compare` currentHeight of
-                             LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-                             -- The height has been increased (by a coincidence event;
-                             -- TODO: is this the only way?)
-                             GT -> scheduleMerge' height
-                             EQ -> do
-                               vals <- liftIO $ readIORef $ accumRef
-                                -- TODO: this is an unfortunate effect of my
-                                -- attempt to use addAccum both at init time and
-                                -- update time.
-                               unless (outputIsEmpty vals) $ do
-                               -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
-                               -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                                 liftIO $ writeIORef accumRef $! mempty
-                                 subscriberPropagate sub vals
-                   scheduleMerge' <=< liftIO $ readIORef heightRef
+              oldAccum <- liftIO (readIORef $ accumRef)
+              liftIO $ writeIORef accumRef $! (a <> oldAccum) -- left-biased generally but there shouldn't be dup'd keys
+              when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
+                checkCycle subscribed
+                let scheduleMerge' initialHeight = do
+                      scheduleMerge initialHeight $ do
+                        height <- liftIO $ readIORef heightRef
+                        currentHeight <- getCurrentHeight
+                        case height `compare` currentHeight of
+                          LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+                          -- The height has been increased (by a coincidence event;
+                          -- TODO: is this the only way?)
+                          GT -> scheduleMerge' height
+                          EQ -> do
+                            vals <- liftIO $ readIORef $ accumRef
+                             -- TODO: this is an unfortunate effect of my
+                             -- attempt to use addAccum both at init time and
+                             -- update time.
+                            unless (outputIsEmpty vals) $ do
+                            -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
+                            -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
+                              liftIO $ writeIORef accumRef $! mempty
+                              subscriberPropagate sub vals
+                scheduleMerge' <=< liftIO $ readIORef heightRef
         -- TODO: is "subscribeAndReadWithThisPropagation" something handy? Avoids defining having to define and use addAccum twice here, and it might lead to more consistency everywhere.
         (subscription@(EventSubscription _ parentSubd), parentOcc) <-
           lift $ subscribeAndRead e $ Subscriber
@@ -2004,27 +2004,27 @@ runFrame a = SpiderHost $ do
     -- TODO: Invalidate used to return an empty list, this might have been in anticipation to the TODO above.
     let invalidate :: IORef [Weak (Invalidator x)] -> IO ()
         invalidate wisRef = do
-         wis <- readIORef wisRef
-         evaluate <=< forM_ wis $ \wi -> do
-           mi <- deRefWeak wi
-           case mi of
-             Nothing -> do
-               traceInvalidate "invalidate Dead"
-               return () --TODO: Should we clean this up here?
-             Just i -> do
-               finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
-               case i of
-                 InvalidatorPull p -> do
-                   traceInvalidate $ "invalidate: Pull" <> showNodeId p
-                   mVal <- readIORef $ pullValue p
-                   forM_ mVal $ \val -> do
-                     writeIORef (pullValue p) Nothing
-                     evaluate
-                       =<< invalidate (pullSubscribedInvalidators val)
-                 InvalidatorSwitch subscribed -> do
-                   traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
-                   modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
-         writeIORef wisRef []
+          wis <- readIORef wisRef
+          evaluate <=< forM_ wis $ \wi -> do
+            mi <- deRefWeak wi
+            case mi of
+              Nothing -> do
+                traceInvalidate "invalidate Dead"
+                return () --TODO: Should we clean this up here?
+              Just i -> do
+                finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
+                case i of
+                  InvalidatorPull p -> do
+                    traceInvalidate $ "invalidate: Pull" <> showNodeId p
+                    mVal <- readIORef $ pullValue p
+                    forM_ mVal $ \val -> do
+                      writeIORef (pullValue p) Nothing
+                      evaluate
+                        =<< invalidate (pullSubscribedInvalidators val)
+                  InvalidatorSwitch subscribed -> do
+                    traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
+                    modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
+          writeIORef wisRef []
     invalidate iRef
   mergeUpdates <- readIORef $ eventEnvMergeUpdates env
   writeIORef (eventEnvMergeUpdates env) []
