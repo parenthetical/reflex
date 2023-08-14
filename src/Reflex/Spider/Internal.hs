@@ -2000,7 +2000,9 @@ runFrame a = SpiderHost $ do
     writeIORef vRef v
     traceInvalidate $ "Invalidating Hold"
     -- TODO: explain what invalidate does:
-    let invalidate :: [Weak (Invalidator x)] -> IO [Weak (Invalidator x)]
+    --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them.
+    -- TODO: Invalidate used to return an empty list, this might have been in anticipation to the TODO above.
+    let invalidate :: [Weak (Invalidator x)] -> IO ()
         invalidate wis = do
          forM_ wis $ \wi -> do
            mi <- deRefWeak wi
@@ -2016,15 +2018,15 @@ runFrame a = SpiderHost $ do
                    mVal <- readIORef $ pullValue p
                    forM_ mVal $ \val -> do
                      writeIORef (pullValue p) Nothing
-                     writeIORef (pullSubscribedInvalidators val)
-                       =<< evaluate
+                     evaluate
                        =<< invalidate
                        =<< readIORef (pullSubscribedInvalidators val)
+                     writeIORef (pullSubscribedInvalidators val) []
                  InvalidatorSwitch subscribed -> do
                    traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
                    modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
-         return [] -- Since we always finalize everything, always return an empty list --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them
-    writeIORef iRef <=< evaluate <=< invalidate <=< readIORef $ iRef
+    evaluate <=< invalidate <=< readIORef $ iRef
+    writeIORef iRef []
   mergeUpdates <- readIORef $ eventEnvMergeUpdates env
   writeIORef (eventEnvMergeUpdates env) []
   tracePropagate (Proxy::Proxy x) $ "Updating merges"
