@@ -117,6 +117,7 @@ import Reflex.PerformEvent.Base (PerformEventT)
 import Data.Patch.DMapWithMove (PatchDMapWithMove(..), From (..), nodeInfoMapFromM, NodeInfo (..))
 import qualified Control.Monad.Writer as W
 import Control.Monad.Writer (WriterT, MonadTrans (..))
+import Control.Monad.Trans.Maybe
 #ifdef DEBUG_TRACE_EVENTS
 import qualified Data.ByteString.Char8 as BS8
 import System.IO (stderr)
@@ -1585,8 +1586,8 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt =
   merge
-  (\ipt (MergeRead tellE) -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
-  (\(PatchIntMap ip) s (MergeRead tellE) -> do
+  (\ipt tellE -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
+  (\(PatchIntMap ip) s tellE -> do
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
      traverse_ fst $ IntMap.intersection s ip
      pure $ applyAlways (PatchIntMap ip') s)
@@ -1598,17 +1599,14 @@ mergeInt =
 mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
   => ( patch k q
        -> DMap k (Constant (MergeM x (), EventSubscription x))
-       -> MergeRead x (DMap k v)
+       -> TellE x (DMap k v)
        -> MergeM x (DMap k (Constant (MergeM x (), EventSubscription x))))
   -> (forall a. q a -> Event x (v a))
   -> DynamicS x (patch k q)
   -> Event x (DMap k v)
 mergeG' doPatch nt =
   merge
-  (\ipt (MergeRead tellE) ->
-       DMap.traverseWithKey (\k v ->
-                               Constant <$> tellE (DMap.singleton k <$> nt v))
-       ipt)
+  (\ipt tellE -> DMap.traverseWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ipt)
   doPatch
   DMap.null
   (fmap (\(_ :=> (Constant (_, sub))) -> sub) . DMap.toList)
@@ -1618,9 +1616,8 @@ mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMap k q) -> Event x (DMap k v)
 mergeG nt =
   mergeG'
-  (\ip s (MergeRead tellE) -> do
-     ip' <- traversePatchDMapWithKey (\k v ->
-                               Constant <$> tellE (DMap.singleton k <$> nt v))
+  (\ip s tellE -> do
+     ip' <- traversePatchDMapWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
      mapM_ (\(_ :=> v) -> fst $ getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
      pure $ applyAlways ip' s)
@@ -1630,7 +1627,7 @@ mergeWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMapWithMove k q) -> Event x (DMap k v)
 mergeWithMove nt =
   mergeG'
-  (\ip s (MergeRead tellE) -> do
+  (\ip s tellE -> do
      ip' <- traversePatchDMapWithMoveWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
@@ -1668,16 +1665,13 @@ checkCycle subscribed = liftIO $ do
 #endif
 
 type MergeM x a = WriterT [EventSubscription x] (EventM x) a
-
-newtype MergeRead x a = MergeRead
-  { _tellE :: Event x a -> MergeM x (MergeM x (), EventSubscription x)
-  }
+type TellE x a = Event x a -> MergeM x (MergeM x (), EventSubscription x)
 
 {-# INLINE merge #-}
 merge :: forall x ip ipt o s.
   ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Monoid s)
-  => (ipt -> MergeRead x o -> MergeM x s)
-  -> (ip -> s -> MergeRead x o -> MergeM x s)
+  => (ipt -> TellE x o -> MergeM x s)
+  -> (ip -> s -> TellE x o -> MergeM x s)
   -> (o -> Bool)
   -> (s -> [EventSubscription x])
   -> (s -> Int)
@@ -1722,7 +1716,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
   let {-# INLINE [1] mergeSubscribeAndRead #-}
       mergeSubscribeAndRead isInit e = do -- not isInit == isUpdate
         let addAccum !a = do
-              oldAccum <- liftIO (readIORef $ accumRef)
+              oldAccum <- liftIO (readIORef accumRef)
               liftIO $ writeIORef accumRef $! (a <> oldAccum) -- left-biased generally but there shouldn't be dup'd keys
               when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
                 checkCycle subscribed
@@ -1736,7 +1730,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
                           -- TODO: is this the only way?)
                           GT -> scheduleMerge' height
                           EQ -> do
-                            vals <- liftIO $ readIORef $ accumRef
+                            vals <- liftIO $ readIORef accumRef
                              -- TODO: this is an unfortunate effect of my
                              -- attempt to use addAccum both at init time and
                              -- update time.
@@ -1780,30 +1774,15 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
             W.tell [subscription]
   subsToKillIllegal <- W.execWriterT $
     liftIO . writeIORef stateRef
-    =<< flip doInitialInput (MergeRead (mergeSubscribeAndRead True))
+    =<< flip doInitialInput (mergeSubscribeAndRead True)
     =<< lift (readBehaviorUntracked (dynamicCurrent d))
   unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
-  myHeight <- liftIO $ readIORef heightRef
-  currentHeight <- getCurrentHeight
-  occ <- if currentHeight >= myHeight -- If we should have fired by now
-         then liftIO $ do
-           dm <- readIORef accumRef
-           if outputIsEmpty dm
-             then pure Nothing
-             else do
-               writeIORef accumRef mempty
-               pure $ Just dm
-         else pure Nothing
   defer $ SomeMergeInit $ do
     let deferUpdateMerge p = do
           -- TODO: Be able to run as much of this as possible promptly
-          -- TODO: SomeMergeUpdate's invalidate is the same for this and mergeIntCheap, could
-          -- just pass in the heightRef/sub?
           defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
             oldState <- liftIO $ readIORef stateRef
-            W.execWriterT $
-              liftIO . writeIORef stateRef
-              =<< doPatchInput p oldState (MergeRead (mergeSubscribeAndRead False))
+            W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False)
     (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) $ Subscriber
           { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
               tracePropagate (Proxy :: Proxy x) "SubscriberMerge/Change"
@@ -1816,10 +1795,16 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
     liftIO $ writeIORef toRetainRef (changeSubscription, stateRef)
-  let unsubscribeAll = do
-        traverse_ unsubscribe . getSubs =<< readIORef stateRef
-        writeIORef stateRef mempty -- TOOD: needed/useful?
-  return (EventSubscription unsubscribeAll subscribed, occ)
+  fmap ( EventSubscription
+           (do traverse_ unsubscribe . getSubs =<< readIORef stateRef
+               writeIORef stateRef mempty) -- TOOD: needed/useful?
+           subscribed
+       , ) . runMaybeT $ do
+       guard =<< lift ((>=) <$> getCurrentHeight <*> liftIO (readIORef heightRef)) -- If we should have fired by now
+       dm <- liftIO $ readIORef accumRef
+       guard (not (outputIsEmpty dm))
+       liftIO $ writeIORef accumRef mempty
+       pure dm
 
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
 newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
