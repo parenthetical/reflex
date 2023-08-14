@@ -992,10 +992,12 @@ data CoincidenceSubscribed_ x a
                             , coincidenceSubscribedInnerParent :: !(IORef (Maybe (EventSubscribed x)))
                             }
 
+-- TODO: Why is this NOINLINE?
 {-# NOINLINE newInvalidatorSwitch #-}
 newInvalidatorSwitch :: SwitchSubscribed x a -> IO (Invalidator x)
 newInvalidatorSwitch subd = return $! InvalidatorSwitch subd
 
+-- TODO: Why is this NOINLINE?
 {-# NOINLINE newInvalidatorPull #-}
 newInvalidatorPull :: Pull x a -> IO (Invalidator x)
 newInvalidatorPull p = return $! InvalidatorPull p
