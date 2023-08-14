@@ -857,7 +857,6 @@ data PullSubscribed x a
 --type role Pull representational
 data Pull x a
    = Pull { pullValue :: !(IORef (Maybe (PullSubscribed x a)))
-          , pullCompute :: !(BehaviorM x a)
 #ifdef DEBUG_NODEIDS
           , pullNodeId :: Int
 #endif
@@ -1060,15 +1059,8 @@ pull a = unsafePerformIO $ do
 #ifdef DEBUG_NODEIDS
   nid <- newNodeId
 #endif
-  let !p = Pull
-        { pullCompute = a
-        , pullValue = ref
-#ifdef DEBUG_NODEIDS
-        , pullNodeId = nid
-#endif
-        }
   pure $ Behavior $ do
-    val <- liftIO $ readIORef $ pullValue p
+    val <- liftIO $ readIORef $ ref
     case val of
       Just subscribed -> do
         askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
@@ -1076,11 +1068,14 @@ pull a = unsafePerformIO $ do
         liftIO $ touch $ pullSubscribedOwnInvalidator subscribed
         return $ pullSubscribedValue subscribed
       Nothing -> do
-        i <- liftIO $ newInvalidatorPull p
+        i <- liftIO $ newInvalidatorPull $ Pull ref 
+#ifdef DEBUG_NODEIDS
+                                                nid
+#endif
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorPull"
         parentsRef <- liftIO $ newIORef []
         holdInits <- askBehaviorHoldInits
-        a <- liftIO $ runReaderIO (unBehaviorM $ pullCompute p) (Just (wi, parentsRef), holdInits)
+        a <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
         invsRef <- liftIO . newIORef . maybeToList =<< askInvalidator
         parents <- liftIO $ readIORef parentsRef
         let subscribed = PullSubscribed
@@ -1089,10 +1084,10 @@ pull a = unsafePerformIO $ do
               , pullSubscribedOwnInvalidator = i
               , pullSubscribedParents = parents
               }
-        liftIO $ writeIORef (pullValue p) $ Just subscribed
-        askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
+        liftIO $ writeIORef ref $ Just subscribed
+        askParentsRef
+          >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
         return a
-
 
 {-# INLINABLE switch #-}
 switch :: HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
@@ -2149,7 +2144,8 @@ invalidate toReconnectRef wis = do
             mVal <- readIORef $ pullValue p
             forM_ mVal $ \val -> do
               writeIORef (pullValue p) Nothing
-              writeIORef (pullSubscribedInvalidators val) =<< evaluate =<< invalidate toReconnectRef =<< readIORef (pullSubscribedInvalidators val)
+              writeIORef (pullSubscribedInvalidators val) =<< evaluate =<< invalidate toReconnectRef
+                =<< readIORef (pullSubscribedInvalidators val)
           InvalidatorSwitch subscribed -> do
             traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
             modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
