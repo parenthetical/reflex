@@ -1080,11 +1080,11 @@ pull a = unsafePerformIO $ do
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorPull"
         parentsRef <- liftIO $ newIORef []
         holdInits <- askBehaviorHoldInits
-        a <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
+        aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
         invsRef <- liftIO . newIORef . maybeToList =<< askInvalidator
         parents <- liftIO $ readIORef parentsRef
         let subscribed = PullSubscribed
-              { pullSubscribedValue = a
+              { pullSubscribedValue = aVal
               , pullSubscribedInvalidators = invsRef
               , pullSubscribedOwnInvalidator = i
               , pullSubscribedParents = parents
@@ -1092,7 +1092,7 @@ pull a = unsafePerformIO $ do
         liftIO $ writeIORef ref $ Just subscribed
         askParentsRef
           >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
-        return a
+        return aVal
 
 {-# INLINABLE switch #-}
 switch :: HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
