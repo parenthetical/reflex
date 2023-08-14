@@ -1232,11 +1232,7 @@ mkWeakPtrWithDebug x debugNote = do
     then Just $ debugStrLn $ "finalizing: " ++ debugNote
     else Nothing
 
-type WeakList a = [Weak a]
-
 type CanTrace x m = (HasSpiderTimeline x, MonadIO m)
-
-
 
 
 #ifdef DEBUG
@@ -2003,7 +1999,32 @@ runFrame a = SpiderHost $ do
   forM_ toAssign $ \(SomeAssignment vRef iRef v) -> {-# SCC "assignment" #-} do
     writeIORef vRef v
     traceInvalidate $ "Invalidating Hold"
-    writeIORef iRef =<< evaluate =<< invalidate toReconnectRef =<< readIORef iRef
+    -- TODO: explain what invalidate does:
+    let invalidate :: [Weak (Invalidator x)] -> IO [Weak (Invalidator x)]
+        invalidate wis = do
+         forM_ wis $ \wi -> do
+           mi <- deRefWeak wi
+           case mi of
+             Nothing -> do
+               traceInvalidate "invalidate Dead"
+               return () --TODO: Should we clean this up here?
+             Just i -> do
+               finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
+               case i of
+                 InvalidatorPull p -> do
+                   traceInvalidate $ "invalidate: Pull" <> showNodeId p
+                   mVal <- readIORef $ pullValue p
+                   forM_ mVal $ \val -> do
+                     writeIORef (pullValue p) Nothing
+                     writeIORef (pullSubscribedInvalidators val)
+                       =<< evaluate
+                       =<< invalidate
+                       =<< readIORef (pullSubscribedInvalidators val)
+                 InvalidatorSwitch subscribed -> do
+                   traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
+                   modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
+         return [] -- Since we always finalize everything, always return an empty list --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them
+    writeIORef iRef <=< evaluate <=< invalidate <=< readIORef $ iRef
   mergeUpdates <- readIORef $ eventEnvMergeUpdates env
   writeIORef (eventEnvMergeUpdates env) []
   tracePropagate (Proxy::Proxy x) $ "Updating merges"
@@ -2125,31 +2146,6 @@ updateCommonHeight heightRef subscribers newHeight = do
       WeakBag.traverse_ subscribers $ recalculateSubscriberHeight newHeight
 
 data SomeSwitchSubscribed x = forall a. SomeSwitchSubscribed {-# NOUNPACK #-} (SwitchSubscribed x a)
-
--- TODO: explain what this does
--- Only used in runFrame
-invalidate :: IORef [SomeSwitchSubscribed x] -> WeakList (Invalidator x) -> IO (WeakList (Invalidator x))
-invalidate toReconnectRef wis = do
-  forM_ wis $ \wi -> do
-    mi <- deRefWeak wi
-    case mi of
-      Nothing -> do
-        traceInvalidate "invalidate Dead"
-        return () --TODO: Should we clean this up here?
-      Just i -> do
-        finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
-        case i of
-          InvalidatorPull p -> do
-            traceInvalidate $ "invalidate: Pull" <> showNodeId p
-            mVal <- readIORef $ pullValue p
-            forM_ mVal $ \val -> do
-              writeIORef (pullValue p) Nothing
-              writeIORef (pullSubscribedInvalidators val) =<< evaluate =<< invalidate toReconnectRef
-                =<< readIORef (pullSubscribedInvalidators val)
-          InvalidatorSwitch subscribed -> do
-            traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
-            modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
-  return [] -- Since we always finalize everything, always return an empty list --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them
 
 --------------------------------------------------------------------------------
 -- Reflex integration
