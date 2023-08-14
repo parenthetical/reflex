@@ -1002,6 +1002,8 @@ newInvalidatorSwitch subd = return $! InvalidatorSwitch subd
 newInvalidatorPull :: Pull x a -> IO (Invalidator x)
 newInvalidatorPull p = return $! InvalidatorPull p
 
+
+-- TODO: why are these instances here?
 instance HasSpiderTimeline x => Filterable (Event x) where
   mapMaybe f = push $ return . f
 
@@ -1019,6 +1021,8 @@ instance HasSpiderTimeline x => Zip (Event x) where
 #endif
   zip x y = mapMaybe justThese $ align x y
 #endif
+----------------- why are these instances here? ^
+
 
 data DynType x p = UnsafeDyn !(BehaviorM x (PatchTarget p), Event x p)
                  | BuildDyn  !(EventM x (PatchTarget p), Event x p)
