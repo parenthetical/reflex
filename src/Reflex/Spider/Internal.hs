@@ -2002,9 +2002,10 @@ runFrame a = SpiderHost $ do
     -- TODO: explain what invalidate does:
     --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them.
     -- TODO: Invalidate used to return an empty list, this might have been in anticipation to the TODO above.
-    let invalidate :: [Weak (Invalidator x)] -> IO ()
-        invalidate wis = do
-         forM_ wis $ \wi -> do
+    let invalidate :: IORef [Weak (Invalidator x)] -> IO ()
+        invalidate wisRef = do
+         wis <- readIORef wisRef
+         evaluate <=< forM_ wis $ \wi -> do
            mi <- deRefWeak wi
            case mi of
              Nothing -> do
@@ -2019,14 +2020,12 @@ runFrame a = SpiderHost $ do
                    forM_ mVal $ \val -> do
                      writeIORef (pullValue p) Nothing
                      evaluate
-                       =<< invalidate
-                       =<< readIORef (pullSubscribedInvalidators val)
-                     writeIORef (pullSubscribedInvalidators val) []
+                       =<< invalidate (pullSubscribedInvalidators val)
                  InvalidatorSwitch subscribed -> do
                    traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
                    modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
-    evaluate <=< invalidate <=< readIORef $ iRef
-    writeIORef iRef []
+         writeIORef wisRef []
+    invalidate iRef
   mergeUpdates <- readIORef $ eventEnvMergeUpdates env
   writeIORef (eventEnvMergeUpdates env) []
   tracePropagate (Proxy::Proxy x) $ "Updating merges"
