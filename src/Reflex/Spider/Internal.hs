@@ -981,7 +981,7 @@ data SwitchSubscribed_ x a
 #endif
 type CoincidenceSubscribed x a = ASubscribed CoincidenceSubscribed_ x a
 data CoincidenceSubscribed_ x a
-   = CoincidenceSubscribed_ { coincidenceSubscribedOuterParent :: !(EventSubscription x)
+   = CoincidenceSubscribed_ { coincidenceSubscribedOuterParent :: !(IORef (EventSubscription x))
                             , coincidenceSubscribedInnerParent :: !(IORef (Maybe (EventSubscribed x)))
                             }
 
@@ -1174,18 +1174,24 @@ switch switchParent =
                                                    , switchSubscribedCurrentParent = subscriptionRef
                                                    }))
 
+
+-- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
+--     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
+--     of all used heights.
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
 coincidence :: forall x a. (-- Defer (SomeMergeUpdate x) (EventM x),
                             HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = unsafePerformIO $ do
   innerSubdRef <- newIORef $ error "coincidence: innerSubdRef undefined"
+  outerParentSubscriptionRef <- newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
+  -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
+  let getParentSubscribeds = do
+        maybeInnerSubscription <- readIORef innerSubdRef
+        outerSubscription <- readIORef outerParentSubscriptionRef
+        return $ _eventSubscription_subscribed outerSubscription : maybeToList maybeInnerSubscription
   pure $ commonEvent
-    (unsubscribe . coincidenceSubscribedOuterParent) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
-    (\subscribedSpecific -> do -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
-      maybeInnerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribedSpecific
-      let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
-          innerParent = maybeToList maybeInnerSubscription
-      return $ outerParent : innerParent)
+    (unsubscribe <=< readIORef . coincidenceSubscribedOuterParent) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
+    (const getParentSubscribeds)
     -- The laziness annotation is important! 'subscribed' might not have been initialized.
     (\(~subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> do -- TODO: subscribed was originally called 'subscribedUnsafe', why? Probably because it might not be initialized so you have to be lazy in examining it?
         let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
@@ -1199,17 +1205,18 @@ coincidence coincidenceParent = unsafePerformIO $ do
                        Nothing -> doPropagate a
               writeAndScheduleClear innerSubdRef innerSubd
               let height = max innerHeight outerHeight
+              let whatIsThisConditionTODO = height > outerHeight
               defer (SomeMergeUpdate
                  (do unsubscribe subscription
-                     when (height > outerHeight) $ 
+                     when whatIsThisConditionTODO $ 
                        invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon))
-                 (when (height > outerHeight) $
+                 (when whatIsThisConditionTODO $
                    updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon) =<< do
-                     outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
-                     innerHeight <- maybe (return zeroHeight) getEventSubscribedHeight =<< readIORef (coincidenceSubscribedInnerParent subscribedSpecific)
-                     return $ if outerHeight == invalidHeight || innerHeight == invalidHeight -- TODO: why not order heights with invalid as Top?
+                     subs <- mapM getEventSubscribedHeight =<< getParentSubscribeds
+                     -- TODO: why not order heights with invalid as Top?
+                     return $ if  invalidHeight `elem` subs
                               then invalidHeight
-                              else max outerHeight innerHeight)
+                              else maximum subs)
                  (pure []) :: SomeMergeUpdate x)
               return (innerOcc, height)
         (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
@@ -1224,17 +1231,18 @@ coincidence coincidenceParent = unsafePerformIO $ do
                  Nothing ->
                    when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
                      writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
-                     WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
-                       $ invalidateSubscriberHeight outerHeight
-                     WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
-                       $ recalculateSubscriberHeight innerHeight
+                     WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight outerHeight
+                     WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ recalculateSubscriberHeight innerHeight
                  Just o -> doPropagate o -- Since it's already firing, no need to adjust height
+        liftIO $ writeIORef outerParentSubscriptionRef outerSubscription
         (occ, height) <- case outerOcc of
           Nothing -> return (Nothing, outerHeight)
           Just o -> subscribeCoincidenceInner o outerHeight
-        pure (occ, height,  CoincidenceSubscribed_ { coincidenceSubscribedOuterParent = outerSubscription
-                                                   , coincidenceSubscribedInnerParent = innerSubdRef
-                                                   }))
+        pure (occ, height,
+              -- This is now just for retaining purposes?
+              CoincidenceSubscribed_ { coincidenceSubscribedOuterParent = outerParentSubscriptionRef
+                                     , coincidenceSubscribedInnerParent = innerSubdRef
+                                     }))
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> ResultM x b -> SpiderHost x b
