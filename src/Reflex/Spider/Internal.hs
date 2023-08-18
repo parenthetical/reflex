@@ -1094,6 +1094,66 @@ pull a = unsafePerformIO $ do
           >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
         return aVal
 
+{-# INLINE commonEvent #-}
+commonEvent :: forall s x a. HasSpiderTimeline x =>
+  (s x a -> IO ()) ->
+  (s x a -> IO [EventSubscribed x]) ->
+  (ASubscribed s x a -> EventM x (Maybe a, Height, s x a)) ->
+  Event x a
+commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
+  -- TODO: Is this function actually doing cacheEvent? Can I use cacheEvent instead?
+  mSubscribedRef :: IORef (Maybe (ASubscribed s x a)) <- newIORef Nothing
+  pure
+    $ Event
+    $ wrap (\subscribed@(ASubscribed !subscribedSpecific !subscribedCommon) ->
+              EventSubscribed
+              { eventSubscribedHeightRef = commonSubscribedHeight subscribedCommon
+              , eventSubscribedRetained = toAny subscribed
+#ifdef DEBUG_CYCLES
+              , eventSubscribedGetParents = eventSubscribedGetParents_ subscribedSpecific
+              , eventSubscribedHasOwnHeightRef = True
+              , eventSubscribedWhoCreated = whoCreatedIORef $ commonSubscribedCachedSubscribed subscribedCommon
+#endif
+              })  
+    $ \sub -> do
+    mSubscribed <- liftIO $ readIORef $ mSubscribedRef
+    let cleanup (ASubscribed subscribedSpecific subscribedCommon) = do
+          cleanupSpecific subscribedSpecific
+          writeIORef (commonSubscribedCachedSubscribed subscribedCommon) Nothing
+    case mSubscribed of
+      Just subscribed@(ASubscribed _subscribedSpecific subscribedCommon) -> {-# SCC "hitCommon" #-} liftIO $ do
+        sln <- WeakBag.insert sub (commonSubscribedSubscribers subscribedCommon) (commonSubscribedWeakSelf subscribedCommon) cleanup
+        occ <- readIORef $ commonSubscribedOccurrence subscribedCommon
+        return (sln, subscribed, occ)
+      Nothing -> {-# SCC "missCommon" #-} do
+        subscribedRef <- liftIO $ newIORef $ error "commonEvent: subscribed has not yet been created"
+        subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
+        (occ, height, subscribedSpecific) <- foo subscribedUnsafe
+        occRef <- newAndScheduleClear occ
+        heightRef <- liftIO $ newIORef height
+        weakSelf <- liftIO $ newIORef $ error "commonEvent: weakSelf not yet initialized"
+        (subs, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanup
+#ifdef DEBUG_NODEIDS
+        nid <- liftIO newNodeId
+#endif
+        let !subscribed :: ASubscribed s x a = ASubscribed
+              { subscribedSpecific_ = subscribedSpecific
+              , subscribedCommon_ = CommonSubscribed
+                { commonSubscribedCachedSubscribed = mSubscribedRef
+                , commonSubscribedOccurrence = occRef
+                , commonSubscribedHeight = heightRef
+                , commonSubscribedSubscribers = subs
+                , commonSubscribedWeakSelf = weakSelf
+#ifdef DEBUG_NODEIDS
+                , commonSubscribedNodeId = nid
+#endif
+                }
+              }
+        liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug subscribed "commonSubscribedWeakSelf"
+        liftIO $ writeIORef subscribedRef $! subscribed
+        liftIO $ writeIORef mSubscribedRef $ Just subscribed
+        return (slnForSub, subscribed, occ)
+
 {-# INLINABLE switch #-}
 switch :: HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = 
@@ -1526,66 +1586,6 @@ fanInt p = unsafePerformIO $ do
 #endif
           }
       return (EventSubscription (FastWeakBag.remove ticket) subscribed, IntMap.lookup k currentOcc)
-
-{-# INLINE commonEvent #-}
-commonEvent :: forall s x a. HasSpiderTimeline x =>
-  (s x a -> IO ()) ->
-  (s x a -> IO [EventSubscribed x]) ->
-  (ASubscribed s x a -> EventM x (Maybe a, Height, s x a)) ->
-  Event x a
-commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
-  -- TODO: Is this function actually doing cacheEvent? Can I use cacheEvent instead?
-  mSubscribedRef :: IORef (Maybe (ASubscribed s x a)) <- newIORef Nothing
-  pure
-    $ Event
-    $ wrap (\subscribed@(ASubscribed !subscribedSpecific !subscribedCommon) ->
-              EventSubscribed
-              { eventSubscribedHeightRef = commonSubscribedHeight subscribedCommon
-              , eventSubscribedRetained = toAny subscribed
-#ifdef DEBUG_CYCLES
-              , eventSubscribedGetParents = eventSubscribedGetParents_ subscribedSpecific
-              , eventSubscribedHasOwnHeightRef = True
-              , eventSubscribedWhoCreated = whoCreatedIORef $ commonSubscribedCachedSubscribed subscribedCommon
-#endif
-              })  
-    $ \sub -> do
-    mSubscribed <- liftIO $ readIORef $ mSubscribedRef
-    let cleanup (ASubscribed subscribedSpecific subscribedCommon) = do
-          cleanupSpecific subscribedSpecific
-          writeIORef (commonSubscribedCachedSubscribed subscribedCommon) Nothing
-    case mSubscribed of
-      Just subscribed@(ASubscribed _subscribedSpecific subscribedCommon) -> {-# SCC "hitCommon" #-} liftIO $ do
-        sln <- WeakBag.insert sub (commonSubscribedSubscribers subscribedCommon) (commonSubscribedWeakSelf subscribedCommon) cleanup
-        occ <- readIORef $ commonSubscribedOccurrence subscribedCommon
-        return (sln, subscribed, occ)
-      Nothing -> {-# SCC "missCommon" #-} do
-        subscribedRef <- liftIO $ newIORef $ error "commonEvent: subscribed has not yet been created"
-        subscribedUnsafe <- liftIO $ unsafeInterleaveIO $ readIORef subscribedRef
-        (occ, height, subscribedSpecific) <- foo subscribedUnsafe
-        occRef <- newAndScheduleClear occ
-        heightRef <- liftIO $ newIORef height
-        weakSelf <- liftIO $ newIORef $ error "commonEvent: weakSelf not yet initialized"
-        (subs, slnForSub) <- liftIO $ WeakBag.singleton sub weakSelf cleanup
-#ifdef DEBUG_NODEIDS
-        nid <- liftIO newNodeId
-#endif
-        let !subscribed :: ASubscribed s x a = ASubscribed
-              { subscribedSpecific_ = subscribedSpecific
-              , subscribedCommon_ = CommonSubscribed
-                { commonSubscribedCachedSubscribed = mSubscribedRef
-                , commonSubscribedOccurrence = occRef
-                , commonSubscribedHeight = heightRef
-                , commonSubscribedSubscribers = subs
-                , commonSubscribedWeakSelf = weakSelf
-#ifdef DEBUG_NODEIDS
-                , commonSubscribedNodeId = nid
-#endif
-                }
-              }
-        liftIO $ writeIORef weakSelf =<< evaluate =<< mkWeakPtrWithDebug subscribed "commonSubscribedWeakSelf"
-        liftIO $ writeIORef subscribedRef $! subscribed
-        liftIO $ writeIORef mSubscribedRef $ Just subscribed
-        return (slnForSub, subscribed, occ)
 
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt =
