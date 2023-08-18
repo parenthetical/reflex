@@ -43,10 +43,20 @@ import Data.Monoid
 import Data.Type.Coercion
 import Reflex.Class
 import Data.Kind (Type)
+import Control.Monad.Trans.Maybe
 
 -- | A completely pure-functional 'Reflex' timeline, identifying moments in time
 -- with the type @/t/@.
 data Pure (t :: Type)
+
+occurs :: Event (Pure t) a -> (t -> Maybe a)
+occurs = unEvent
+
+
+
+toEvent :: HasTrie t => (t -> Maybe a) -> Event (Pure t) a
+toEvent = Event . memo
+
 
 -- | The 'Enum' instance of @/t/@ must be dense: for all @/x :: t/@, there must not exist
 -- any @/y :: t/@ such that @/'pred' x < y < x/@. The 'HasTrie' instance will be used
@@ -62,13 +72,13 @@ instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
   type PullM (Pure t) = (->) t
 
   never :: Event (Pure t) a
-  never = Event $ \_ -> Nothing
+  never = toEvent (pure Nothing)
 
   constant :: a -> Behavior (Pure t) a
-  constant x = Behavior $ \_ -> x
+  constant = pull . pure
 
   push :: (a -> PushM (Pure t) (Maybe b)) -> Event (Pure t) a -> Event (Pure t) b
-  push f e = Event $ memo $ \t -> unEvent e t >>= \o -> f o t
+  push f = toEvent . runMaybeT . (MaybeT . f <=< MaybeT . occurs)
 
   pushCheap :: (a -> PushM (Pure t) (Maybe b)) -> Event (Pure t) a -> Event (Pure t) b
   pushCheap = push
@@ -94,10 +104,10 @@ instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
   fanG e = EventSelectorG $ \k -> Event $ \t -> unEvent e t >>= DMap.lookup k
 
   switch :: Behavior (Pure t) (Event (Pure t) a) -> Event (Pure t) a
-  switch b = Event $ memo $ \t -> unEvent (unBehavior b t) t
+  switch = toEvent . (occurs <=< sample)
 
   coincidence :: Event (Pure t) (Event (Pure t) a) -> Event (Pure t) a
-  coincidence e = Event $ memo $ \t -> unEvent e t >>= \o -> unEvent o t
+  coincidence = push occurs
 
   current :: Dynamic (Pure t) a -> Behavior (Pure t) a
   current d = Behavior $ \t -> fst $ unDynamic d t
