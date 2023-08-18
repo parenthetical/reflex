@@ -1181,56 +1181,55 @@ switch switchParent =
 
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
 coincidence :: forall x a. HasSpiderTimeline x => Event x (Event x a) -> Event x a
-coincidence coincidenceParent =
-  commonEvent
-  (unsubscribe . coincidenceSubscribedOuterParent) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
-  (\subscribedSpecific -> do -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
-    maybeInnerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribedSpecific
-    let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
-        innerParent = maybeToList maybeInnerSubscription
-    return $ outerParent : innerParent)
-  -- The laziness annotation is important! 'subscribed' might not have been initialized.
-  (\(~subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> do -- TODO: subscribed was originally called 'subscribedUnsafe', why? Probably because it might not be initialized so you have to be lazy in examining it?
-      -- {-# INLINE subscribeCoincidenceInner #-}
-      let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height, EventSubscribed x)
-          subscribeCoincidenceInner inner outerHeight = do
-            let subInner = flip (newSubscriberCommon "SubscriberCoincidenceInner") subscribedCommon $ \doPropagate a -> do
-                                      occ <- liftIO $ readIORef (commonSubscribedOccurrence subscribedCommon)
-                                      case occ of
-                                        Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
-                                        Nothing -> doPropagate a
-            (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <- subscribeAndReadWithHeight inner subInner
-            let height = max innerHeight outerHeight
-            defer $ SomeResetCoincidence subscription $
-              if height > outerHeight then Just subscribed else Nothing
-            return (innerOcc, height, innerSubd)
-      (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
-        flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed) $ \doPropagate a ->
-          {-# SCC "traverseCoincidenceOuter" #-} do
-             outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
-             -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
-             (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
-             -- tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
-             -- tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
-             writeAndScheduleClear (coincidenceSubscribedInnerParent subscribedSpecific) innerSubd
-             case occ of
-               Nothing ->
-                 when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
-                   writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
-                   WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
-                     $ invalidateSubscriberHeight outerHeight
-                   WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
-                     $ recalculateSubscriberHeight innerHeight
-               Just o -> doPropagate o -- Since it's already firing, no need to adjust height
-      (occ, height, mInnerSubd) <- case outerOcc of
-        Nothing -> return (Nothing, outerHeight, Nothing)
-        Just o -> do
-          (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight
-          return (occ, height, Just innerSubd)
-      innerSubdRef <- newAndScheduleClear mInnerSubd
-      pure (occ, height,  CoincidenceSubscribed_ { coincidenceSubscribedOuterParent = outerSubscription
-                                                 , coincidenceSubscribedInnerParent = innerSubdRef
-                                                 }))
+coincidence coincidenceParent = unsafePerformIO $ do
+  innerSubdRef <- newIORef $ error "coincidence: innerSubdRef undefined"
+  pure $ commonEvent
+    (unsubscribe . coincidenceSubscribedOuterParent) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
+    (\subscribedSpecific -> do -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
+      maybeInnerSubscription <- readIORef $ coincidenceSubscribedInnerParent subscribedSpecific
+      let outerParent = _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
+          innerParent = maybeToList maybeInnerSubscription
+      return $ outerParent : innerParent)
+    -- The laziness annotation is important! 'subscribed' might not have been initialized.
+    (\(~subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> do -- TODO: subscribed was originally called 'subscribedUnsafe', why? Probably because it might not be initialized so you have to be lazy in examining it?
+        -- {-# INLINE subscribeCoincidenceInner #-}
+        let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
+            subscribeCoincidenceInner inner outerHeight = do
+              (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
+                subscribeAndReadWithHeight inner $ flip (newSubscriberCommon "SubscriberCoincidenceInner") subscribedCommon
+                  $ \doPropagate a -> do
+                     occ <- liftIO $ readIORef (commonSubscribedOccurrence subscribedCommon)
+                     case occ of
+                       Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
+                       Nothing -> doPropagate a
+              writeAndScheduleClear innerSubdRef innerSubd
+              let height = max innerHeight outerHeight
+              defer $ SomeResetCoincidence subscription $
+                if height > outerHeight then Just subscribed else Nothing
+              return (innerOcc, height)
+        (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
+          flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed) $ \doPropagate a ->
+            {-# SCC "traverseCoincidenceOuter" #-} do
+               outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
+               -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
+               (occ, innerHeight) <- subscribeCoincidenceInner a outerHeight
+               -- tracePropagate (Proxy :: Proxy x) $ "  isJust occ = " <> show (isJust occ)
+               -- tracePropagate (Proxy :: Proxy x) $ "  innerHeight = " <> show innerHeight
+               case occ of
+                 Nothing ->
+                   when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
+                     writeIORef (commonSubscribedHeight subscribedCommon) $! innerHeight
+                     WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
+                       $ invalidateSubscriberHeight outerHeight
+                     WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
+                       $ recalculateSubscriberHeight innerHeight
+                 Just o -> doPropagate o -- Since it's already firing, no need to adjust height
+        (occ, height) <- case outerOcc of
+          Nothing -> return (Nothing, outerHeight)
+          Just o -> subscribeCoincidenceInner o outerHeight
+        pure (occ, height,  CoincidenceSubscribed_ { coincidenceSubscribedOuterParent = outerSubscription
+                                                   , coincidenceSubscribedInnerParent = innerSubdRef
+                                                   }))
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> ResultM x b -> SpiderHost x b
