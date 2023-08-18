@@ -681,7 +681,6 @@ data EventEnv x
               , eventEnvIntClears :: !(IORef [Some IntClear])
               , eventEnvRootClears :: !(IORef [Some RootClear])
               , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
-              , eventEnvResetCoincidences :: !(IORef [SomeResetCoincidence x]) -- Needed for Subscribe
               , eventEnvDelayedMerges :: !(IORef (IntMap [EventM x ()]))
               }
 
@@ -796,10 +795,6 @@ instance HasSpiderTimeline x => Defer (Some RootClear) (EventM x) where
 {-# INLINE scheduleRootClear #-}
 scheduleRootClear :: Defer (Some RootClear) m => IORef (DMap k Identity) -> m ()
 scheduleRootClear r = defer $ Some $ RootClear r
-
-instance HasSpiderTimeline x => Defer (SomeResetCoincidence x) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvResetCoincidences
 
 -- Note: hold cannot examine its event until after the phase is over
 {-# INLINE [1] hold #-}
@@ -1180,7 +1175,8 @@ switch switchParent =
                                                    }))
 
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
-coincidence :: forall x a. HasSpiderTimeline x => Event x (Event x a) -> Event x a
+coincidence :: forall x a. (-- Defer (SomeMergeUpdate x) (EventM x),
+                            HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = unsafePerformIO $ do
   innerSubdRef <- newIORef $ error "coincidence: innerSubdRef undefined"
   pure $ commonEvent
@@ -1203,8 +1199,18 @@ coincidence coincidenceParent = unsafePerformIO $ do
                        Nothing -> doPropagate a
               writeAndScheduleClear innerSubdRef innerSubd
               let height = max innerHeight outerHeight
-              defer $ SomeResetCoincidence subscription $
-                if height > outerHeight then Just subscribed else Nothing
+              defer (SomeMergeUpdate
+                 (do unsubscribe subscription
+                     when (height > outerHeight) $ 
+                       invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon))
+                 (when (height > outerHeight) $
+                   updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon) =<< do
+                     outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
+                     innerHeight <- maybe (return zeroHeight) getEventSubscribedHeight =<< readIORef (coincidenceSubscribedInnerParent subscribedSpecific)
+                     return $ if outerHeight == invalidHeight || innerHeight == invalidHeight -- TODO: why not order heights with invalid as Top?
+                              then invalidHeight
+                              else max outerHeight innerHeight)
+                 (pure []) :: SomeMergeUpdate x)
               return (innerOcc, height)
         (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
           flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed) $ \doPropagate a ->
@@ -1418,8 +1424,6 @@ instance Show EventLoopException where
 
 #endif
 
-
-data SomeResetCoincidence x = forall a. SomeResetCoincidence !(EventSubscription x) !(Maybe (CoincidenceSubscribed x a)) -- The CoincidenceSubscriber will be present only if heights need to be reset
 
 runBehaviorM :: BehaviorM x a -> Maybe (Weak (Invalidator x), IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
@@ -1935,12 +1939,11 @@ newEventEnv = do
   toClearRef <- newIORef []
   toClearIntRef <- newIORef []
   toClearRootRef <- newIORef []
-  coincidenceInfosRef <- newIORef []
   delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeInitRef toClearRef toClearIntRef toClearRootRef heightRef coincidenceInfosRef delayedRef
+  return $ EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeInitRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef
 
 clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeInitRef toClearRef toClearIntRef toClearRootRef heightRef coincidenceInfosRef delayedRef) = do
+clearEventEnv (EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeInitRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef) = do
   writeIORef toAssignRef []
   writeIORef holdInitRef []
   writeIORef dynInitRef []
@@ -1950,7 +1953,6 @@ clearEventEnv (EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeI
   writeIORef toClearRef []
   writeIORef toClearIntRef []
   writeIORef toClearRootRef []
-  writeIORef coincidenceInfosRef []
   writeIORef delayedRef IntMap.empty
 
 -- | Run an event action outside of a frame
@@ -1970,7 +1972,6 @@ runFrame a = SpiderHost $ do
   forM_ toClearRoot $ \(Some (RootClear ref)) -> {-# SCC "rootClear" #-} writeIORef ref $! DMap.empty
   toAssign <- readIORef $ eventEnvAssignments env
   toReconnectRef <- newIORef []
-  coincidenceInfos <- readIORef $ eventEnvResetCoincidences env
   forM_ toAssign $ \(SomeAssignment vRef iRef v) -> {-# SCC "assignment" #-} do
     writeIORef vRef v
     traceInvalidate $ "Invalidating Hold"
@@ -1994,8 +1995,7 @@ runFrame a = SpiderHost $ do
                     mVal <- readIORef $ pullValue p
                     forM_ mVal $ \val -> do
                       writeIORef (pullValue p) Nothing
-                      evaluate
-                        =<< invalidate (pullSubscribedInvalidators val)
+                      evaluate =<< invalidate (pullSubscribedInvalidators val)
                   InvalidatorSwitch subscribed -> do
                     traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
                     modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
@@ -2045,32 +2045,10 @@ runFrame a = SpiderHost $ do
       writeIORef (commonSubscribedHeight subscribedCommon) $! invalidHeight
       WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight myHeight
   mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
-  forM_ coincidenceInfos $ \(SomeResetCoincidence subscription mcs) -> do
-    -- TODO: could this unsubscribe be done at 'mergeSubscriptionsToKill/switchSubscriptionsToKill' time?
-    unsubscribe subscription
-    mapM_ (\(ASubscribed _subscribedSpecific subscribedCommon) ->
-             invalidateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon))
-       mcs
-  -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
-  --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
-  --     of all used heights.
-  -- TODO: calculate functions only use specific
-  let recalculateAndUpdateHeight :: forall s b. (s x b -> IO Height) -> ASubscribed s x b -> IO ()
-      recalculateAndUpdateHeight calculate (ASubscribed subscribedSpecific subscribedCommon) =
-        updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
-        =<< calculate subscribedSpecific
-  -- 
-  forM_ coincidenceInfos $ \(SomeResetCoincidence _ mcs) ->
-    forM_ mcs . recalculateAndUpdateHeight $ \subscribedSpecific -> do
-        outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
-        innerHeight <- maybe (return zeroHeight) getEventSubscribedHeight =<< readIORef (coincidenceSubscribedInnerParent subscribedSpecific)
-        return $ if outerHeight == invalidHeight || innerHeight == invalidHeight -- TODO: why not order heights with invalid as Top?
-                 then invalidHeight
-                 else max outerHeight innerHeight
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
-  forM_ toReconnect $ \(SomeSwitchSubscribed subscribed) ->
-    flip recalculateAndUpdateHeight subscribed
-    $ getEventSubscribedHeight . _eventSubscription_subscribed <=< readIORef . switchSubscribedCurrentParent
+  forM_ toReconnect $ \(SomeSwitchSubscribed (ASubscribed subscribedSpecific subscribedCommon)) ->
+    updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
+        =<< (getEventSubscribedHeight . _eventSubscription_subscribed <=< readIORef . switchSubscribedCurrentParent) subscribedSpecific
   return result
 
 newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
