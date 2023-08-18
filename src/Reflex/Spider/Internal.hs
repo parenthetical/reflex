@@ -27,6 +27,7 @@
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE PartialTypeSignatures #-}
+{-# LANGUAGE TypeApplications #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
@@ -860,7 +861,7 @@ data Pull x a
 
 data Invalidator x
    = forall a. InvalidatorPull (Pull x a)
-   | forall a. InvalidatorSwitch (SwitchSubscribed x a)
+   | InvalidatorSwitch (SomeMergeUpdate x)
 
 data RootSubscribed x a = forall k. GCompare k => RootSubscribed
   { rootSubscribedKey :: !(k a)
@@ -1139,7 +1140,7 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
         return (slnForSub, subscribed, occ)
 
 {-# INLINABLE switch #-}
-switch :: HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
+switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = 
     commonEvent
     (\subscribedSpecific -> do
@@ -1148,8 +1149,43 @@ switch switchParent =
     (\subscribedSpecific -> do
         s <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
         return [_eventSubscription_subscribed s])
-    (\subscribedUnsafe -> do
-        i <- liftIO $ evaluate $ InvalidatorSwitch subscribedUnsafe
+    (\(~subscribedUnsafe@(ASubscribed subscribedSpecific subscribedCommon)) -> do
+        i <- liftIO $ evaluate $ InvalidatorSwitch $ SomeMergeUpdate @x
+          ({-# SCC "switchSubscribed" #-} do
+            EventSubscription _ subd' <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
+            parentHeight <- getEventSubscribedHeight subd'
+            myHeight <- readIORef $ commonSubscribedHeight subscribedCommon
+            when (parentHeight /= myHeight) $ do
+              writeIORef (commonSubscribedHeight subscribedCommon) $! invalidHeight
+              WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight myHeight)
+          (updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
+           =<< (getEventSubscribedHeight . _eventSubscription_subscribed
+                <=< readIORef . switchSubscribedCurrentParent
+                $ subscribedSpecific))
+          ({-# SCC "switchSubscribed" #-} liftIO $ do
+            oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
+            wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribedSpecific
+            traceInvalidate $ "Finalizing invalidator for Switch" <> showNodeId subscribedCommon
+            finalize wi
+            i <- evaluate $ switchSubscribedOwnInvalidator subscribedSpecific
+            wi' <- mkWeakPtrWithDebug i "wi'"
+            writeIORef (switchSubscribedOwnWeakInvalidator subscribedSpecific) $! wi'
+            writeIORef (switchSubscribedBehaviorParents subscribedSpecific) []
+            -- FIXME: why is this wonky? Can we do better than reusing runHoldInits in this way?
+            holdInitsRef <- newIORef []
+            throwAway1 <- newIORef []
+            throwAway2 <- newIORef []
+            -- TODO: after this runBehavior holdInitsRef always seems empty...
+            e <- runBehaviorM (readBehaviorTracked (switchSubscribedParent subscribedSpecific))
+                              (Just (wi', switchSubscribedBehaviorParents subscribedSpecific))
+                              $ holdInitsRef
+            runEventM $ runHoldInits holdInitsRef throwAway1 throwAway2
+            --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
+            subscription <- unSpiderHost .
+              runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-}
+                 newSubscriberCommon "SubscriberSwitch" (\doPropagate a -> {-# SCC "traverseSwitch" #-} doPropagate a) subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+            writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
+            return [oldSubscription])
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorSwitch"
         -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
         -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
@@ -1979,7 +2015,6 @@ runFrame a = SpiderHost $ do
   toClearRoot <- readIORef $ eventEnvRootClears env
   forM_ toClearRoot $ \(Some (RootClear ref)) -> {-# SCC "rootClear" #-} writeIORef ref $! DMap.empty
   toAssign <- readIORef $ eventEnvAssignments env
-  toReconnectRef <- newIORef []
   forM_ toAssign $ \(SomeAssignment vRef iRef v) -> {-# SCC "assignment" #-} do
     writeIORef vRef v
     traceInvalidate $ "Invalidating Hold"
@@ -2004,59 +2039,19 @@ runFrame a = SpiderHost $ do
                     forM_ mVal $ \val -> do
                       writeIORef (pullValue p) Nothing
                       evaluate =<< invalidate (pullSubscribedInvalidators val)
-                  InvalidatorSwitch subscribed -> do
-                    traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
-                    modifyIORef' toReconnectRef (SomeSwitchSubscribed subscribed :)
+                  InvalidatorSwitch someMergeUpdate -> do
+                    -- traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
+                    runEventM @x $ defer someMergeUpdate
           writeIORef wisRef []
     invalidate iRef
-  mergeUpdates <- readIORef $ eventEnvMergeUpdates env
-  writeIORef (eventEnvMergeUpdates env) []
+  mergeUpdates <- readIORef (eventEnvMergeUpdates env)
+  clearEventEnv env
   tracePropagate (Proxy::Proxy x) $ "Updating merges"
   mergeSubscriptionsToKill <- runEventM $ concat <$> mapM _someMergeUpdate_update mergeUpdates
   tracePropagate (Proxy::Proxy x) $ "Updating merges done"
-  toReconnect <- readIORef toReconnectRef
-  clearEventEnv env
-  -- TODO: Can this be made like SomeMergeUpdate for consistency? Or
-  -- unify this "run something to get subscriptions to kill" pattern
-  -- some other way?
-  -- TODO: I meant that maybe the code below can be put in the definition for switch to make patterns obvious, but I'm not sure that's a good idea.
-  switchSubscriptionsToKill <- forM toReconnect $ \(SomeSwitchSubscribed (ASubscribed subscribedSpecific subscribedCommon)) -> {-# SCC "switchSubscribed" #-} do
-    oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
-    wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribedSpecific
-    traceInvalidate $ "Finalizing invalidator for Switch" <> showNodeId subscribedCommon
-    finalize wi
-    i <- evaluate $ switchSubscribedOwnInvalidator subscribedSpecific
-    wi' <- mkWeakPtrWithDebug i "wi'"
-    writeIORef (switchSubscribedOwnWeakInvalidator subscribedSpecific) $! wi'
-    writeIORef (switchSubscribedBehaviorParents subscribedSpecific) []
-    writeIORef (eventEnvHoldInits env) [] --TODO: Should we reuse this?
-    e <- runBehaviorM (readBehaviorTracked (switchSubscribedParent subscribedSpecific))
-                      (Just (wi', switchSubscribedBehaviorParents subscribedSpecific))
-                      $ eventEnvHoldInits env
-    runEventM $ runHoldInits (eventEnvHoldInits env) (eventEnvDynInits env) (eventEnvMergeInits env) --TODO: Is this actually OK? It seems like it should be, since we know that no events are firing at this point, but it still seems inelegant
-    --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
-    subscription <- unSpiderHost .
-      runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-}
-         newSubscriberCommon "SubscriberSwitch" (\doPropagate a -> {-# SCC "traverseSwitch" #-} doPropagate a) subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-    writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
-    return oldSubscription
-  -- TODO: there is a pattern in the structure here? First unsubscribes, then invalidates, then calculates.
-  --   Could getting rid of the specific queues for these work? Instead there would be a queue for each.
-  --   This way patterns in the code might become more obvious.
   liftIO $ mapM_ unsubscribe mergeSubscriptionsToKill
-  liftIO $ mapM_ unsubscribe switchSubscriptionsToKill
-  forM_ toReconnect $ \(SomeSwitchSubscribed (ASubscribed subscribedSpecific subscribedCommon)) -> {-# SCC "switchSubscribed" #-} do
-    EventSubscription _ subd' <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
-    parentHeight <- getEventSubscribedHeight subd'
-    myHeight <- readIORef $ commonSubscribedHeight subscribedCommon
-    when (parentHeight /= myHeight) $ do
-      writeIORef (commonSubscribedHeight subscribedCommon) $! invalidHeight
-      WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight myHeight
   mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
-  forM_ toReconnect $ \(SomeSwitchSubscribed (ASubscribed subscribedSpecific subscribedCommon)) ->
-    updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
-        =<< (getEventSubscribedHeight . _eventSubscription_subscribed <=< readIORef . switchSubscribedCurrentParent) subscribedSpecific
   return result
 
 newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
