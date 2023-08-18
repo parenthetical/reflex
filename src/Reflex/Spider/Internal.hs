@@ -986,8 +986,7 @@ data SwitchSubscribed_ x a
 #endif
 type CoincidenceSubscribed x a = ASubscribed CoincidenceSubscribed_ x a
 data CoincidenceSubscribed_ x a
-   = CoincidenceSubscribed_ { coincidenceSubscribedOuter :: {-# NOUNPACK #-} (Subscriber x (Event x a))
-                            , coincidenceSubscribedOuterParent :: !(EventSubscription x)
+   = CoincidenceSubscribed_ { coincidenceSubscribedOuterParent :: !(EventSubscription x)
                             , coincidenceSubscribedInnerParent :: !(IORef (Maybe (EventSubscribed x)))
                             }
 
@@ -1205,8 +1204,9 @@ coincidence coincidenceParent =
             defer $ SomeResetCoincidence subscription $
               if height > outerHeight then Just subscribed else Nothing
             return (innerOcc, height, innerSubd)
-      let subOuter =
-           flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed) $ \doPropagate a -> {-# SCC "traverseCoincidenceOuter" #-} do
+      (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
+        flip (newSubscriberCommon "SubscriberCoincidenceOuter") (subscribedCommon_ subscribed) $ \doPropagate a ->
+          {-# SCC "traverseCoincidenceOuter" #-} do
              outerHeight <- liftIO $ readIORef $ commonSubscribedHeight subscribedCommon
              -- tracePropagate (Proxy :: Proxy x) $ "  outerHeight = " <> show outerHeight
              (occ, innerHeight, innerSubd) <- subscribeCoincidenceInner a outerHeight
@@ -1222,15 +1222,13 @@ coincidence coincidenceParent =
                    WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon)
                      $ recalculateSubscriberHeight innerHeight
                Just o -> doPropagate o -- Since it's already firing, no need to adjust height
-      (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent subOuter
       (occ, height, mInnerSubd) <- case outerOcc of
         Nothing -> return (Nothing, outerHeight, Nothing)
         Just o -> do
           (occ, height, innerSubd) <- subscribeCoincidenceInner o outerHeight
           return (occ, height, Just innerSubd)
       innerSubdRef <- newAndScheduleClear mInnerSubd
-      pure (occ, height,  CoincidenceSubscribed_ { coincidenceSubscribedOuter = subOuter
-                                                 , coincidenceSubscribedOuterParent = outerSubscription
+      pure (occ, height,  CoincidenceSubscribed_ { coincidenceSubscribedOuterParent = outerSubscription
                                                  , coincidenceSubscribedInnerParent = innerSubdRef
                                                  }))
 
@@ -2033,10 +2031,7 @@ runFrame a = SpiderHost $ do
     --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
     subscription <- unSpiderHost .
       runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-}
-         newSubscriberCommon "SubscriberSwitch" (\doPropagate a ->
-                                                    {-# SCC "traverseSwitch" #-}
-                                                    doPropagate a)
-         subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+         newSubscriberCommon "SubscriberSwitch" (\doPropagate a -> {-# SCC "traverseSwitch" #-} doPropagate a) subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
     writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
     return oldSubscription
   -- TODO: there is a pattern in the structure here? First unsubscribes, then invalidates, then calculates.
@@ -2066,6 +2061,7 @@ runFrame a = SpiderHost $ do
       recalculateAndUpdateHeight calculate (ASubscribed subscribedSpecific subscribedCommon) =
         updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
         =<< calculate subscribedSpecific
+  -- 
   forM_ coincidenceInfos $ \(SomeResetCoincidence _ mcs) ->
     forM_ mcs . recalculateAndUpdateHeight $ \subscribedSpecific -> do
         outerHeight <- getEventSubscribedHeight $ _eventSubscription_subscribed $ coincidenceSubscribedOuterParent subscribedSpecific
