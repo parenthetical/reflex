@@ -1150,7 +1150,8 @@ switch switchParent =
         s <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
         return [_eventSubscription_subscribed s])
     (\(~subscribedUnsafe@(ASubscribed subscribedSpecific subscribedCommon)) -> do
-        i <- liftIO $ evaluate $ InvalidatorSwitch $ SomeMergeUpdate @x
+        i <- liftIO $ evaluate $ InvalidatorSwitch $
+          SomeMergeUpdate @x
           ({-# SCC "switchSubscribed" #-} do
             EventSubscription _ subd' <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
             parentHeight <- getEventSubscribedHeight subd'
@@ -1159,9 +1160,9 @@ switch switchParent =
               writeIORef (commonSubscribedHeight subscribedCommon) $! invalidHeight
               WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight myHeight)
           (updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
-           =<< (getEventSubscribedHeight . _eventSubscription_subscribed
-                <=< readIORef . switchSubscribedCurrentParent
-                $ subscribedSpecific))
+            =<< (getEventSubscribedHeight . _eventSubscription_subscribed
+                 <=< readIORef . switchSubscribedCurrentParent
+                 $ subscribedSpecific))
           ({-# SCC "switchSubscribed" #-} liftIO $ do
             oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
             wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribedSpecific
@@ -2027,9 +2028,7 @@ runFrame a = SpiderHost $ do
           evaluate <=< forM_ wis $ \wi -> do
             mi <- deRefWeak wi
             case mi of
-              Nothing -> do
-                traceInvalidate "invalidate Dead"
-                return () --TODO: Should we clean this up here?
+              Nothing -> void $ traceInvalidate "invalidate Dead" --TODO: Should we clean this up here?
               Just i -> do
                 finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
                 case i of
