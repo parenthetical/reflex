@@ -1192,7 +1192,6 @@ coincidence coincidenceParent = unsafePerformIO $ do
       return $ outerParent : innerParent)
     -- The laziness annotation is important! 'subscribed' might not have been initialized.
     (\(~subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> do -- TODO: subscribed was originally called 'subscribedUnsafe', why? Probably because it might not be initialized so you have to be lazy in examining it?
-        -- {-# INLINE subscribeCoincidenceInner #-}
         let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
             subscribeCoincidenceInner inner outerHeight = do
               (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
