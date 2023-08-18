@@ -957,8 +957,7 @@ heightBagVerify = id
 --       IIRC these are repeated more in the code while the rest might be specific to switch and coincidence.
 -- Common between switch and coincidence
 data CommonSubscribed s x a
-   = CommonSubscribed { commonSubscribedCachedSubscribed :: !(IORef (Maybe (ASubscribed s x a)))
-                      , commonSubscribedOccurrence :: !(IORef (Maybe a))
+   = CommonSubscribed { commonSubscribedOccurrence :: !(IORef (Maybe a))
                       , commonSubscribedHeight :: !(IORef Height)
                       , commonSubscribedSubscribers :: !(WeakBag (Subscriber x a))
                       , commonSubscribedWeakSelf :: !(IORef (Weak (ASubscribed s x a)))
@@ -1103,23 +1102,20 @@ commonEvent :: forall s x a. HasSpiderTimeline x =>
 commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
   -- TODO: Is this function actually doing cacheEvent? Can I use cacheEvent instead?
   mSubscribedRef :: IORef (Maybe (ASubscribed s x a)) <- newIORef Nothing
-  pure
-    $ Event
-    $ wrap (\subscribed@(ASubscribed !subscribedSpecific !subscribedCommon) ->
+  pure $ Event $ wrap (\subscribed@(ASubscribed !subscribedSpecific !subscribedCommon) ->
               EventSubscribed
               { eventSubscribedHeightRef = commonSubscribedHeight subscribedCommon
               , eventSubscribedRetained = toAny subscribed
 #ifdef DEBUG_CYCLES
               , eventSubscribedGetParents = eventSubscribedGetParents_ subscribedSpecific
               , eventSubscribedHasOwnHeightRef = True
-              , eventSubscribedWhoCreated = whoCreatedIORef $ commonSubscribedCachedSubscribed subscribedCommon
+              , eventSubscribedWhoCreated = whoCreatedIORef mSubscribedRef
 #endif
-              })  
-    $ \sub -> do
+              }) $ \sub -> do
     mSubscribed <- liftIO $ readIORef $ mSubscribedRef
     let cleanup (ASubscribed subscribedSpecific subscribedCommon) = do
           cleanupSpecific subscribedSpecific
-          writeIORef (commonSubscribedCachedSubscribed subscribedCommon) Nothing
+          writeIORef mSubscribedRef Nothing
     case mSubscribed of
       Just subscribed@(ASubscribed _subscribedSpecific subscribedCommon) -> {-# SCC "hitCommon" #-} liftIO $ do
         sln <- WeakBag.insert sub (commonSubscribedSubscribers subscribedCommon) (commonSubscribedWeakSelf subscribedCommon) cleanup
@@ -1139,8 +1135,7 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
         let !subscribed :: ASubscribed s x a = ASubscribed
               { subscribedSpecific_ = subscribedSpecific
               , subscribedCommon_ = CommonSubscribed
-                { commonSubscribedCachedSubscribed = mSubscribedRef
-                , commonSubscribedOccurrence = occRef
+                { commonSubscribedOccurrence = occRef
                 , commonSubscribedHeight = heightRef
                 , commonSubscribedSubscribers = subs
                 , commonSubscribedWeakSelf = weakSelf
