@@ -972,7 +972,6 @@ type SwitchSubscribed x a = ASubscribed SwitchSubscribed_ x a
 data SwitchSubscribed_ x a
    = SwitchSubscribed_ { switchSubscribedOwnInvalidator :: {-# NOUNPACK #-} !(Invalidator x)
                        , switchSubscribedOwnWeakInvalidator :: !(IORef (Weak (Invalidator x)))
-                       , switchSubscribedBehaviorParents :: !(IORef [SomeBehaviorSubscribed x])
                        , switchSubscribedCurrentParent :: !(IORef (EventSubscription x))
                        }
 
@@ -1084,8 +1083,8 @@ pull a = unsafePerformIO $ do
 
 {-# INLINE commonEvent #-}
 commonEvent :: forall s x a. HasSpiderTimeline x =>
-  (s x a -> IO ()) ->
-  (s x a -> IO [EventSubscribed x]) ->
+  IO () ->
+  IO [EventSubscribed x] ->
   (ASubscribed s x a -> EventM x (Maybe a, Height, s x a)) ->
   Event x a
 commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
@@ -1096,14 +1095,14 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
               { eventSubscribedHeightRef = commonSubscribedHeight subscribedCommon
               , eventSubscribedRetained = toAny subscribed
 #ifdef DEBUG_CYCLES
-              , eventSubscribedGetParents = eventSubscribedGetParents_ subscribedSpecific
+              , eventSubscribedGetParents = eventSubscribedGetParents_
               , eventSubscribedHasOwnHeightRef = True
               , eventSubscribedWhoCreated = whoCreatedIORef mSubscribedRef
 #endif
               }) $ \sub -> do
     mSubscribed <- liftIO $ readIORef $ mSubscribedRef
     let cleanup (ASubscribed subscribedSpecific subscribedCommon) = do
-          cleanupSpecific subscribedSpecific
+          cleanupSpecific
           writeIORef mSubscribedRef Nothing
     case mSubscribed of
       Just subscribed@(ASubscribed _subscribedSpecific subscribedCommon) -> {-# SCC "hitCommon" #-} liftIO $ do
@@ -1140,67 +1139,65 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
 
 {-# INLINABLE switch #-}
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switch switchParent = 
-    commonEvent
-    (\subscribedSpecific -> do
-       unsubscribe =<< readIORef (switchSubscribedCurrentParent subscribedSpecific)
-       finalize =<< readIORef (switchSubscribedOwnWeakInvalidator subscribedSpecific)) -- We don't need to get invalidated if we're dead
-    (\subscribedSpecific -> do
-        s <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
+switch switchParent = unsafePerformIO $ do
+  -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
+  -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
+  --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
+  --          in Behavior to fix that TODO?
+  parentsRef <- newIORef []
+  currentParentSubscriptionRef <- newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
+  ownWeakInvalidatorRef <- newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+  pure $ commonEvent
+    (do unsubscribe =<< readIORef currentParentSubscriptionRef
+        finalize =<< readIORef ownWeakInvalidatorRef) -- We don't need to get invalidated if we're dead
+    (do s <- readIORef currentParentSubscriptionRef
         return [_eventSubscription_subscribed s])
     (\(~_subscribedUnsafe@(ASubscribed subscribedSpecific subscribedCommon)) -> do
         let subscriber = newSubscriberCommon "SubscriberSwitch" id subscribedCommon
         i <- liftIO $ evaluate $ InvalidatorSwitch $
           SomeMergeUpdate @x
           ({-# SCC "switchSubscribed" #-} do
-            EventSubscription _ subd' <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
+            EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
             parentHeight <- getEventSubscribedHeight subd'
             myHeight <- readIORef $ commonSubscribedHeight subscribedCommon
             when (parentHeight /= myHeight) $ do
               writeIORef (commonSubscribedHeight subscribedCommon) $! invalidHeight
               WeakBag.traverse_ (commonSubscribedSubscribers subscribedCommon) $ invalidateSubscriberHeight myHeight)
           (updateCommonHeight (commonSubscribedHeight subscribedCommon) (commonSubscribedSubscribers subscribedCommon)
-            =<< (getEventSubscribedHeight . _eventSubscription_subscribed
-                 <=< readIORef . switchSubscribedCurrentParent
-                 $ subscribedSpecific))
+            =<< getEventSubscribedHeight . _eventSubscription_subscribed
+            =<< readIORef currentParentSubscriptionRef)
           ({-# SCC "switchSubscribed" #-} liftIO $ do
-            oldSubscription <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
-            wi <- readIORef $ switchSubscribedOwnWeakInvalidator subscribedSpecific
+            oldSubscription <- readIORef currentParentSubscriptionRef
+            wi <- readIORef ownWeakInvalidatorRef
             traceInvalidate $ "Finalizing invalidator for Switch" <> showNodeId subscribedCommon
             finalize wi
             i <- evaluate $ switchSubscribedOwnInvalidator subscribedSpecific
             wi' <- mkWeakPtrWithDebug i "wi'"
-            writeIORef (switchSubscribedOwnWeakInvalidator subscribedSpecific) $! wi'
-            writeIORef (switchSubscribedBehaviorParents subscribedSpecific) []
+            writeIORef ownWeakInvalidatorRef $! wi'
+            writeIORef parentsRef []
             -- FIXME: why is this wonky? Can we do better than reusing runHoldInits in this way?
             holdInitsRef <- newIORef []
             -- TODO: after this runBehavior holdInitsRef always seems empty...
             e <- runBehaviorM (readBehaviorTracked switchParent)
-                              (Just (wi', switchSubscribedBehaviorParents subscribedSpecific))
+                              (Just (wi', parentsRef))
                               $ holdInitsRef
             runEventM (join $ runHoldInits holdInitsRef <$> liftIO (newIORef []) <*> liftIO (newIORef []))
             --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
             subscription <- unSpiderHost .
               runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-} subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-            writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
+            writeIORef currentParentSubscriptionRef $! subscription
             return [oldSubscription])
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorSwitch"
-        -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
-        -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
-        --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
-        --          in Behavior to fix that TODO?
-        parentsRef <- liftIO $ newIORef []
         holdInits <- getDeferralQueue
         (subscription, height, parentOcc) <-
           join $ subscribeAndReadWithHeight
           <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
           <*> pure subscriber
-        wiRef <- liftIO $ newIORef wi
-        subscriptionRef <- liftIO $ newIORef subscription
+        liftIO $ writeIORef ownWeakInvalidatorRef wi
+        liftIO $ writeIORef currentParentSubscriptionRef subscription
         pure (parentOcc, height, SwitchSubscribed_ { switchSubscribedOwnInvalidator = i
-                                                   , switchSubscribedOwnWeakInvalidator = wiRef
-                                                   , switchSubscribedBehaviorParents = parentsRef
-                                                   , switchSubscribedCurrentParent = subscriptionRef
+                                                   , switchSubscribedOwnWeakInvalidator = ownWeakInvalidatorRef
+                                                   , switchSubscribedCurrentParent = currentParentSubscriptionRef
                                                    }))
 
 
@@ -1208,8 +1205,7 @@ switch switchParent =
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
-coincidence :: forall x a. (-- Defer (SomeMergeUpdate x) (EventM x),
-                            HasSpiderTimeline x) => Event x (Event x a) -> Event x a
+coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = unsafePerformIO $ do
   innerSubdRef <- newIORef $ error "coincidence: innerSubdRef undefined"
   outerParentSubscriptionRef <- newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
@@ -1219,8 +1215,8 @@ coincidence coincidenceParent = unsafePerformIO $ do
         outerSubscription <- readIORef outerParentSubscriptionRef
         return $ _eventSubscription_subscribed outerSubscription : maybeToList maybeInnerSubscription
   pure $ commonEvent
-    (unsubscribe <=< readIORef . coincidenceSubscribedOuterParent) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
-    (const getParentSubscribeds)
+    (unsubscribe =<< readIORef outerParentSubscriptionRef) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
+    getParentSubscribeds
     -- The laziness annotation is important! 'subscribed' might not have been initialized.
     (\(~subscribed@(ASubscribed subscribedSpecific subscribedCommon)) -> do -- TODO: subscribed was originally called 'subscribedUnsafe', why? Probably because it might not be initialized so you have to be lazy in examining it?
         let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
