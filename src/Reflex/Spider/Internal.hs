@@ -1174,13 +1174,11 @@ switch switchParent =
             writeIORef (switchSubscribedBehaviorParents subscribedSpecific) []
             -- FIXME: why is this wonky? Can we do better than reusing runHoldInits in this way?
             holdInitsRef <- newIORef []
-            throwAway1 <- newIORef []
-            throwAway2 <- newIORef []
             -- TODO: after this runBehavior holdInitsRef always seems empty...
             e <- runBehaviorM (readBehaviorTracked switchParent)
                               (Just (wi', switchSubscribedBehaviorParents subscribedSpecific))
                               $ holdInitsRef
-            runEventM $ runHoldInits holdInitsRef throwAway1 throwAway2
+            runEventM (join $ runHoldInits holdInitsRef <$> liftIO (newIORef []) <*> liftIO (newIORef []))
             --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
             subscription <- unSpiderHost .
               runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-} subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
