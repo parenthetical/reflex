@@ -2099,8 +2099,6 @@ updateCommonHeight heightRef subscribers newHeight = do
       writeIORef heightRef $! newHeight
       WeakBag.traverse_ subscribers $ recalculateSubscriberHeight newHeight
 
-data SomeSwitchSubscribed x = forall a. SomeSwitchSubscribed {-# NOUNPACK #-} (SwitchSubscribed x a)
-
 --------------------------------------------------------------------------------
 -- Reflex integration
 --------------------------------------------------------------------------------
