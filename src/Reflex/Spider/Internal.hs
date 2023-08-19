@@ -973,7 +973,6 @@ data SwitchSubscribed_ x a
    = SwitchSubscribed_ { switchSubscribedOwnInvalidator :: {-# NOUNPACK #-} !(Invalidator x)
                        , switchSubscribedOwnWeakInvalidator :: !(IORef (Weak (Invalidator x)))
                        , switchSubscribedBehaviorParents :: !(IORef [SomeBehaviorSubscribed x])
-                       , switchSubscribedParent :: !(Behavior x (Event x a))
                        , switchSubscribedCurrentParent :: !(IORef (EventSubscription x))
                        }
 
@@ -1177,7 +1176,7 @@ switch switchParent =
             throwAway1 <- newIORef []
             throwAway2 <- newIORef []
             -- TODO: after this runBehavior holdInitsRef always seems empty...
-            e <- runBehaviorM (readBehaviorTracked (switchSubscribedParent subscribedSpecific))
+            e <- runBehaviorM (readBehaviorTracked switchParent)
                               (Just (wi', switchSubscribedBehaviorParents subscribedSpecific))
                               $ holdInitsRef
             runEventM $ runHoldInits holdInitsRef throwAway1 throwAway2
@@ -1207,7 +1206,6 @@ switch switchParent =
         pure (parentOcc, height, SwitchSubscribed_ { switchSubscribedOwnInvalidator = i
                                                    , switchSubscribedOwnWeakInvalidator = wiRef
                                                    , switchSubscribedBehaviorParents = parentsRef
-                                                   , switchSubscribedParent = switchParent
                                                    , switchSubscribedCurrentParent = subscriptionRef
                                                    }))
 
