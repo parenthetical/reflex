@@ -11,6 +11,7 @@
 module Data.WeakBag
   ( WeakBag
   , WeakBagTicket
+  , null
   , empty
   , singleton
   , insert
@@ -23,7 +24,7 @@ module Data.WeakBag
   , _weakBag_children --TODO: Don't export this
   ) where
 
-import Prelude hiding (traverse)
+import Prelude hiding (traverse, null)
 
 import Control.Exception
 import Control.Monad
@@ -49,6 +50,10 @@ data WeakBagTicket = forall a. WeakBagTicket
   { _weakBagTicket_weakItem :: {-# UNPACK #-} !(Weak a)
   , _weakBagTicket_item :: {-# NOUNPACK #-} !a
   }
+
+-- | Wether the 'WeakBag' is empty.
+null :: WeakBag a -> IO Bool
+null = fmap IntMap.null . readIORef . _weakBag_children
 
 -- | Insert an item into a 'WeakBag'.
 {-# INLINE insert #-}
