@@ -1148,7 +1148,8 @@ switch switchParent =
     (\subscribedSpecific -> do
         s <- readIORef $ switchSubscribedCurrentParent subscribedSpecific
         return [_eventSubscription_subscribed s])
-    (\(~subscribedUnsafe@(ASubscribed subscribedSpecific subscribedCommon)) -> do
+    (\(~_subscribedUnsafe@(ASubscribed subscribedSpecific subscribedCommon)) -> do
+        let subscriber = newSubscriberCommon "SubscriberSwitch" id subscribedCommon
         i <- liftIO $ evaluate $ InvalidatorSwitch $
           SomeMergeUpdate @x
           ({-# SCC "switchSubscribed" #-} do
@@ -1182,8 +1183,7 @@ switch switchParent =
             runEventM $ runHoldInits holdInitsRef throwAway1 throwAway2
             --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
             subscription <- unSpiderHost .
-              runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-}
-                 newSubscriberCommon "SubscriberSwitch" (\doPropagate a -> {-# SCC "traverseSwitch" #-} doPropagate a) subscribedCommon --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+              runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-} subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
             writeIORef (switchSubscribedCurrentParent subscribedSpecific) $! subscription
             return [oldSubscription])
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorSwitch"
@@ -1196,11 +1196,7 @@ switch switchParent =
         (subscription, height, parentOcc) <-
           join $ subscribeAndReadWithHeight
           <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
-          <*> pure (newSubscriberCommon "SubscriberSwitch"
-                      -- TODO: SubscriberSwitch is created in runFrame as well, why? Refactor to one place only??
-                      (\doPropagate -> {-# SCC "traverseSwitch" #-} doPropagate)
-                      . subscribedCommon_
-                      $ subscribedUnsafe)
+          <*> pure subscriber
         wiRef <- liftIO $ newIORef wi
         subscriptionRef <- liftIO $ newIORef subscription
         pure (parentOcc, height, SwitchSubscribed_ { switchSubscribedOwnInvalidator = i
