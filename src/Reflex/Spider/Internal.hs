@@ -1028,12 +1028,12 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
   heightRef <- newIORef $ error "commonEvent: heightRef uninitialized"
   occRef <- newIORef Nothing
   toRetainRef <- newIORef $ error "commonEvent: toRetainRef uninitialized"
+#ifdef DEBUG_NODEIDS
+  nodeId <- liftIO newNodeId
+#endif
   pure $ Event $ \sub -> do
     let cleanup = cleanupSpecific >> writeIORef toRetainRef undefined >> writeIORef occRef Nothing -- TODO what needs to happen here, if anything?
     (liftIO (WeakBag.null subscribers) >>=) $ flip when $ {-# SCC "missCommon" #-} do
-#ifdef DEBUG_NODEIDS
-        nodeId <- liftIO newNodeId
-#endif
         (occ, height, toRetainSpecific) <-
           foo
           -- newSubscriber:
