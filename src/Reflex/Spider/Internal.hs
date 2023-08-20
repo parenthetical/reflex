@@ -168,9 +168,6 @@ debugInvalidate = False
 class HasNodeId a where
   getNodeId :: a -> Int
 
-instance HasNodeId (CacheSubscribed x a) where
-  getNodeId = _cacheSubscribed_nodeId
-
 instance HasNodeId (Hold x p) where
   getNodeId = holdNodeId
 
@@ -305,17 +302,8 @@ headE originalE = do
       Nothing -> subscribeAndReadNever
       Just e -> subscribeAndReadHead e sub
 
-data CacheSubscribed x a
-   = CacheSubscribed { _cacheSubscribed_subscribers :: {-# UNPACK #-} !(FastWeakBag (Subscriber x a))
-                     , _cacheSubscribed_parent :: {-# UNPACK #-} !(EventSubscription x)
-                     , _cacheSubscribed_occurrence :: {-# UNPACK #-} !(IORef (Maybe a))
-#ifdef DEBUG_NODEIDS
-                     , _cacheSubscribed_nodeId :: {-# UNPACK #-} !Int
-#endif
-                     }
-
-now :: (MonadIO m, Defer (Some Clear) m, HasSpiderTimeline x
-       ) => m (Event x ())
+now :: ( MonadIO m, Defer (Some Clear) m, HasSpiderTimeline x
+        ) => m (Event x ())
 now = do
   nowOrNot <- newAndScheduleClear $ Just ()
   return . Event $ \_ -> do
@@ -332,72 +320,43 @@ now = do
 --subscriber joins
 {-# NOINLINE [0] cacheEvent #-}
 cacheEvent :: forall x a. HasSpiderTimeline x => Event x a -> Event x a
-cacheEvent e =
-#ifdef DEBUG_TRACE_EVENTS
-  withStackOneLine $ \callSite -> Event $
-#else
-  Event $
-#endif
-  unsafePerformIO $ do
-    mSubscribedRef :: IORef (FastWeak (CacheSubscribed x a))
-        <- newIORef emptyFastWeak
-    pure $ \sub -> {-# SCC "cacheEvent" #-} do
-#ifdef DEBUG_TRACE_EVENTS
-          unless (BS8.null callSite) $ liftIO $ BS8.hPutStrLn stderr callSite
-#endif
-          subscribedTicket <- liftIO (readIORef mSubscribedRef >>= getFastWeakTicket) >>= \case
-            Just subscribedTicket -> return subscribedTicket
-            Nothing -> do
+cacheEvent e = unsafePerformIO $ do
+  subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
+  parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
+  occRef :: IORef (Maybe a) <- newIORef Nothing
 #ifdef DEBUG_NODEIDS
-              nodeId <- liftIO newNodeId
+  nodeId <- liftIO newNodeId
 #endif
-              subscribers <- liftIO FastWeakBag.empty
-              occRef <- liftIO $ newIORef Nothing -- This should never be read prior to being set below
-              (parentSub, occ) <- subscribeAndRead e $ debugSubscriber' ("cacheEvent" <> showNodeId' nodeId) $ Subscriber
-                  { subscriberPropagate = \a -> do
-                      writeAndScheduleClear occRef a
-                      propagateFast a subscribers
-                  , subscriberInvalidateHeight = FastWeakBag.traverse_ subscribers . invalidateSubscriberHeight
-                  , subscriberRecalculateHeight = FastWeakBag.traverse_ subscribers . recalculateSubscriberHeight
-                  }
-              mapM_ (writeAndScheduleClear occRef) occ
-              let !subscribed = CacheSubscribed
-                    { _cacheSubscribed_subscribers = subscribers
-                    , _cacheSubscribed_parent = parentSub
-                    , _cacheSubscribed_occurrence = occRef
-#ifdef DEBUG_NODEIDS
-                    , _cacheSubscribed_nodeId = nodeId
-#endif
-                    }
-              subscribedTicket <- liftIO $ mkFastWeakTicket subscribed
-              liftIO $ writeIORef mSubscribedRef =<< getFastWeakTicketWeak subscribedTicket
-              return subscribedTicket
-          -- Cache subscription:
-          liftIO $ do
-            subscribed <- getFastWeakTicketValue subscribedTicket
-            ticket <- FastWeakBag.insert sub $ _cacheSubscribed_subscribers subscribed
-            occ <- readIORef $ _cacheSubscribed_occurrence subscribed
-            let parentSub = _cacheSubscribed_parent subscribed
-                es = EventSubscription
-                  { _eventSubscription_unsubscribe = do
-                    FastWeakBag.remove ticket
-                    isEmpty <- FastWeakBag.isEmpty $ _cacheSubscribed_subscribers subscribed
-                    when isEmpty $ do
-                      writeIORef mSubscribedRef emptyFastWeak
-                      unsubscribe parentSub
-                    touch ticket
-                    touch subscribedTicket
-                  , _eventSubscription_subscribed = EventSubscribed
-                    { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub
-                    , eventSubscribedRetained = toAny subscribedTicket
+  pure $ Event $ \sub -> {-# SCC "cacheEvent" #-} do
+    (liftIO (WeakBag.null subscribers) >>=) $ flip when $ do
+      (parentSub, occ) <- subscribeAndRead e $ debugSubscriber' ("cacheEvent" <> showNodeId' nodeId) $
+        Subscriber
+          { subscriberPropagate = \a -> do
+              writeAndScheduleClear occRef a
+              propagate a subscribers
+          , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . invalidateSubscriberHeight
+          , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . recalculateSubscriberHeight
+          }
+      mapM_ (writeAndScheduleClear occRef) occ
+      liftIO $ writeIORef parentSubscriptionRef parentSub
+    parentSub <- liftIO $ readIORef parentSubscriptionRef
+    sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
+    occ <- liftIO $ readIORef occRef
+    pure ( EventSubscription
+           (WeakBag.remove sln >> touch sln)
+           (EventSubscribed
+              { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub
+              , eventSubscribedRetained = toAny (sln, parentSubscriptionRef)
 #ifdef DEBUG_CYCLES
-                    , eventSubscribedGetParents = return [_eventSubscription_subscribed parentSub]
-                    , eventSubscribedHasOwnHeightRef = False
-                    , eventSubscribedWhoCreated = whoCreatedIORef mSubscribedRef
+              , eventSubscribedGetParents = pure [_eventSubscription_subscribed parentSub]
+              , eventSubscribedHasOwnHeightRef = False
+              , eventSubscribedWhoCreated = whoCreatedIORef occRef
 #endif
-                    }
-                  }
-            return (es, occ)
+              }
+           )
+         , occ
+         )
+
 
 subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
 subscribe e s = fst <$> subscribeAndRead e s
@@ -488,6 +447,7 @@ eventSubscribedNever = EventSubscribed
   , eventSubscribedWhoCreated = return ["never"]
 #endif
   }
+
 eventSubscribedNow :: EventSubscribed x
 eventSubscribedNow = EventSubscribed
   { eventSubscribedHeightRef = zeroRef
@@ -1032,16 +992,15 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
   nodeId <- liftIO newNodeId
 #endif
   pure $ Event $ \sub -> do
-    let cleanup = cleanupSpecific >> writeIORef toRetainRef undefined >> writeIORef occRef Nothing -- TODO what needs to happen here, if anything?
     (liftIO (WeakBag.null subscribers) >>=) $ flip when $ {-# SCC "missCommon" #-} do
         (occ, height, toRetainSpecific) <-
           foo
           -- newSubscriber:
           (\debugName propagateSpecific -> debugSubscriber' (debugName <> showNodeId' nodeId) $
               Subscriber
-                { subscriberPropagate = propagateSpecific $ \val -> do
-                    writeAndScheduleClear occRef val
-                    propagate val subscribers
+                { subscriberPropagate = propagateSpecific $ \a -> do
+                    writeAndScheduleClear occRef a
+                    propagate a subscribers
                 , subscriberInvalidateHeight = \_height ->
                     invalidateHeightRef heightRef (WeakBag.traverse_ subscribers . invalidateSubscriberHeight) -- TODO: what normally happens with the passed in height here?
                 , subscriberRecalculateHeight = updateCommonHeight heightRef subscribers
@@ -1052,7 +1011,8 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
         mapM_ (writeAndScheduleClear occRef) occ
         liftIO $ writeIORef heightRef height
         liftIO $ writeIORef toRetainRef $ (subscribers, toRetainSpecific) -- TODO: is toRetain correct?
-    sln <- liftIO $ WeakBag.insert' sub subscribers cleanup
+    sln <- liftIO $ WeakBag.insert' sub subscribers $
+      cleanupSpecific >> writeIORef toRetainRef undefined >> writeIORef occRef Nothing -- TODO what needs to happen here, if anything?
     occ <- liftIO $ readIORef occRef
     pure ( EventSubscription
             (WeakBag.remove sln >> touch sln)
