@@ -545,7 +545,7 @@ readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
 readHoldTracked h = do
   result <- liftIO $ readIORef $ holdValue h
   askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (holdInvalidators h) (wi:))
-  askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedHold h)) :))
+  addParentB (BehaviorSubscribedHold h)
   liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
   return result
 
@@ -987,7 +987,7 @@ pull a = unsafePerformIO $ do
     val <- liftIO $ readIORef $ ref
     case val of
       Just subscribed -> do
-        askParentsRef >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
+        addParentB (BehaviorSubscribedPull subscribed)
         askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (pullSubscribedInvalidators subscribed) (wi:))
         liftIO $ touch $ pullSubscribedOwnInvalidator subscribed
         return $ pullSubscribedValue subscribed
@@ -1009,8 +1009,7 @@ pull a = unsafePerformIO $ do
               , pullSubscribedParents = parents
               }
         liftIO $ writeIORef ref $ Just subscribed
-        askParentsRef
-          >>= mapM_ (\r -> liftIO $ modifyIORef' r (SomeBehaviorSubscribed (Some (BehaviorSubscribedPull subscribed)) :))
+        addParentB (BehaviorSubscribedPull subscribed)
         return aVal
 
 {-# INLINE commonEvent #-}
@@ -1037,6 +1036,7 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ d
 #endif
         (occ, height, toRetainSpecific) <-
           foo
+          -- newSubscriber:
           (\debugName propagateSpecific -> debugSubscriber' (debugName <> showNodeId' nodeId) $
               Subscriber
                 { subscriberPropagate = propagateSpecific $ \val -> do
@@ -1383,12 +1383,14 @@ askInvalidator = do
     Nothing -> return Nothing
     Just (!wi, _) -> return $ Just wi
 
-askParentsRef :: BehaviorM x (Maybe (IORef [SomeBehaviorSubscribed x]))
-askParentsRef = do
+-- TODO: What is the meaning of this function?
+addParentB :: BehaviorSubscribed x a -> BehaviorM x ()
+addParentB h = do
   (!m, _) <- ask
   case m of
-    Nothing -> return Nothing
-    Just (_, !p) -> return $ Just p
+    Nothing -> pure ()
+    Just (_, !p) ->
+      liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
 
 askBehaviorHoldInits :: BehaviorM x (IORef [SomeHoldInit x])
 askBehaviorHoldInits = do
