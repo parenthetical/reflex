@@ -1992,6 +1992,7 @@ invalidateHeightRef heightRef doOnInvalidate = do
     writeIORef heightRef $! invalidHeight
     doOnInvalidate oldHeight
 
+-- TODO: comments say that 'when's should be assertions but tests fail if they are removed
 updateCommonHeight :: IORef Height -> WeakBag (Subscriber x a) -> Height -> IO ()
 updateCommonHeight heightRef subscribers newHeight = do
   oldHeight <- readIORef heightRef
