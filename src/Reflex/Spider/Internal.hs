@@ -978,72 +978,58 @@ commonEvent :: forall x extra a. HasSpiderTimeline x =>
   IO [EventSubscribed x] ->
   ((forall a1. String -> ((a -> EventM x ()) -> a1 -> EventM x ()) -> Subscriber x a1)
    -> IORef Height
-   -> WeakBag (Subscriber x a)
-   -> IORef (Maybe a)
+   -> Subscriber x a
    -> EventM x (Maybe a, Height, extra)) ->
-  Event x a
-commonEvent cleanupSpecific eventSubscribedGetParents_ foo = unsafePerformIO $ do
-  -- TODO: Is this function actually doing cacheEvent? Can I use cacheEvent instead?
-  subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
-  heightRef <- newIORef $ error "commonEvent: heightRef uninitialized"
-  occRef <- newIORef Nothing
-  toRetainRef <- newIORef $ error "commonEvent: toRetainRef uninitialized"
-#ifdef DEBUG_NODEIDS
-  nodeId <- liftIO newNodeId
-#endif
-  pure $ Event $ \sub -> do
-    (liftIO (WeakBag.null subscribers) >>=) $ flip when $ {-# SCC "missCommon" #-} do
-        (occ, height, toRetainSpecific) <-
-          foo
-          -- newSubscriber:
-          (\debugName propagateSpecific -> debugSubscriber' (debugName <> showNodeId' nodeId) $
-              Subscriber
-                { subscriberPropagate = propagateSpecific $ \a -> do
-                    writeAndScheduleClear occRef a
-                    propagate a subscribers
-                , subscriberInvalidateHeight = \_height ->
-                    invalidateHeightRef heightRef (WeakBag.traverse_ subscribers . invalidateSubscriberHeight) -- TODO: what normally happens with the passed in height here?
-                , subscriberRecalculateHeight = updateCommonHeight heightRef subscribers
-                })
-          heightRef
-          subscribers
-          occRef
-        mapM_ (writeAndScheduleClear occRef) occ
-        liftIO $ writeIORef heightRef height
-        liftIO $ writeIORef toRetainRef $ (subscribers, toRetainSpecific) -- TODO: is toRetain correct?
-    sln <- liftIO $ WeakBag.insert' sub subscribers $
-      cleanupSpecific >> writeIORef toRetainRef undefined >> writeIORef occRef Nothing -- TODO what needs to happen here, if anything?
-    occ <- liftIO $ readIORef occRef
-    pure ( EventSubscription
-            (WeakBag.remove sln >> touch sln)
-            (EventSubscribed
-              { eventSubscribedHeightRef = heightRef
-              , eventSubscribedRetained = toAny toRetainRef
+  Subscriber x a ->
+  EventM x (EventSubscription x, Maybe a)
+commonEvent cleanupSpecific eventSubscribedGetParents_ foo sub = do
+  heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
+  toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
+  (occ, height, toRetainSpecific) <-
+    foo
+    -- newSubscriber:
+    (\debugName propagateSpecific -> debugSubscriber' debugName $
+        Subscriber
+          { subscriberPropagate = propagateSpecific $ subscriberPropagate sub
+          , subscriberInvalidateHeight = \_height ->
+              invalidateHeightRef heightRef (subscriberInvalidateHeight sub) -- TODO: what normally happens with the passed in height here?
+          , subscriberRecalculateHeight = updateCommonHeight heightRef sub
+          })
+    heightRef
+    sub
+  liftIO $ writeIORef heightRef height
+  liftIO $ writeIORef toRetainRef $ (sub, toRetainSpecific) -- TODO: is toRetain correct?
+  pure ( EventSubscription
+          (cleanupSpecific >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
+          (EventSubscribed
+            { eventSubscribedHeightRef = heightRef
+            , eventSubscribedRetained = toAny toRetainRef
 #ifdef DEBUG_CYCLES
-              , eventSubscribedGetParents = eventSubscribedGetParents_
-              , eventSubscribedHasOwnHeightRef = True
-              , eventSubscribedWhoCreated = whoCreatedIORef heightRef
+            , eventSubscribedGetParents = eventSubscribedGetParents_
+            , eventSubscribedHasOwnHeightRef = True
+            , eventSubscribedWhoCreated = whoCreatedIORef heightRef
 #endif
-              })
-          , occ
-          )
+            })
+       , occ
+       )
 
+-- TODO: Slow, but terminates and doesn't exhibit growing memory when not cached (but memory use is huge).
 {-# INLINABLE switch #-}
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switch switchParent = unsafePerformIO $ do
+switch switchParent = cacheEvent $ Event $ \sub -> do
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
   --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
   --          in Behavior to fix that TODO?
-  parentsRef <- newIORef []
-  currentParentSubscriptionRef <- newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
-  ownWeakInvalidatorRef <- newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  pure $ commonEvent
+  parentsRef <- liftIO $ newIORef []
+  currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
+  ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+  commonEvent
     (do unsubscribe =<< readIORef currentParentSubscriptionRef
         finalize =<< readIORef ownWeakInvalidatorRef) -- We don't need to get invalidated if we're dead
     (do s <- readIORef currentParentSubscriptionRef
         return [_eventSubscription_subscribed s])
-    (\newSubscriber heightRef subscribers _occRef -> do
+    (\newSubscriber heightRef sub -> do
         let subscriber = newSubscriber "SubscriberSwitch" id
         ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ InvalidatorSwitch $
           SomeMergeUpdate @x
@@ -1053,8 +1039,8 @@ switch switchParent = unsafePerformIO $ do
             myHeight <- readIORef heightRef
             when (parentHeight /= myHeight) $ do
               writeIORef heightRef $! invalidHeight
-              WeakBag.traverse_ subscribers $ invalidateSubscriberHeight myHeight)
-          (updateCommonHeight heightRef subscribers
+              invalidateSubscriberHeight myHeight sub)
+          (updateCommonHeight heightRef sub
             =<< getEventSubscribedHeight . _eventSubscription_subscribed
             =<< readIORef currentParentSubscriptionRef)
           ({-# SCC "switchSubscribed" #-} liftIO $ do
@@ -1083,25 +1069,28 @@ switch switchParent = unsafePerformIO $ do
         liftIO $ writeIORef ownWeakInvalidatorRef wi
         liftIO $ writeIORef currentParentSubscriptionRef subscription
         pure (parentOcc, height, (ownInvalidator, ownWeakInvalidatorRef, currentParentSubscriptionRef)))
+    sub
 
 
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
+-- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
 coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
-coincidence coincidenceParent = unsafePerformIO $ do
-  innerSubdRef <- newIORef $ error "coincidence: innerSubdRef undefined"
-  outerParentSubscriptionRef <- newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
+coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
+  innerSubdRef <- liftIO $ newIORef $ error "coincidence: innerSubdRef undefined"
+  outerParentSubscriptionRef <- liftIO $ newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
+  occRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
   -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
   let getParentSubscribeds = do
         maybeInnerSubscription <- readIORef innerSubdRef
         outerSubscription <- readIORef outerParentSubscriptionRef
         return $ _eventSubscription_subscribed outerSubscription : maybeToList maybeInnerSubscription
-  pure $ commonEvent
+  commonEvent
     (unsubscribe =<< readIORef outerParentSubscriptionRef) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
     getParentSubscribeds
-    (\newSubscriber heightRef subscribers occRef -> do
+    (\newSubscriber heightRef sub -> do
         let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
             subscribeCoincidenceInner inner outerHeight = do
               (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
@@ -1109,15 +1098,17 @@ coincidence coincidenceParent = unsafePerformIO $ do
                      occ <- liftIO $ readIORef occRef
                      case occ of
                        Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
-                       Nothing -> doPropagate a
+                       Nothing -> do
+                         writeAndScheduleClear occRef a
+                         doPropagate a
               writeAndScheduleClear innerSubdRef innerSubd
               let innerHeightWasHigher = innerHeight > outerHeight
               defer $ SomeMergeUpdate @x
                  (do unsubscribe subscription
                      when innerHeightWasHigher $
-                       invalidateHeightRef heightRef (WeakBag.traverse_ subscribers . invalidateSubscriberHeight))
+                       invalidateHeightRef heightRef (subscriberInvalidateHeight sub))
                  (when innerHeightWasHigher $
-                   updateCommonHeight heightRef subscribers =<< do
+                   updateCommonHeight heightRef sub =<< do
                      subs <- mapM getEventSubscribedHeight =<< getParentSubscribeds
                      -- TODO: why not order heights with invalid as Top?
                      return $ if invalidHeight `elem` subs then invalidHeight else maximum subs)
@@ -1135,14 +1126,16 @@ coincidence coincidenceParent = unsafePerformIO $ do
                  Nothing ->
                    when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
                      writeIORef heightRef $! innerHeight
-                     WeakBag.traverse_ subscribers $ invalidateSubscriberHeight outerHeight
-                     WeakBag.traverse_ subscribers $ recalculateSubscriberHeight innerHeight
+                     invalidateSubscriberHeight outerHeight sub
+                     recalculateSubscriberHeight innerHeight sub
                  Just o -> doPropagate o -- Since it's already firing, no need to adjust height
         liftIO $ writeIORef outerParentSubscriptionRef outerSubscription
         (occ, height) <- case outerOcc of
           Nothing -> return (Nothing, outerHeight)
           Just o -> subscribeCoincidenceInner o outerHeight
+        mapM_ (writeAndScheduleClear occRef) occ
         pure (occ, height, (outerParentSubscriptionRef, innerSubdRef)))
+    sub
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> ResultM x b -> SpiderHost x b
@@ -1953,13 +1946,13 @@ invalidateHeightRef heightRef doOnInvalidate = do
     doOnInvalidate oldHeight
 
 -- TODO: comments say that 'when's should be assertions but tests fail if they are removed
-updateCommonHeight :: IORef Height -> WeakBag (Subscriber x a) -> Height -> IO ()
-updateCommonHeight heightRef subscribers newHeight = do
+updateCommonHeight :: IORef Height -> Subscriber x a -> Height -> IO ()
+updateCommonHeight heightRef subscriber newHeight = do
   oldHeight <- readIORef heightRef
   when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
     when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
       writeIORef heightRef $! newHeight
-      WeakBag.traverse_ subscribers $ recalculateSubscriberHeight newHeight
+      recalculateSubscriberHeight newHeight subscriber
 
 --------------------------------------------------------------------------------
 -- Reflex integration
