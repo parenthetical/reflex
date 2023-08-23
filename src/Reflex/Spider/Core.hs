@@ -753,7 +753,7 @@ data PullSubscribed x a
 
 data Invalidator x
    = InvalidatorPull (IO ())
-   | InvalidatorSwitch (SomeMergeUpdate x)
+   | InvalidatorSwitch (IO ())
 
 newtype SomeHoldInit x = SomeHoldInit (EventM x ())
 
@@ -945,8 +945,8 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         return [_eventSubscription_subscribed s])
     (\newSubscriber heightRef sub -> do
         let subscriber = newSubscriber "SubscriberSwitch" id
-        ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ InvalidatorSwitch $
-          SomeMergeUpdate @x
+        ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ InvalidatorSwitch $  -- traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed           
+         runEventM @x $ defer $ SomeMergeUpdate @x
           ({-# SCC "switchSubscribed" #-} do
             EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
             parentHeight <- getEventSubscribedHeight subd'
@@ -1685,9 +1685,7 @@ invalidate wisRef = do
         finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
         case i of
           InvalidatorPull p -> p
-          InvalidatorSwitch someMergeUpdate -> do
-            -- traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
-            runEventM @x $ defer someMergeUpdate
+          InvalidatorSwitch someMergeUpdate -> someMergeUpdate
   writeIORef wisRef []
 
 -- | Run an event action outside of a frame
