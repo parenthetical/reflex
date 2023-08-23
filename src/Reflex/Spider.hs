@@ -18,3 +18,4 @@ module Reflex.Spider
        ) where
 
 import Reflex.Spider.Internal
+import Reflex.Spider.Core
