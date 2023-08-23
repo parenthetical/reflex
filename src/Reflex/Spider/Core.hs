@@ -268,7 +268,7 @@ terminalSubscriber p = Subscriber
   }
 
 --TODO: Make this lazy in its input event
-headE :: forall x m a. (Defer (SomeMergeInit x) m, HasSpiderTimeline x) => Event x a -> m (Event x a)
+headE :: forall x m a. (Defer (SomeInit x) m, HasSpiderTimeline x) => Event x a -> m (Event x a)
 headE originalE = do
   let -- | Subscribe to an Event only for the duration of one occurrence
       subscribeAndReadHead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
@@ -284,7 +284,7 @@ headE originalE = do
           Just _ -> unsubscribe subscription
         return (subscription, occ)
   parent <- liftIO $ newIORef $ Just originalE
-  defer $ SomeMergeInit $ do --TODO: Rename SomeMergeInit appropriately
+  defer $ SomeInit $ do --TODO: Rename SomeInit appropriately
     let clearParent = liftIO $ writeIORef parent Nothing
     (_, occ) <- subscribeAndReadHead originalE $ terminalSubscriber $ const clearParent
     when (isJust occ) clearParent
@@ -579,7 +579,7 @@ data EventEnv x
               , eventEnvHoldInits :: !(IORef [SomeHoldInit x]) -- Needed for Subscribe
               , eventEnvDynInits :: !(IORef [SomeDynInit x])
               , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
-              , eventEnvMergeInits :: !(IORef [SomeMergeInit x]) -- Needed for Subscribe
+              , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Some Clear]) -- Needed for Subscribe
               , eventEnvIntClears :: !(IORef [Some IntClear])
               , eventEnvRootClears :: !(IORef [Some RootClear])
@@ -623,9 +623,9 @@ instance HasSpiderTimeline x => Defer (SomeMergeUpdate x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvMergeUpdates
 
-instance HasSpiderTimeline x => Defer (SomeMergeInit x) (EventM x) where
+instance HasSpiderTimeline x => Defer (SomeInit x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvMergeInits
+  getDeferralQueue = asksEventEnv eventEnvInits
 
 -- TODO: this is only used in the 'merge' function thus obfuscates what's going on?
 class HasSpiderTimeline x => HasCurrentHeight x m | m -> x where
@@ -788,7 +788,7 @@ data SomeMergeUpdate x = SomeMergeUpdate
   , _someMergeUpdate_update :: !(EventM x [EventSubscription x])
   }
 
-newtype SomeMergeInit x = SomeMergeInit { unSomeMergeInit :: EventM x () }
+newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
 
 -- EventM can do everything BehaviorM can, plus create holds
 newtype EventM x a = EventM { unEventM :: IO a }
@@ -1565,7 +1565,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
     =<< flip doInitialInput (mergeSubscribeAndRead True)
     =<< lift (readBehaviorUntracked (dynamicCurrent d))
   unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
-  defer $ SomeMergeInit $ do
+  defer $ SomeInit $ do
     let deferUpdateMerge p = do
           -- TODO: Be able to run as much of this as possible promptly
           defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
@@ -1671,19 +1671,19 @@ fanG e = unsafePerformIO $ do
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
-runHoldInits :: forall x. HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeDynInit x] -> IORef [SomeMergeInit x] -> EventM x ()
-runHoldInits holdInitRef dynInitRef mergeInitRef = do
+runHoldInits :: forall x. HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeDynInit x] -> IORef [SomeInit x] -> EventM x ()
+runHoldInits holdInitRef dynInitRef initRef = do
   holdInits <- liftIO $ readIORef holdInitRef
   dynInits <- liftIO $ readIORef dynInitRef
-  mergeInits <- liftIO $ readIORef mergeInitRef
-  unless (null holdInits && null dynInits && null mergeInits) $ do
+  inits <- liftIO $ readIORef initRef
+  unless (null holdInits && null dynInits && null inits) $ do
     liftIO $ writeIORef holdInitRef []
     liftIO $ writeIORef dynInitRef []
-    liftIO $ writeIORef mergeInitRef []
+    liftIO $ writeIORef initRef []
     forM_ holdInits $ \(SomeHoldInit h) ->  h
     forM_ dynInits $ \(SomeDynInit d) -> void $ getDynHold d
-    forM_ mergeInits $ unSomeMergeInit -- TODO: why is merge init just a thunk but do dyn/hold inits use a data type?
-    runHoldInits holdInitRef dynInitRef mergeInitRef
+    forM_ inits $ unSomeInit -- TODO: why is merge init just a thunk but do dyn/hold inits use a data type?
+    runHoldInits holdInitRef dynInitRef initRef
 
 newEventEnv :: IO (EventEnv x)
 newEventEnv = do
@@ -1691,21 +1691,21 @@ newEventEnv = do
   holdInitRef <- newIORef []
   dynInitRef <- newIORef []
   mergeUpdateRef <- newIORef []
-  mergeInitRef <- newIORef []
+  initRef <- newIORef []
   heightRef <- newIORef zeroHeight
   toClearRef <- newIORef []
   toClearIntRef <- newIORef []
   toClearRootRef <- newIORef []
   delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeInitRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef
+  return $ EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef
 
 clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef mergeInitRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef) = do
+clearEventEnv (EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef) = do
   writeIORef toAssignRef []
   writeIORef holdInitRef []
   writeIORef dynInitRef []
   writeIORef mergeUpdateRef []
-  writeIORef mergeInitRef []
+  writeIORef initRef []
   writeIORef heightRef zeroHeight
   writeIORef toClearRef []
   writeIORef toClearIntRef []
@@ -1718,7 +1718,7 @@ runFrame a = SpiderHost $ do
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- runEventM $ do
         result <- a
-        runHoldInits (eventEnvHoldInits env) (eventEnvDynInits env) (eventEnvMergeInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
+        runHoldInits (eventEnvHoldInits env) (eventEnvDynInits env) (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
         return result
   toClear <- readIORef $ eventEnvClears env
   forM_ toClear $ \(Some (Clear ref)) -> {-# SCC "clear" #-} writeIORef ref Nothing
