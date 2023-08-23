@@ -880,7 +880,7 @@ pull a = unsafePerformIO $ do
 #endif
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorPull"
         parentsRef <- liftIO $ newIORef []
-        holdInits <- askBehaviorHoldInits
+        (_, !holdInits) <- ask -- ask behavior hold inits
         aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
         invsRef <- liftIO . newIORef . maybeToList =<< askInvalidator
         parents <- liftIO $ readIORef parentsRef
@@ -1267,11 +1267,6 @@ addParentB h = do
     Nothing -> pure ()
     Just (_, !p) ->
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
-
-askBehaviorHoldInits :: BehaviorM x (IORef [SomeHoldInit x])
-askBehaviorHoldInits = do
-  (_, !his) <- ask
-  return his
 
 {-# INLINE getDynHold #-}
 getDynHold :: (HasSpiderTimeline x, Defer (SomeHoldInit x) m, Patch p) => Dyn x p -> m (Hold x p)
