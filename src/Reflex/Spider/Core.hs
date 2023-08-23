@@ -551,7 +551,7 @@ globalSpiderTimelineEnv = unsafePerformIO unsafeNewSpiderTimelineEnv
 
 -- | Stores all global data relevant to a particular Spider timeline; only one
 -- value should exist for each type @x@
-newtype SpiderTimelineEnv x = STE {unSTE :: SpiderTimelineEnv' x}
+newtype SpiderTimelineEnv (x :: Type) = STE {unSTE :: SpiderTimelineEnv' x}
 -- We implement SpiderTimelineEnv with a newtype wrapper so
 -- we can get the coercions we want safely.
 type role SpiderTimelineEnv nominal
@@ -564,7 +564,7 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
 #endif
   }
 
-type role SpiderTimelineEnv' nominal -- TODO: I commented this out, put back?
+-- type role SpiderTimelineEnv' nominal
 
 instance Eq (SpiderTimelineEnv x) where
   _ == _ = True -- Since only one exists of each type
@@ -577,7 +577,6 @@ instance GEq SpiderTimelineEnv where
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe
               , eventEnvHoldInits :: !(IORef [SomeHoldInit x]) -- Needed for Subscribe
-              , eventEnvDynInits :: !(IORef [SomeDynInit x])
               , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
               , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Some Clear]) -- Needed for Subscribe
@@ -610,10 +609,6 @@ instance HasSpiderTimeline x => Defer (SomeAssignment x) (EventM x) where
 instance HasSpiderTimeline x => Defer (SomeHoldInit x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvHoldInits
-
-instance HasSpiderTimeline x => Defer (SomeDynInit x) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvDynInits
 
 instance Defer (SomeHoldInit x) (BehaviorM x) where
   {-# INLINE getDeferralQueue #-}
@@ -757,7 +752,8 @@ data BehaviorSubscribed x a
 
 newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscribed x))
 
---type role PullSubscribed representational
+-- type role PullSubscribed representational nominal
+
 data PullSubscribed x a
    = PullSubscribed { pullSubscribedValue :: !a
                     , pullSubscribedInvalidators :: !(IORef [Weak (Invalidator x)])
@@ -765,7 +761,7 @@ data PullSubscribed x a
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
 
---type role Pull representational
+-- type role Pull representational nominal
 data Pull x a
    = Pull { pullValue :: !(IORef (Maybe (PullSubscribed x a)))
 
@@ -779,8 +775,6 @@ data Invalidator x
    | InvalidatorSwitch (SomeMergeUpdate x)
 
 newtype SomeHoldInit x = SomeHoldInit (EventM x ())
-
-data SomeDynInit x = forall p. Patch p => SomeDynInit !(Dyn x p)
 
 data SomeMergeUpdate x = SomeMergeUpdate
   { _someMergeUpdate_invalidateHeight :: !(IO ())
@@ -855,14 +849,14 @@ data DynType x p = UnsafeDyn !(BehaviorM x (PatchTarget p), Event x p)
 
 newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (DynType x p) }
 
-newMapDyn :: HasSpiderTimeline x => (a -> b) -> DynamicS x (Identity a) -> DynamicS x (Identity b)
+newMapDyn :: _ => (a -> b) -> DynamicS x (Identity a) -> DynamicS x (Identity b)
 newMapDyn f d = dynamicDynIdentity $ unsafeBuildDynamic (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
 
-buildDynamic :: (Defer (SomeDynInit x) m, Patch p) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
+buildDynamic :: forall x m p. (HasSpiderTimeline x, Defer (SomeHoldInit x) m, Patch p) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
 buildDynamic readV0 v' = do
   result <- liftIO $ newIORef $ BuildDyn (readV0, v')
   let !d = Dyn result
-  defer $ SomeDynInit d
+  defer $ SomeHoldInit @x $ void $ getDynHold d
   return d
 
 unsafeBuildDynamic :: BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
@@ -958,7 +952,7 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo sub = do
 
 -- TODO: Slow, but terminates and doesn't exhibit growing memory when not cached (but memory use is huge).
 {-# INLINABLE switch #-}
-switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
+switch :: forall x a. _ => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ Event $ \sub -> do
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
@@ -998,7 +992,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
             holdInitsRef <- newIORef []
             -- TODO: after this runBehavior holdInitsRef always seems empty...
             e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) $ holdInitsRef
-            runEventM (join $ runHoldInits holdInitsRef <$> liftIO (newIORef []) <*> liftIO (newIORef []))
+            runEventM $ runHoldInits holdInitsRef =<< liftIO (newIORef [])
             --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
             subscription <- unSpiderHost . runFrame . subscribe e $ {-# SCC "subscribeSwitch" #-} subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
             writeIORef currentParentSubscriptionRef $! subscription
@@ -1671,25 +1665,21 @@ fanG e = unsafePerformIO $ do
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
-runHoldInits :: forall x. HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeDynInit x] -> IORef [SomeInit x] -> EventM x ()
-runHoldInits holdInitRef dynInitRef initRef = do
+runHoldInits :: forall x. HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeInit x] -> EventM x ()
+runHoldInits holdInitRef initRef = do
   holdInits <- liftIO $ readIORef holdInitRef
-  dynInits <- liftIO $ readIORef dynInitRef
   inits <- liftIO $ readIORef initRef
-  unless (null holdInits && null dynInits && null inits) $ do
+  unless (null holdInits && null inits) $ do
     liftIO $ writeIORef holdInitRef []
-    liftIO $ writeIORef dynInitRef []
     liftIO $ writeIORef initRef []
     forM_ holdInits $ \(SomeHoldInit h) ->  h
-    forM_ dynInits $ \(SomeDynInit d) -> void $ getDynHold d
     forM_ inits $ unSomeInit -- TODO: why is merge init just a thunk but do dyn/hold inits use a data type?
-    runHoldInits holdInitRef dynInitRef initRef
+    runHoldInits holdInitRef initRef
 
 newEventEnv :: IO (EventEnv x)
 newEventEnv = do
   toAssignRef <- newIORef [] -- This should only actually get used when events are firing
   holdInitRef <- newIORef []
-  dynInitRef <- newIORef []
   mergeUpdateRef <- newIORef []
   initRef <- newIORef []
   heightRef <- newIORef zeroHeight
@@ -1697,13 +1687,12 @@ newEventEnv = do
   toClearIntRef <- newIORef []
   toClearRootRef <- newIORef []
   delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef
+  return $ EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef
 
 clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef holdInitRef dynInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef) = do
+clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef) = do
   writeIORef toAssignRef []
   writeIORef holdInitRef []
-  writeIORef dynInitRef []
   writeIORef mergeUpdateRef []
   writeIORef initRef []
   writeIORef heightRef zeroHeight
@@ -1718,7 +1707,7 @@ runFrame a = SpiderHost $ do
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- runEventM $ do
         result <- a
-        runHoldInits (eventEnvHoldInits env) (eventEnvDynInits env) (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
+        runHoldInits (eventEnvHoldInits env) (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
         return result
   toClear <- readIORef $ eventEnvClears env
   forM_ toClear $ \(Some (Clear ref)) -> {-# SCC "clear" #-} writeIORef ref Nothing
@@ -1836,10 +1825,10 @@ localSpiderTimeline
   :: proxy s
   -> SpiderTimelineEnv x
   -> SpiderTimelineEnv (LocalSpiderTimeline x s)
-localSpiderTimeline _ = unsafeCoerce -- FIXME: was coerce but I can't figure out why that doesn't work anymore, has to do with phantom type role of SpiderTimelineEnv'
+localSpiderTimeline _ = coerce
 
 -- | Pass a new timeline to the given function.
-withSpiderTimeline :: (forall x. HasSpiderTimeline x => SpiderTimelineEnv x -> IO r) -> IO r
+withSpiderTimeline :: forall r. (forall x. HasSpiderTimeline x => SpiderTimelineEnv x -> IO r) -> IO r
 withSpiderTimeline k = do
   env <- unsafeNewSpiderTimelineEnv
   reify env $ \s -> k $ localSpiderTimeline s env
