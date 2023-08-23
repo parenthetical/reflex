@@ -171,9 +171,6 @@ class HasNodeId a where
 instance HasNodeId (Hold x p) where
   getNodeId = holdNodeId
 
-instance HasNodeId (RootSubscribed x a) where
-  getNodeId = rootSubscribedNodeId
-
 instance HasNodeId (Pull x a) where
   getNodeId = pullNodeId
 
@@ -361,13 +358,6 @@ cacheEvent e = unsafePerformIO $ do
 subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
 subscribe e s = fst <$> subscribeAndRead e s
 
-{-# INLINE wrap #-}
-wrap :: MonadIO m => (t -> EventSubscribed x) -> (Subscriber x a -> m (WeakBagTicket, t, Maybe a)) -> Subscriber x a -> m (EventSubscription x, Maybe a)
-wrap tag getSpecificSubscribed sub = do
-  (sln, subd, occ) <- getSpecificSubscribed sub
-  let es = tag subd
-  return (EventSubscription (WeakBag.remove sln >> touch sln) es, occ)
-
 subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
 subscribeAndReadNever = return (EventSubscription (return ()) eventSubscribedNever, Nothing)
 
@@ -423,17 +413,6 @@ data EventSubscribed x = EventSubscribed
   , eventSubscribedGetParents :: !(IO [EventSubscribed x]) -- For debugging loops
   , eventSubscribedHasOwnHeightRef :: !Bool
   , eventSubscribedWhoCreated :: !(IO [String])
-#endif
-  }
-
-eventSubscribedRoot :: RootSubscribed x a -> EventSubscribed x
-eventSubscribedRoot !r = EventSubscribed
-  { eventSubscribedHeightRef = zeroRef
-  , eventSubscribedRetained = toAny r
-#ifdef DEBUG_CYCLES
-  , eventSubscribedGetParents = return []
-  , eventSubscribedHasOwnHeightRef = False
-  , eventSubscribedWhoCreated = return ["root"]
 #endif
   }
 
@@ -792,24 +771,6 @@ data Pull x a
 data Invalidator x
    = forall a. InvalidatorPull (Pull x a)
    | InvalidatorSwitch (SomeMergeUpdate x)
-
-data RootSubscribed x a = forall k. GCompare k => RootSubscribed
-  { rootSubscribedKey :: !(k a)
-  , rootSubscribedCachedSubscribed :: !(IORef (DMap k (RootSubscribed x))) -- From the original Root
-  , rootSubscribedSubscribers :: !(WeakBag (Subscriber x a))
-  , rootSubscribedOccurrence :: !(IO (Maybe a)) -- Lookup from rootOccurrence
-  , rootSubscribedUninit :: IO ()
-  , rootSubscribedWeakSelf :: !(IORef (Weak (RootSubscribed x a))) --TODO: Can we make this a lazy non-IORef and then force it manually to avoid an indirection each time we use it?
-#ifdef DEBUG_NODEIDS
-  , rootSubscribedNodeId :: Int
-#endif
-  }
-
-data Root x k
-   = Root { rootOccurrence :: !(IORef (DMap k Identity)) -- The currently-firing occurrence of this event
-          , rootSubscribed :: !(IORef (DMap k (RootSubscribed x)))
-          , rootInit :: !(forall a. k a -> RootTrigger x a -> IO (IO ()))
-          }
 
 data SomeHoldInit x = forall p. Patch p => SomeHoldInit !(Hold x p)
 
@@ -1374,58 +1335,6 @@ getDynHold d = do
 {-# NOINLINE zeroRef #-}
 zeroRef :: IORef Height
 zeroRef = unsafePerformIO $ newIORef zeroHeight
-
-getRootSubscribed :: forall k x a. (GCompare k, HasSpiderTimeline x) => k a -> Root x k -> Subscriber x a -> IO (WeakBagTicket, RootSubscribed x a, Maybe a)
-getRootSubscribed k r sub = do
-  let cleanupRootSubscribed :: RootSubscribed x a -> IO ()
-      cleanupRootSubscribed self@RootSubscribed { rootSubscribedKey = k, rootSubscribedCachedSubscribed = cached } = do
-        rootSubscribedUninit self
-        modifyIORef' cached $ DMap.delete k
-  mSubscribed <- readIORef $ rootSubscribed r
-  let getOcc = fmap (coerce . DMap.lookup k) $ readIORef $ rootOccurrence r
-  case DMap.lookup k mSubscribed of
-    Just subscribed -> {-# SCC "hitRoot" #-} do
-      sln <- WeakBag.insert sub (rootSubscribedSubscribers subscribed) (rootSubscribedWeakSelf subscribed) cleanupRootSubscribed
-      occ <- getOcc
-      return (sln, subscribed, occ)
-    Nothing -> {-# SCC "missRoot" #-} do
-      weakSelf <- newIORef $ error "getRootSubscribed: weakSelfRef not initialized"
-      let !cached = rootSubscribed r
-      uninitRef <- newIORef $ error "getRootsubscribed: uninitRef not initialized"
-      (subs, sln) <- WeakBag.singleton sub weakSelf cleanupRootSubscribed
-
-      tracePropagate (Proxy::Proxy x) $  "getRootSubscribed: calling rootInit"
-
-      uninit <- rootInit r k $ RootTrigger (subs, rootOccurrence r, k)
-      writeIORef uninitRef $! uninit
-#ifdef DEBUG_NODEIDS
-      nid <- newNodeId
-#endif
-      let !subscribed = RootSubscribed
-            { rootSubscribedKey = k
-            , rootSubscribedCachedSubscribed = cached
-            , rootSubscribedOccurrence = getOcc
-            , rootSubscribedSubscribers = subs
-            , rootSubscribedUninit = uninit
-            , rootSubscribedWeakSelf = weakSelf
-#ifdef DEBUG_NODEIDS
-            , rootSubscribedNodeId = nid
-#endif
-            }
-          -- If we die at the same moment that all our children die, they will
-          -- try to clean us up but will fail because their Weak reference to us
-          -- will also be dead.  So, if we are dying, check if there are any
-          -- children; since children don't bother cleaning themselves up if
-          -- their parents are already dead, I don't think there's a race
-          -- condition here.  However, if there are any children, then we can
-          -- infer that we need to clean ourselves up, so we do.
-          finalCleanup = do
-            cs <- readIORef $ _weakBag_children subs
-            when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
-      writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-      modifyIORef' (rootSubscribed r) $ DMap.insertWith (error $ "getRootSubscribed: duplicate key inserted into Root") k subscribed --TODO: I think we can just write back mSubscribed rather than re-reading it
-      occ <- getOcc
-      return (sln, subscribed, occ)
 
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
@@ -2346,16 +2255,55 @@ newEventWithTriggerIO f = do
   es <- newFanEventWithTriggerIO $ \Refl -> f
   return $ select es Refl
 
-newFanEventWithTriggerIO :: (HasSpiderTimeline x, GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (EventSelector x k)
+
+data NewFanSubscribedChildren x a = NewFanSubscribedChildren
+  { _newFanSubscribedChildren :: WeakBag (Subscriber x a)
+  , _newFanSubscribedUninit :: IO ()
+  }
+
+-- TODO: anything in common with Fan?
+newFanEventWithTriggerIO :: forall x k. (HasSpiderTimeline x, GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (EventSelector x k)
 newFanEventWithTriggerIO f = do
   occRef <- newIORef DMap.empty
-  subscribedRef <- newIORef DMap.empty
-  let !r = Root
-        { rootOccurrence = occRef
-        , rootSubscribed = subscribedRef
-        , rootInit = f
-        }
-  return $ EventSelector $ \(!k) -> Event $ wrap eventSubscribedRoot $ liftIO . getRootSubscribed k r
+  subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
+  return $ EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
+    (NewFanSubscribedChildren subscribers uninit) <- DMap.lookup k <$> readIORef subscribedRef >>= \case
+      Just res -> {-# SCC "hitRoot" #-} pure res
+      Nothing -> {-# SCC "missRoot" #-} do
+        subscribers <- WeakBag.empty
+        uninit <- f k $ RootTrigger (subscribers, occRef, k)
+        let res = NewFanSubscribedChildren subscribers uninit
+        modifyIORef' subscribedRef $ DMap.insertWith (error $ "getRootSubscribed: duplicate key inserted into Root") k res
+        pure res
+    sln <- WeakBag.insert' sub subscribers $ do
+              uninit
+              modifyIORef' subscribedRef $ DMap.delete k
+    -- TODO: understand original intent of this comment:
+    -- If we die at the same moment that all our children die, they will
+    -- try to clean us up but will fail because their Weak reference to us
+    -- will also be dead.  So, if we are dying, check if there are any
+    -- children; since children don't bother cleaning themselves up if
+    -- their parents are already dead, I don't think there's a race
+    -- condition here.  However, if there are any children, then we can
+    -- infer that we need to clean ourselves up, so we do.
+    -- finalCleanup = do
+    --   cs <- readIORef $ _weakBag_children subs
+    --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
+     -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
+    occ <- fmap (coerce . DMap.lookup k) $ readIORef $ occRef
+    return ( EventSubscription
+             (WeakBag.remove sln >> touch sln)
+             EventSubscribed
+             { eventSubscribedHeightRef = zeroRef
+             , eventSubscribedRetained = toAny subscribedRef
+#ifdef DEBUG_CYCLES
+             , eventSubscribedGetParents = return []
+             , eventSubscribedHasOwnHeightRef = False
+             , eventSubscribedWhoCreated = return ["root"]
+#endif
+             }             
+           , occ
+           )
 
 newtype ReadPhase x a = ReadPhase (ResultM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
