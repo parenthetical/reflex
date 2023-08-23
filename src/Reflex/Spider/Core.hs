@@ -833,12 +833,6 @@ heightBagVerify b@(HeightBag s c) = if
 heightBagVerify = id
 #endif
 
--- TODO: Why is this NOINLINE?
-{-# NOINLINE newInvalidatorPull #-}
-newInvalidatorPull :: Pull x a -> IO (Invalidator x)
-newInvalidatorPull p = return $! InvalidatorPull p
-
-
 data DynType x p = UnsafeDyn !(BehaviorM x (PatchTarget p), Event x p)
                  | BuildDyn  !(EventM x (PatchTarget p), Event x p)
                  | HoldDyn   !(Hold x p)
@@ -877,15 +871,13 @@ pull a = unsafePerformIO $ do
   nid <- newNodeId
 #endif
   pure $ Behavior $ do
-    val <- liftIO $ readIORef $ ref
-    case val of
+    (aVal, subscribed) <- liftIO (readIORef ref) >>= \case
       Just subscribed -> do
-        addParentB (BehaviorSubscribedPull subscribed)
         askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (pullSubscribedInvalidators subscribed) (wi:))
         liftIO $ touch $ pullSubscribedOwnInvalidator subscribed
-        return $ pullSubscribedValue subscribed
+        return $ (pullSubscribedValue subscribed, subscribed)
       Nothing -> do
-        i <- liftIO $ newInvalidatorPull $ Pull ref 
+        let i = InvalidatorPull $ Pull ref -- TODO: i had NOINLINE in original code
 #ifdef DEBUG_NODEIDS
                                                 nid
 #endif
@@ -902,8 +894,9 @@ pull a = unsafePerformIO $ do
               , pullSubscribedParents = parents
               }
         liftIO $ writeIORef ref $ Just subscribed
-        addParentB (BehaviorSubscribedPull subscribed)
-        return aVal
+        return (aVal, subscribed)
+    addParentB (BehaviorSubscribedPull subscribed)
+    pure aVal
 
 {-# INLINE commonEvent #-}
 commonEvent :: forall x extra a. HasSpiderTimeline x =>
