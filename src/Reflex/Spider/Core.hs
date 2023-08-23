@@ -221,7 +221,6 @@ unsubscribe :: EventSubscription x -> IO ()
 unsubscribe (EventSubscription u _) = u
 
 
-
 --------------------------------------------------------------------------------
 -- Event
 --------------------------------------------------------------------------------
@@ -870,9 +869,6 @@ unsafeBuildDynamic :: BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
 unsafeBuildDynamic readV0 v' =
   Dyn $ unsafePerformIO $ newIORef $ UnsafeDyn (readV0, v')
 
--- ResultM can read behaviors and events
-type ResultM = EventM
-
 instance HasSpiderTimeline x => Functor (Event x) where
   fmap f = push $ return . Just . f
 
@@ -1085,7 +1081,7 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
     sub
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
-run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> ResultM x b -> SpiderHost x b
+run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
 run roots after = do
   tracePropagate (Proxy :: Proxy x) $ "Running an event frame with " <> show (length roots) <> " events"
   let t = spiderTimeline :: SpiderTimelineEnv x

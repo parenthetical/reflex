@@ -475,7 +475,7 @@ newEventWithTriggerIO f = do
   return $ select es Refl
 
 
-newtype ReadPhase x a = ReadPhase (ResultM x a) deriving (Functor, Applicative, Monad, MonadFix)
+newtype ReadPhase x a = ReadPhase (EventM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
 instance MonadRef (SpiderHost x) where
   type Ref (SpiderHost x) = Ref IO
