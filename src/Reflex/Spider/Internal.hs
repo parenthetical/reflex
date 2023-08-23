@@ -302,7 +302,8 @@ headE originalE = do
 now :: ( MonadIO m, Defer (Some Clear) m, HasSpiderTimeline x
         ) => m (Event x ())
 now = do
-  nowOrNot <- newAndScheduleClear $ Just ()
+  nowOrNot <- liftIO $ newIORef $ Just ()
+  scheduleClear nowOrNot
   return . Event $ \_ -> do
     occ <- liftIO . readIORef $ nowOrNot
     return ( EventSubscription (return ()) eventSubscribedNow
@@ -681,14 +682,6 @@ writeAndScheduleIntClear ref val = do
   liftIO $ writeIORef ref val
   scheduleIntClear ref
 
-
-{-# INLINE newAndScheduleClear #-}
-newAndScheduleClear :: Defer (Some Clear) m => Maybe a -> m (IORef (Maybe a))
-newAndScheduleClear occ = do
-  occRef <- liftIO $ newIORef occ
-  when (isJust occ) $ scheduleClear occRef
-  pure occRef
-  
 
 instance HasSpiderTimeline x => Defer (Some IntClear) (EventM x) where
   {-# INLINE getDeferralQueue #-}
