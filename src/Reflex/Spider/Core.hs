@@ -166,9 +166,6 @@ debugInvalidate = False
 class HasNodeId a where
   getNodeId :: a -> Int
 
-instance HasNodeId (Hold x p) where
-  getNodeId = holdNodeId
-
 instance HasNodeId (Pull x a) where
   getNodeId = pullNodeId
 
@@ -544,9 +541,6 @@ data Hold x p
           , holdInvalidators :: !(IORef [Weak (Invalidator x)])
           , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
           , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
-#ifdef DEBUG_NODEIDS
-          , holdNodeId :: Int
-#endif
           }
 
 -- | A statically allocated 'SpiderTimeline'
@@ -703,41 +697,31 @@ scheduleRootClear r = defer $ Some $ RootClear r
 hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeHoldInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
 hold v0 e = do
   valRef <- liftIO $ newIORef v0
-  invsRef <- liftIO $ newIORef []
+  invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
 #ifdef DEBUG_NODEIDS
   nodeId <- liftIO newNodeId
 #endif
-  let h = Hold
-        { holdValue = valRef
-        , holdInvalidators = invsRef
-        , holdEvent = e
-        , holdParent = parentRef
-#ifdef DEBUG_NODEIDS
-        , holdNodeId = nodeId
-#endif
-        }
   defer $ SomeHoldInit $ do
-      ep <- liftIO $ readIORef $ holdParent h
+      ep <- liftIO $ readIORef $ parentRef
       case ep of
         Just _subd -> pure ()
         Nothing -> do
-          let e = holdEvent h
           subscriptionRef <- liftIO $ newIORef $ error "getHoldEventSubscription: subdRef uninitialized"
           (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
              { subscriberPropagate = {-# SCC "traverseHold" #-} \a -> do
                 {-# SCC "trace" #-} when debugPropagate $ traceM (Proxy :: Proxy x) $ liftIO $ do
-                  invalidators <- liftIO $ readIORef $ holdInvalidators h
-                  return $ "SubscriberHold" <> showNodeId h <> ": " ++ show (length invalidators)
+                  invalidators <- liftIO $ readIORef $ invsRef
+                  return $ "SubscriberHold" <> showNodeId' nodeId <> ": " ++ show (length invalidators)
               
-                v <- {-# SCC "read" #-} liftIO $ readIORef $ holdValue h
+                v <- {-# SCC "read" #-} liftIO $ readIORef $ valRef
                 case {-# SCC "apply" #-} apply a v of
                   Nothing -> return ()
                   Just v' -> do
                     {-# SCC "trace2" #-} withIncreasedDepth (Proxy :: Proxy x) $
-                      tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId h)
-                    vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ holdValue h
-                    iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ holdInvalidators h
+                      tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId' nodeId)
+                    vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ valRef
+                    iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ invsRef
                     defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
              , subscriberInvalidateHeight = \_ -> return ()
              , subscriberRecalculateHeight = \_ -> return ()
@@ -746,16 +730,21 @@ hold v0 e = do
           case occ of
             Nothing -> return ()
             Just o -> do
-              old <- liftIO $ readIORef $ holdValue h
+              old <- liftIO $ readIORef $ valRef
               case apply o old of
                 Nothing -> return ()
                 Just new -> do
                   -- Need to evaluate these so that we don't retain the Hold itself
-                  v <- liftIO $ evaluate $ holdValue h
-                  i <- liftIO $ evaluate $ holdInvalidators h
+                  v <- liftIO $ evaluate $ valRef
+                  i <- liftIO $ evaluate $ invsRef
                   defer $ SomeAssignment v i new
-          liftIO $ writeIORef (holdParent h) $ Just subscription
-  return h
+          liftIO $ writeIORef parentRef $ Just subscription
+  return $ Hold
+        { holdValue = valRef
+        , holdInvalidators = invsRef
+        , holdEvent = e
+        , holdParent = parentRef
+        }
 
 type BehaviorEnv x = (Maybe (Weak (Invalidator x), IORef [SomeBehaviorSubscribed x]), IORef [SomeHoldInit x])
 
