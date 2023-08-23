@@ -468,9 +468,6 @@ behaviorHoldIdentity = behaviorHold
 behaviorConst :: a -> Behavior x a
 behaviorConst !a = Behavior $ return a
 
-behaviorDyn :: (HasSpiderTimeline x, Patch p) => Dyn x p -> Behavior x (PatchTarget p)
-behaviorDyn !d = Behavior $ readHoldTracked =<< getDynHold d
-
 {-# INLINE readHoldTracked #-}
 readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
 readHoldTracked h = do
@@ -519,7 +516,7 @@ dynamicConst !a = Dynamic
 
 dynamicDyn :: (HasSpiderTimeline x, Patch p) => Dyn x p -> DynamicS x p
 dynamicDyn !d = Dynamic
-  { dynamicCurrent = behaviorDyn d
+  { dynamicCurrent = Behavior $ readHoldTracked =<< getDynHold d
   , dynamicUpdated = Event $ \sub -> getDynHold d >>= \h -> subscribeHoldEvent h sub
   }
 
