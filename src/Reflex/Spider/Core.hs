@@ -258,15 +258,6 @@ pushCheap !f e = Event $ \sub -> do
   occ' <- join <$> mapM f occ
   return (subscription, occ')
 
--- | A subscriber that never triggers other 'Event's
-{-# INLINE terminalSubscriber #-}
-terminalSubscriber :: (a -> EventM x ()) -> Subscriber x a
-terminalSubscriber p = Subscriber
-  { subscriberPropagate = p
-  , subscriberInvalidateHeight = \_ -> return ()
-  , subscriberRecalculateHeight = \_ -> return ()
-  }
-
 --TODO: Make this lazy in its input event
 headE :: forall x m a. (Defer (SomeInit x) m, HasSpiderTimeline x) => Event x a -> m (Event x a)
 headE originalE = do
@@ -286,7 +277,12 @@ headE originalE = do
   parent <- liftIO $ newIORef $ Just originalE
   defer $ SomeInit $ do --TODO: Rename SomeInit appropriately
     let clearParent = liftIO $ writeIORef parent Nothing
-    (_, occ) <- subscribeAndReadHead originalE $ terminalSubscriber $ const clearParent
+    (_, occ) <- subscribeAndReadHead originalE $
+      Subscriber
+      { subscriberPropagate = \_ -> clearParent
+      , subscriberInvalidateHeight = \_ -> return ()
+      , subscriberRecalculateHeight = \_ -> return ()
+      }
     when (isJust occ) clearParent
   return $ Event $ \sub ->
     liftIO (readIORef parent) >>= \case
