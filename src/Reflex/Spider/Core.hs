@@ -166,9 +166,6 @@ debugInvalidate = False
 class HasNodeId a where
   getNodeId :: a -> Int
 
-instance HasNodeId (Pull x a) where
-  getNodeId = pullNodeId
-
 {-# INLINE showNodeId #-}
 showNodeId :: HasNodeId a => a -> String
 showNodeId = showNodeId' . getNodeId
@@ -754,17 +751,8 @@ data PullSubscribed x a
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
 
--- type role Pull representational nominal
-data Pull x a
-   = Pull { pullValue :: !(IORef (Maybe (PullSubscribed x a)))
-
-#ifdef DEBUG_NODEIDS
-          , pullNodeId :: Int
-#endif
-          }
-
 data Invalidator x
-   = forall a. InvalidatorPull (Pull x a)
+   = InvalidatorPull (IO ())
    | InvalidatorSwitch (SomeMergeUpdate x)
 
 newtype SomeHoldInit x = SomeHoldInit (EventM x ())
@@ -853,7 +841,7 @@ unsafeBuildDynamic readV0 v' =
 instance HasSpiderTimeline x => Functor (Event x) where
   fmap f = push $ return . Just . f
 
-instance Functor (Behavior x) where
+instance HasSpiderTimeline x => Functor (Behavior x) where
   fmap f = pull . fmap f . readBehaviorTracked
 
 {-# INLINE push #-}
@@ -861,28 +849,31 @@ push :: HasSpiderTimeline x => (a -> EventM x (Maybe b)) -> Event x a -> Event x
 push f e = cacheEvent (pushCheap f e)
 
 {-# INLINABLE pull #-}
-pull :: BehaviorM x a -> Behavior x a
+pull :: Defer (SomeMergeUpdate x) (EventM x) => BehaviorM x a -> Behavior x a
 pull a = unsafePerformIO $ do
   ref <- newIORef Nothing
+  invsRef <- newIORef $ error "pull: invsRef uninitialized"
 #ifdef DEBUG_NODEIDS
-  nid <- newNodeId
+  nodeId <- newNodeId
 #endif
+  let i = InvalidatorPull $ do
+            traceInvalidate $ "invalidate: Pull" <> showNodeId' nodeId
+            mVal <- readIORef $ ref
+            forM_ mVal $ \_val -> do
+              writeIORef ref Nothing
+              evaluate =<< invalidate invsRef
   pure $ Behavior $ do
-    (aVal, subscribed) <- liftIO (readIORef ref) >>= \case
+    subscribed <- liftIO (readIORef ref) >>= \case
       Just subscribed -> do
-        askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (pullSubscribedInvalidators subscribed) (wi:))
-        liftIO $ touch $ pullSubscribedOwnInvalidator subscribed
-        return $ (pullSubscribedValue subscribed, subscribed)
+        askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' invsRef (wi:))
+        liftIO $ touch $ i
+        return $ subscribed
       Nothing -> do
-        let i = InvalidatorPull $ Pull ref -- TODO: i had NOINLINE in original code
-#ifdef DEBUG_NODEIDS
-                                                nid
-#endif
         wi <- liftIO $ mkWeakPtrWithDebug i "InvalidatorPull"
         parentsRef <- liftIO $ newIORef []
         (_, !holdInits) <- ask -- ask behavior hold inits
         aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
-        invsRef <- liftIO . newIORef . maybeToList =<< askInvalidator
+        liftIO . writeIORef invsRef . maybeToList =<< askInvalidator
         parents <- liftIO $ readIORef parentsRef
         let subscribed = PullSubscribed
               { pullSubscribedValue = aVal
@@ -891,9 +882,9 @@ pull a = unsafePerformIO $ do
               , pullSubscribedParents = parents
               }
         liftIO $ writeIORef ref $ Just subscribed
-        return (aVal, subscribed)
+        return subscribed
     addParentB (BehaviorSubscribedPull subscribed)
-    pure aVal
+    pure $ pullSubscribedValue subscribed
 
 {-# INLINE commonEvent #-}
 commonEvent :: forall x extra a. HasSpiderTimeline x =>
@@ -944,7 +935,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
   -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
   --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
   --          in Behavior to fix that TODO?
-  parentsRef <- liftIO $ newIORef []
+  parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   commonEvent
@@ -1682,6 +1673,23 @@ clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRe
   writeIORef toClearRootRef []
   writeIORef delayedRef IntMap.empty
 
+
+invalidate :: forall x. (Defer (SomeMergeUpdate x) (EventM x)) => IORef [Weak (Invalidator x)] -> IO ()
+invalidate wisRef = do
+  wis <- readIORef wisRef
+  evaluate <=< forM_ wis $ \wi -> do
+    mi <- deRefWeak wi
+    case mi of
+      Nothing -> void $ traceInvalidate "invalidate Dead" --TODO: Should we clean this up here?
+      Just i -> do
+        finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
+        case i of
+          InvalidatorPull p -> p
+          InvalidatorSwitch someMergeUpdate -> do
+            -- traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
+            runEventM @x $ defer someMergeUpdate
+  writeIORef wisRef []
+
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
@@ -1703,26 +1711,6 @@ runFrame a = SpiderHost $ do
     -- TODO: explain what invalidate does:
     --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them.
     -- TODO: Invalidate used to return an empty list, this might have been in anticipation to the TODO above.
-    let invalidate :: IORef [Weak (Invalidator x)] -> IO ()
-        invalidate wisRef = do
-          wis <- readIORef wisRef
-          evaluate <=< forM_ wis $ \wi -> do
-            mi <- deRefWeak wi
-            case mi of
-              Nothing -> void $ traceInvalidate "invalidate Dead" --TODO: Should we clean this up here?
-              Just i -> do
-                finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
-                case i of
-                  InvalidatorPull p -> do
-                    traceInvalidate $ "invalidate: Pull" <> showNodeId p
-                    mVal <- readIORef $ pullValue p
-                    forM_ mVal $ \val -> do
-                      writeIORef (pullValue p) Nothing
-                      evaluate =<< invalidate (pullSubscribedInvalidators val)
-                  InvalidatorSwitch someMergeUpdate -> do
-                    -- traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed
-                    runEventM @x $ defer someMergeUpdate
-          writeIORef wisRef []
     invalidate iRef
   mergeUpdates <- readIORef (eventEnvMergeUpdates env)
   clearEventEnv env
