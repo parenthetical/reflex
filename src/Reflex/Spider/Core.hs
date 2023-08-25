@@ -724,13 +724,6 @@ newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscri
 
 -- type role PullSubscribed representational nominal
 
-data PullSubscribed x a
-   = PullSubscribed { pullSubscribedValue :: !a
-                    , pullSubscribedInvalidators :: !(IORef [Weak (Invalidator x)])
-                    , pullSubscribedOwnInvalidator :: !(Invalidator x)
-                    , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
-                    }
-
 data Invalidator x
    = InvalidatorPull (IO ())
    | InvalidatorSwitch (IO ())
@@ -827,6 +820,15 @@ instance HasSpiderTimeline x => Functor (Behavior x) where
 {-# INLINE push #-}
 push :: HasSpiderTimeline x => (a -> EventM x (Maybe b)) -> Event x a -> Event x b
 push f e = cacheEvent (pushCheap f e)
+
+
+-- TODO: what is really needed here?
+data PullSubscribed x a
+   = PullSubscribed { pullSubscribedValue :: !a
+                    , pullSubscribedInvalidators :: !(IORef [Weak (Invalidator x)])
+                    , pullSubscribedOwnInvalidator :: !(Invalidator x)
+                    , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
+                    }
 
 {-# INLINABLE pull #-}
 pull :: Defer (SomeMergeUpdate x) (EventM x) => BehaviorM x a -> Behavior x a
