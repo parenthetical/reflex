@@ -31,7 +31,6 @@
 
 module Reflex.Spider.Core where
 #if MIN_VERSION_base(4,10,0)
-import Control.Applicative (liftA2)
 #endif
 import Control.Concurrent
 import Control.Exception
@@ -44,15 +43,10 @@ import Control.Monad.Primitive
 import Control.Monad.Reader.Class
 import Control.Monad.IO.Class
 import Control.Monad.ReaderIO
-import Control.Monad.Ref
-import Control.Monad.Fail (MonadFail)
-import qualified Control.Monad.Fail as MonadFail
-import Data.Align
 import Data.Coerce
 import Data.Dependent.Map (DMap)
 import qualified Data.Dependent.Map as DMap
 import Data.Dependent.Sum (DSum (..))
-import Data.FastMutableIntMap (FastMutableIntMap (..), PatchIntMap (..))
 import qualified Data.FastMutableIntMap as FastMutableIntMap
 import Data.Foldable hiding (concat, elem, sequence_)
 import Data.Functor.Constant
@@ -64,26 +58,21 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.IORef
 import Data.Kind (Type)
 import Data.Maybe hiding (mapMaybe)
-import Data.Monoid (mempty, (<>))
 import Data.Proxy
-import Data.These
 import Data.Traversable
 import Data.Type.Equality ((:~:)(Refl))
-import Data.Witherable (Filterable, mapMaybe)
+import Data.Witherable (mapMaybe)
 import GHC.Exts hiding (toList)
 import GHC.IORef (IORef (..))
 import GHC.Stack
-import Reflex.FastWeak
 import System.IO.Unsafe
 import System.Mem.Weak
 import Unsafe.Coerce
 
 #ifdef MIN_VERSION_semialign
 #if MIN_VERSION_these(0,8,0)
-import Data.These.Combinators (justThese)
 #endif
 #if MIN_VERSION_semialign(1,1,0)
-import Data.Zip (Zip (..))
 #endif
 #endif
 
@@ -94,28 +83,19 @@ import Control.Monad.State hiding (forM, forM_, mapM, mapM_, sequence)
 import Data.List.NonEmpty (NonEmpty (..), nonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Tree (Forest, Tree (..), drawForest)
-import Data.List (isPrefixOf)
 
-import Data.FastWeakBag (FastWeakBag, FastWeakBagTicket)
+import Data.FastWeakBag (FastWeakBag)
 import qualified Data.FastWeakBag as FastWeakBag
 
 import Data.Reflection
 import Data.Some (Some(Some))
-import Data.Type.Coercion
-import Data.Profunctor.Unsafe ((#.), (.#))
-import Data.WeakBag (WeakBag, WeakBagTicket, _weakBag_children)
+import Data.WeakBag (WeakBag, _weakBag_children)
 import qualified Data.WeakBag as WeakBag
-import qualified Reflex.Class
-import qualified Reflex.Class as R
-import qualified Reflex.Host.Class
-import Reflex.NotReady.Class
 import Data.Patch
 import qualified Data.Patch.DMap as PatchDMap
 import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
-import Reflex.PerformEvent.Base (PerformEventT)
-import Data.Patch.DMapWithMove (PatchDMapWithMove(..), From (..), nodeInfoMapFromM, NodeInfo (..))
 import qualified Control.Monad.Writer as W
-import Control.Monad.Writer (WriterT, MonadTrans (..))
+import Control.Monad.Writer (WriterT)
 import Control.Monad.Trans.Maybe
 #ifdef DEBUG_TRACE_EVENTS
 import qualified Data.ByteString.Char8 as BS8
