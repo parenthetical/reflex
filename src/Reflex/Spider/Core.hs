@@ -1301,6 +1301,82 @@ getDynHold d = do
 zeroRef :: IORef Height
 zeroRef = unsafePerformIO $ newIORef zeroHeight
 
+
+newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
+newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
+
+newtype FanSubscribedChildren x k v a = FanSubscribedChildren
+  { _fanSubscribedChildren :: WeakBag (Subscriber x (v a))
+  }
+
+fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
+fanG e = unsafePerformIO $ do
+  -- TODO: no need for Maybe in parentSubscriptionRef? Can do things unsafely instead
+  -- This is the subscription which will update occRef:
+  subscribersRef :: IORef (DMap k (FanSubscribedChildren x k v)) <- newIORef DMap.empty
+  parentSubscriptionRef :: (IORef (EventSubscription x)) <- newIORef $ error "fanG: no subscription"
+  occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
+#ifdef DEBUG_NODEIDS
+  nodeId <- liftIO $ newNodeId
+#endif
+  pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
+    isEmpty <- liftIO $ DMap.null <$> readIORef subscribersRef
+    when isEmpty $ do
+      -- Not initialized: subscribe to parent.
+      (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nodeId) $ Subscriber
+        { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
+            subs <- liftIO $ readIORef subscribersRef
+            tracePropagate (Proxy :: Proxy x) $
+                    show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+            writeAndScheduleClear occRef a
+            _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
+                                          propagate v $ _fanSubscribedChildren subsubs
+                                          return $ Constant ())
+                 $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
+            return ()
+        , subscriberInvalidateHeight = \old -> do
+            subscribers <- readIORef subscribersRef
+            forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+              WeakBag.traverse_ (_fanSubscribedChildren v) $ invalidateSubscriberHeight old
+        , subscriberRecalculateHeight = \new -> do
+            subscribers <- readIORef subscribersRef
+            forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+              WeakBag.traverse_ (_fanSubscribedChildren v) $ recalculateSubscriberHeight new
+        }
+      liftIO $ writeIORef parentSubscriptionRef $ subscription
+      mapM_ (writeAndScheduleClear occRef) parentOcc
+    liftIO $ do
+      sln <- do
+        subscribers <- readIORef subscribersRef
+        list <- case DMap.lookup k subscribers of
+          -- No WeakBag of subscribers yet for this key:
+          Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
+            list <- WeakBag.empty
+            writeIORef subscribersRef $! DMap.insert k (FanSubscribedChildren list) subscribers
+            pure list
+          Just (FanSubscribedChildren list) -> {-# SCC "hitSubscribeFanSubscribed" #-} pure list
+        WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
+          reducedSubscribers <- DMap.delete k <$> readIORef subscribersRef
+          writeIORef subscribersRef $! reducedSubscribers
+          -- When we don't have any subscribers, unsubscribe from e
+          when (DMap.null reducedSubscribers) $ do
+            unsubscribe =<< readIORef parentSubscriptionRef
+            writeIORef parentSubscriptionRef (error "fanG: parentSubscriptionRef emptied")
+      subscribedParent <- liftIO $ _eventSubscription_subscribed <$> readIORef parentSubscriptionRef
+      ( EventSubscription
+              (WeakBag.remove sln >> touch sln)
+              (EventSubscribed
+               { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
+               , eventSubscribedRetained = toAny (sln, parentSubscriptionRef)
+#ifdef DEBUG_CYCLES
+               , eventSubscribedGetParents = return [subscribedParent]
+               , eventSubscribedHasOwnHeightRef = False
+               , eventSubscribedWhoCreated = whoCreatedIORef $ parentSubscriptionRef
+#endif
+               })
+            ,)
+        <$> ((DMap.lookup k =<<) <$> liftIO (readIORef occRef))
+
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
 fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
@@ -1576,81 +1652,6 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
        guard (not (outputIsEmpty dm))
        liftIO $ writeIORef accumRef mempty
        pure dm
-
-newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
-newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
-
-newtype FanSubscribedChildren x k v a = FanSubscribedChildren
-  { _fanSubscribedChildren :: WeakBag (Subscriber x (v a))
-  }
-
-fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
-fanG e = unsafePerformIO $ do
-  -- TODO: no need for Maybe in parentSubscriptionRef? Can do things unsafely instead
-  -- This is the subscription which will update occRef:
-  subscribersRef :: IORef (DMap k (FanSubscribedChildren x k v)) <- newIORef DMap.empty
-  parentSubscriptionRef :: (IORef (EventSubscription x)) <- newIORef $ error "fanG: no subscription"
-  occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
-#ifdef DEBUG_NODEIDS
-  nodeId <- liftIO $ newNodeId
-#endif
-  pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
-    isEmpty <- liftIO $ DMap.null <$> readIORef subscribersRef
-    when isEmpty $ do
-      -- Not initialized: subscribe to parent.
-      (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nodeId) $ Subscriber
-        { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-            subs <- liftIO $ readIORef subscribersRef
-            tracePropagate (Proxy :: Proxy x) $
-                    show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
-            writeAndScheduleClear occRef a
-            _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
-                                          propagate v $ _fanSubscribedChildren subsubs
-                                          return $ Constant ())
-                 $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
-            return ()
-        , subscriberInvalidateHeight = \old -> do
-            subscribers <- readIORef subscribersRef
-            forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-              WeakBag.traverse_ (_fanSubscribedChildren v) $ invalidateSubscriberHeight old
-        , subscriberRecalculateHeight = \new -> do
-            subscribers <- readIORef subscribersRef
-            forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-              WeakBag.traverse_ (_fanSubscribedChildren v) $ recalculateSubscriberHeight new
-        }
-      liftIO $ writeIORef parentSubscriptionRef $ subscription
-      mapM_ (writeAndScheduleClear occRef) parentOcc
-    liftIO $ do
-      sln <- do
-        subscribers <- readIORef subscribersRef
-        list <- case DMap.lookup k subscribers of
-          -- No WeakBag of subscribers yet for this key:
-          Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
-            list <- WeakBag.empty
-            writeIORef subscribersRef $! DMap.insert k (FanSubscribedChildren list) subscribers
-            pure list
-          Just (FanSubscribedChildren list) -> {-# SCC "hitSubscribeFanSubscribed" #-} pure list
-        WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
-          reducedSubscribers <- DMap.delete k <$> readIORef subscribersRef
-          writeIORef subscribersRef $! reducedSubscribers
-          -- When we don't have any subscribers, unsubscribe from e
-          when (DMap.null reducedSubscribers) $ do
-            unsubscribe =<< readIORef parentSubscriptionRef
-            writeIORef parentSubscriptionRef (error "fanG: parentSubscriptionRef emptied")
-      subscribedParent <- liftIO $ _eventSubscription_subscribed <$> readIORef parentSubscriptionRef
-      ( EventSubscription
-              (WeakBag.remove sln >> touch sln)
-              (EventSubscribed
-               { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
-               , eventSubscribedRetained = toAny (sln, parentSubscriptionRef)
-#ifdef DEBUG_CYCLES
-               , eventSubscribedGetParents = return [subscribedParent]
-               , eventSubscribedHasOwnHeightRef = False
-               , eventSubscribedWhoCreated = whoCreatedIORef $ parentSubscriptionRef
-#endif
-               })
-            ,)
-        <$> ((DMap.lookup k =<<) <$> liftIO (readIORef occRef))
 
 -- TODO: Getting rid of all these different types which get initialized at the same time anyway
 --   might lead to patterns showing up in code.
