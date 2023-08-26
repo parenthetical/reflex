@@ -313,7 +313,17 @@ now = do
   scheduleClear nowOrNot
   return . Event $ \_ -> do
     occ <- liftIO . readIORef $ nowOrNot
-    return ( EventSubscription (return ()) eventSubscribedNow
+    return ( EventSubscription
+             (return ())
+             (EventSubscribed
+              { eventSubscribedHeightRef = zeroRef
+              , eventSubscribedRetained = toAny ()
+#ifdef DEBUG_CYCLES
+              , eventSubscribedGetParents = return []
+              , eventSubscribedHasOwnHeightRef = False
+              , eventSubscribedWhoCreated = return ["now"]
+#endif
+              })
            , occ
            )
 
@@ -367,7 +377,17 @@ subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
 subscribe e s = fst <$> subscribeAndRead e s
 
 subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
-subscribeAndReadNever = return (EventSubscription (return ()) eventSubscribedNever, Nothing)
+subscribeAndReadNever = return (EventSubscription (return ())
+                                (EventSubscribed
+                                  { eventSubscribedHeightRef = zeroRef
+                                  , eventSubscribedRetained = toAny ()
+#ifdef DEBUG_CYCLES
+                                  , eventSubscribedGetParents = return []
+                                  , eventSubscribedHasOwnHeightRef = False
+                                  , eventSubscribedWhoCreated = return ["never"]
+#endif
+                                  }),
+                                Nothing)
 
 eventNever :: Event x a
 eventNever = Event $ const subscribeAndReadNever
@@ -421,28 +441,6 @@ data EventSubscribed x = EventSubscribed
   , eventSubscribedGetParents :: !(IO [EventSubscribed x]) -- For debugging loops
   , eventSubscribedHasOwnHeightRef :: !Bool
   , eventSubscribedWhoCreated :: !(IO [String])
-#endif
-  }
-
-eventSubscribedNever :: EventSubscribed x
-eventSubscribedNever = EventSubscribed
-  { eventSubscribedHeightRef = zeroRef
-  , eventSubscribedRetained = toAny ()
-#ifdef DEBUG_CYCLES
-  , eventSubscribedGetParents = return []
-  , eventSubscribedHasOwnHeightRef = False
-  , eventSubscribedWhoCreated = return ["never"]
-#endif
-  }
-
-eventSubscribedNow :: EventSubscribed x
-eventSubscribedNow = EventSubscribed
-  { eventSubscribedHeightRef = zeroRef
-  , eventSubscribedRetained = toAny ()
-#ifdef DEBUG_CYCLES
-  , eventSubscribedGetParents = return []
-  , eventSubscribedHasOwnHeightRef = False
-  , eventSubscribedWhoCreated = return ["now"]
 #endif
   }
 
