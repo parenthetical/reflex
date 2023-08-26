@@ -873,7 +873,7 @@ data PullSubscribed x a
                     }
 
 {-# INLINABLE pull #-}
-pull :: Defer (SomeMergeUpdate x) (EventM x) => BehaviorM x a -> Behavior x a
+pull :: BehaviorM x a -> Behavior x a
 pull a = unsafePerformIO $ do
   ref <- newIORef Nothing
   invsRef <- newIORef $ error "pull: invsRef uninitialized"
@@ -1695,7 +1695,7 @@ clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRe
   writeIORef delayedRef IntMap.empty
 
 
-invalidate :: forall x. (Defer (SomeMergeUpdate x) (EventM x)) => IORef [Weak (Invalidator x)] -> IO ()
+invalidate :: forall x. IORef [Weak (Invalidator x)] -> IO ()
 invalidate wisRef = do
   wis <- readIORef wisRef
   evaluate <=< forM_ wis $ \wi -> do
