@@ -147,6 +147,16 @@ import Data.List (isPrefixOf)
 #endif
 
 
+whenNothing :: Applicative f => Maybe a -> f () -> f ()
+whenNothing c m = case c of
+  Nothing -> m
+  Just _ -> pure ()
+
+whenNothingRef :: MonadIO m => IORef (Maybe a) -> m () -> m ()
+whenNothingRef ref m = do
+  c <- liftIO $ readIORef ref
+  whenNothing c m
+
 whenM :: Monad m => m Bool -> m () -> m ()
 whenM mcond m = mcond >>= flip when m
 
@@ -287,9 +297,7 @@ headE originalE = do
               liftIO $ unsubscribe =<< readIORef subscriptionRef
               subscriberPropagate sub a
           }
-        liftIO $ case occ of
-          Nothing -> writeIORef subscriptionRef $! subscription
-          Just _ -> unsubscribe subscription
+        liftIO $ maybe (writeIORef subscriptionRef $! subscription) (const (unsubscribe subscription)) occ
         return (subscription, occ)
   parent <- liftIO $ newIORef $ Just originalE
   defer $ SomeInit $ do --TODO: Rename SomeInit appropriately
@@ -302,12 +310,9 @@ headE originalE = do
       }
     when (isJust occ) clearParent
   return $ Event $ \sub ->
-    liftIO (readIORef parent) >>= \case
-      Nothing -> subscribeAndReadNever
-      Just e -> subscribeAndReadHead e sub
+    liftIO (readIORef parent) >>= maybe subscribeAndReadNever (`subscribeAndReadHead` sub)
 
-now :: ( MonadIO m, Defer (Some Clear) m, HasSpiderTimeline x
-        ) => m (Event x ())
+now :: (Defer (Some Clear) m) => m (Event x ())
 now = do
   nowOrNot <- liftIO $ newIORef $ Just ()
   scheduleClear nowOrNot
@@ -688,17 +693,13 @@ hold v0 e = do
                   invalidators <- liftIO $ readIORef $ invsRef
                   return $ "SubscriberHold" <> showNodeId' nodeId <> ": " ++ show (length invalidators)
         v <- {-# SCC "read" #-} liftIO $ readIORef $ valRef
-        case ({-# SCC "apply" #-} apply a v) of 
-          Nothing -> return ()
-          Just v' -> do
+        forM_ ({-# SCC "apply" #-} apply a v) $ \v' -> do
             {-# SCC "trace2" #-} withIncreasedDepth (Proxy :: Proxy x) $
               tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId' nodeId)
             vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ valRef
             iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ invsRef
             defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
-  defer $ SomeHoldInit $ do
-      liftIO (readIORef parentRef) >>= \case
-        Nothing -> do
+  defer $ SomeHoldInit $ whenNothingRef parentRef $ do
           (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
              { subscriberPropagate = {-# SCC "traverseHold" #-} deferAssignment
              , subscriberInvalidateHeight = \_ -> return ()
@@ -706,7 +707,6 @@ hold v0 e = do
              }
           mapM_ deferAssignment occ
           liftIO $ writeIORef parentRef $ Just subscription
-        Just _ -> pure ()
   return $ Hold
         { holdValue = valRef
         , holdInvalidators = invsRef
@@ -779,9 +779,7 @@ heightBagRemoveMaybe (Height h) (HeightBag s c) = heightBagVerify . removed <$> 
     _ -> IntMap.insert h (pred old) c
 
 heightBagMax :: HeightBag -> Height
-heightBagMax (HeightBag _ c) = case IntMap.maxViewWithKey c of
-  Just ((h, _), _) -> Height h
-  Nothing -> zeroHeight
+heightBagMax (HeightBag _ c) = maybe zeroHeight (\((h, _), _) -> Height h) . IntMap.maxViewWithKey $ c
 
 heightBagVerify :: HeightBag -> HeightBag
 #ifdef DEBUG
@@ -878,7 +876,6 @@ commonEvent :: forall x extra a. HasSpiderTimeline x =>
   IO [EventSubscribed x] ->
   ((forall a1. String -> ((a -> EventM x ()) -> a1 -> EventM x ()) -> Subscriber x a1)
    -> IORef Height
-   -> Subscriber x a
    -> EventM x (Maybe a, Height, extra)) ->
   Subscriber x a ->
   EventM x (EventSubscription x, Maybe a)
@@ -896,7 +893,6 @@ commonEvent cleanupSpecific eventSubscribedGetParents_ foo sub = do
           , subscriberRecalculateHeight = updateCommonHeight heightRef sub
           })
     heightRef
-    sub
   liftIO $ writeIORef heightRef height
   liftIO $ writeIORef toRetainRef $ (sub, toRetainSpecific) -- TODO: is toRetain correct?
   pure ( EventSubscription
@@ -929,7 +925,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         finalize =<< readIORef ownWeakInvalidatorRef) -- We don't need to get invalidated if we're dead
     (do s <- readIORef currentParentSubscriptionRef
         return [_eventSubscription_subscribed s])
-    (\newSubscriber heightRef sub -> do
+    (\newSubscriber heightRef -> do
         let subscriber = newSubscriber "SubscriberSwitch" id
         ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ InvalidatorSwitch $  -- traceInvalidate $ "invalidate: Switch" <> showNodeId subscribed           
          runEventM @x $ defer $ SomeMergeUpdate @x
@@ -990,17 +986,13 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   commonEvent
     (unsubscribe =<< readIORef outerParentSubscriptionRef) -- TODO: switch does the same but also finalizes OwnWeakInvalidator
     getParentSubscribeds
-    (\newSubscriber heightRef sub -> do
+    (\newSubscriber heightRef -> do
         let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
             subscribeCoincidenceInner inner outerHeight = do
               (subscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
-                subscribeAndReadWithHeight inner $ newSubscriber "SubscriberCoincidenceInner" $ \doPropagate a -> do
-                     occ <- liftIO $ readIORef occRef
-                     case occ of
-                       Just _ -> return () -- SubscriberCoincidenceOuter must have already propagated this event
-                       Nothing -> do
-                         writeAndScheduleClear occRef a
-                         doPropagate a
+                subscribeAndReadWithHeight inner
+                $ newSubscriber "SubscriberCoincidenceInner"
+                $ \doPropagate a -> whenNothingRef occRef (writeAndScheduleClear occRef a >> doPropagate a)
               writeAndScheduleClear innerSubdRef innerSubd
               let innerHeightWasHigher = innerHeight > outerHeight
               defer $ SomeMergeUpdate @x
@@ -1055,17 +1047,14 @@ run roots after = do
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
       propagate a subscribersRef
     delayedRef <- asksEventEnv eventEnvDelayedMerges
-    let go = do
+    fix $ \go -> do
           delayed <- liftIO $ readIORef delayedRef
-          case IntMap.minViewWithKey delayed of
-            Nothing -> return ()
-            Just ((currentHeight, cur), future) -> do
+          forM_ (IntMap.minViewWithKey delayed) $ \((currentHeight, cur), future) -> do
               tracePropagate (Proxy :: Proxy x) $ "Running height " ++ show currentHeight
               putCurrentHeight $ Height currentHeight
               liftIO $ writeIORef delayedRef $! future
               sequence_ cur
               go
-    go
     putCurrentHeight maxBound
     after
   tracePropagate (Proxy :: Proxy x) "Done running an event frame"
@@ -1342,13 +1331,11 @@ fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
     liftIO $ do
       sln <- do
         subscribers <- readIORef subscribersRef
-        list <- case lookup subscribers of
-          -- No WeakBag of subscribers yet for this key:
-          Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
+        list <- flip fromMaybe (pure <$> lookup subscribers) $ {-# SCC "missSubscribeFanSubscribed" #-} do
+            -- No WeakBag of subscribers yet for this key:
             list <- WeakBag.empty
             writeIORef subscribersRef $! insert list subscribers
             pure list
-          Just list -> {-# SCC "hitSubscribeFanSubscribed" #-} pure list
         WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
           reducedSubscribers <- delete <$> readIORef subscribersRef
           writeIORef subscribersRef $! reducedSubscribers
