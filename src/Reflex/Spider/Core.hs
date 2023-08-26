@@ -697,9 +697,7 @@ hold v0 e = do
             iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ invsRef
             defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
   defer $ SomeHoldInit $ do
-      ep <- liftIO $ readIORef $ parentRef
-      case ep of
-        Just _subd -> pure ()
+      liftIO (readIORef parentRef) >>= \case
         Nothing -> do
           (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
              { subscriberPropagate = {-# SCC "traverseHold" #-} deferAssignment
@@ -708,6 +706,7 @@ hold v0 e = do
              }
           mapM_ deferAssignment occ
           liftIO $ writeIORef parentRef $ Just subscription
+        Just _ -> pure ()
   return $ Hold
         { holdValue = valRef
         , holdInvalidators = invsRef
