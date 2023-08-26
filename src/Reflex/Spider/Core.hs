@@ -701,13 +701,11 @@ hold v0 e = do
       case ep of
         Just _subd -> pure ()
         Nothing -> do
-          subscriptionRef <- liftIO $ newIORef $ error "getHoldEventSubscription: subdRef uninitialized"
           (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
              { subscriberPropagate = {-# SCC "traverseHold" #-} deferAssignment
              , subscriberInvalidateHeight = \_ -> return ()
              , subscriberRecalculateHeight = \_ -> return ()
              }
-          liftIO $ writeIORef subscriptionRef $! subscription
           mapM_ deferAssignment occ
           liftIO $ writeIORef parentRef $ Just subscription
   return $ Hold
