@@ -101,7 +101,6 @@ import Data.Coerce
 import Data.Dependent.Map (DMap)
 import qualified Data.Dependent.Map as DMap
 import Data.Dependent.Sum (DSum (..))
-import qualified Data.FastMutableIntMap as FastMutableIntMap
 import Data.Foldable hiding (concat, elem, sequence_)
 import Data.Functor.Constant
 import Data.Functor.Misc
@@ -130,9 +129,6 @@ import Control.Monad.State hiding (forM, forM_, mapM, mapM_, sequence)
 import Data.List.NonEmpty (NonEmpty (..), nonEmpty)
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Tree (Forest, Tree (..), drawForest)
-
-import Data.FastWeakBag (FastWeakBag)
-import qualified Data.FastWeakBag as FastWeakBag
 
 import Data.Reflection
 import Data.Some (Some(Some))
@@ -406,6 +402,8 @@ data Subscriber x a = Subscriber
   , subscriberRecalculateHeight :: !(Height -> IO ())
   }
 
+type SomeSubscriber x = Some (Subscriber x)
+
 invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
 invalidateSubscriberHeight = flip subscriberInvalidateHeight
 
@@ -418,13 +416,6 @@ propagate a subscribers = withIncreasedDepth (Proxy::Proxy x) $
   -- Note: in the following traversal, we do not visit nodes that are added to the list during our traversal; they are new events, which will necessarily have full information already, so there is no need to traverse them
   --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
   WeakBag.traverse_ subscribers $ \s -> subscriberPropagate s a
-
--- | Propagate everything at the current height
-propagateFast :: forall x a. HasSpiderTimeline x => a -> FastWeakBag (Subscriber x a) -> EventM x ()
-propagateFast a subscribers = withIncreasedDepth (Proxy::Proxy x) $
-  -- Note: in the following traversal, we do not visit nodes that are added to the list during our traversal; they are new events, which will necessarily have full information already, so there is no need to traverse them
-  --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
-  FastWeakBag.traverse_ subscribers $ \s -> subscriberPropagate s a
 
 --------------------------------------------------------------------------------
 -- EventSubscribed
@@ -592,7 +583,6 @@ data EventEnv x
               , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
               , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Some Clear]) -- Needed for Subscribe
-              , eventEnvIntClears :: !(IORef [Some IntClear])
               , eventEnvRootClears :: !(IORef [Some RootClear])
               , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
               , eventEnvDelayedMerges :: !(IORef (IntMap [EventM x ()]))
@@ -675,21 +665,6 @@ writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
   scheduleClear ref
 
-{-# INLINE writeAndScheduleIntClear #-}
-writeAndScheduleIntClear :: Defer (Some IntClear) m => IORef (IntMap a) -> IntMap a -> m ()
-writeAndScheduleIntClear ref val = do
-  liftIO $ writeIORef ref val
-  scheduleIntClear ref
-
-
-instance HasSpiderTimeline x => Defer (Some IntClear) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvIntClears
-
-{-# INLINE scheduleIntClear #-}
-scheduleIntClear :: Defer (Some IntClear) m => IORef (IntMap a) -> m ()
-scheduleIntClear r = defer $ Some $ IntClear r
-
 instance HasSpiderTimeline x => Defer (Some RootClear) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvRootClears
@@ -740,6 +715,7 @@ hold v0 e = do
               case apply o old of
                 Nothing -> return ()
                 Just new -> do
+                  -- TODO: identical code above
                   -- Need to evaluate these so that we don't retain the Hold itself
                   v <- liftIO $ evaluate $ valRef
                   i <- liftIO $ evaluate $ invsRef
@@ -1111,8 +1087,6 @@ run roots after = do
 
 newtype Clear a = Clear (IORef (Maybe a))
 
-newtype IntClear a = IntClear (IORef (IntMap a))
-
 newtype RootClear k = RootClear (IORef (DMap k Identity))
 
 data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak (Invalidator x)]) a
@@ -1305,64 +1279,95 @@ getDynHold d = do
 zeroRef :: IORef Height
 zeroRef = unsafePerformIO $ newIORef zeroHeight
 
-
-newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
-newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
-
-newtype FanSubscribedChildren x k v a = FanSubscribedChildren
-  { _fanSubscribedChildren :: WeakBag (Subscriber x (v a))
-  }
-
 fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
-fanG e = unsafePerformIO $ do
+fanG =
+  fan
+  (DMap.null :: (DMap k (FanSubscribedChildren x k v) -> Bool))
+  (\f subscribers -> forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
+              WeakBag.traverse_ (_fanSubscribedChildren v) f)
+  ((\f -> EventSelectorG $ \(!k) -> unsafeCoerce f
+    ( fmap _fanSubscribedChildren . DMap.lookup k
+    , DMap.lookup k
+    , DMap.insert k . FanSubscribedChildren
+    , DMap.delete k
+    , (\a subs ->
+         void
+         $ DMap.traverseWithKey (\_ (Pair v subsubs) -> do
+                                          propagate @x v $ _fanSubscribedChildren subsubs
+                                          return $ Constant ())
+         $ DMap.intersectionWithKey @k (const Pair) a subs)
+    )))
+
+fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
+fanInt =
+  fan
+  IntMap.null
+  (\f subscribers -> forM_ (IntMap.elems subscribers) $ \v -> WeakBag.traverse_ v f)
+  ((\f -> EventSelectorInt $ \(!k) -> f
+     ( IntMap.lookup k
+     , IntMap.lookup k
+     , IntMap.insert k
+     , IntMap.delete k
+     , \a -> sequence_ . IntMap.intersectionWith propagate a
+     )))
+  
+newtype SomeSubscribers x = SomeSubscribers (forall a. WeakBag (Subscriber x a))
+
+{-# INLINE fan #-}
+fan :: forall {a1} {x1} {a2} {a3}
+       {a5}.
+  (Monoid a1, HasSpiderTimeline x1) =>
+  (a1 -> Bool)
+  -> ((forall a. Subscriber x1 a -> IO ()) -> a1 -> IO ())
+  -> (((a1 -> Maybe (WeakBag (Subscriber x1 a2)),
+        a3 -> Maybe a2,
+        WeakBag (Subscriber x1 a2) -> a1 -> a1,
+        a1 -> a1,
+        a3 -> a1 -> EventM x1 ()) -> Event x1 a2)
+      -> a5)
+  -> Event x1 a3
+  -> a5
+fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
   -- TODO: no need for Maybe in parentSubscriptionRef? Can do things unsafely instead
   -- This is the subscription which will update occRef:
-  subscribersRef :: IORef (DMap k (FanSubscribedChildren x k v)) <- newIORef DMap.empty
-  parentSubscriptionRef :: (IORef (EventSubscription x)) <- newIORef $ error "fanG: no subscription"
-  occRef :: IORef (Maybe (DMap k v)) <- newIORef Nothing
+  subscribersRef <- newIORef mempty
+  parentSubscriptionRef <- newIORef $ error "fanG: no subscription"
+  occRef <- newIORef Nothing
 #ifdef DEBUG_NODEIDS
   nodeId <- liftIO $ newNodeId
 #endif
-  pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
-    whenM (liftIO $ DMap.null <$> readIORef subscribersRef) $ do
+  pure $ eventSelector $ \(lookup,lookup2,insert,delete,doPropagation) -> Event $ \sub -> do
+    whenM (liftIO $ isNull <$> readIORef subscribersRef) $ do
       -- Not initialized: subscribe to parent.
       (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nodeId) $ Subscriber
         { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
             subs <- liftIO $ readIORef subscribersRef
-            tracePropagate (Proxy :: Proxy x) $
-                    show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
+            -- tracePropagate (Proxy :: Proxy x) $
+            --         show (DMap.size subs) <> " keys subscribed, " <> show (DMap.size a) <> " keys firing"
             writeAndScheduleClear occRef a
-            _ <- DMap.traverseWithKey (\_ (Pair v subsubs) -> do
-                                          propagate v $ _fanSubscribedChildren subsubs
-                                          return $ Constant ())
-                 $ DMap.intersectionWithKey (const Pair) a subs --TODO: Would be nice to have DMap.traverse_
-            return ()
-        , subscriberInvalidateHeight = \old -> do
-            subscribers <- readIORef subscribersRef
-            forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-              WeakBag.traverse_ (_fanSubscribedChildren v) $ invalidateSubscriberHeight old
-        , subscriberRecalculateHeight = \new -> do
-            subscribers <- readIORef subscribersRef
-            forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-              WeakBag.traverse_ (_fanSubscribedChildren v) $ recalculateSubscriberHeight new
+            doPropagation a subs
+        , subscriberInvalidateHeight = \old ->
+            traverseWeakBags (invalidateSubscriberHeight old) =<< readIORef subscribersRef
+        , subscriberRecalculateHeight = \new ->
+            traverseWeakBags (recalculateSubscriberHeight new) =<< readIORef subscribersRef
         }
       liftIO $ writeIORef parentSubscriptionRef $ subscription
       mapM_ (writeAndScheduleClear occRef) parentOcc
     liftIO $ do
       sln <- do
         subscribers <- readIORef subscribersRef
-        list <- case DMap.lookup k subscribers of
+        list <- case lookup subscribers of
           -- No WeakBag of subscribers yet for this key:
           Nothing -> {-# SCC "missSubscribeFanSubscribed" #-} do
             list <- WeakBag.empty
-            writeIORef subscribersRef $! DMap.insert k (FanSubscribedChildren list) subscribers
+            writeIORef subscribersRef $! insert list subscribers
             pure list
-          Just (FanSubscribedChildren list) -> {-# SCC "hitSubscribeFanSubscribed" #-} pure list
+          Just list -> {-# SCC "hitSubscribeFanSubscribed" #-} pure list
         WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
-          reducedSubscribers <- DMap.delete k <$> readIORef subscribersRef
+          reducedSubscribers <- delete <$> readIORef subscribersRef
           writeIORef subscribersRef $! reducedSubscribers
           -- When we don't have any subscribers, unsubscribe from e
-          when (DMap.null reducedSubscribers) $ do
+          when (isNull reducedSubscribers) $ do
             unsubscribe =<< readIORef parentSubscriptionRef
             writeIORef parentSubscriptionRef (error "fanG: parentSubscriptionRef emptied")
       subscribedParent <- liftIO $ _eventSubscription_subscribed <$> readIORef parentSubscriptionRef
@@ -1378,60 +1383,16 @@ fanG e = unsafePerformIO $ do
 #endif
                })
             ,)
-        <$> ((DMap.lookup k =<<) <$> liftIO (readIORef occRef))
+        <$> ((lookup2 =<<) <$> liftIO (readIORef occRef))
+
+newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
+newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
+
+newtype FanSubscribedChildren x k v a = FanSubscribedChildren
+  { _fanSubscribedChildren :: WeakBag (Subscriber x (v a))
+  }
 
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
-
-fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
-fanInt p = unsafePerformIO $ do
-  subscribers <- FastMutableIntMap.newEmpty --TODO: Clean up the keys in here when their child weak bags get empty --TODO: Remove our own subscription when the subscribers list is completely empty
-  subscriptionRef <- newIORef $ error "fanInt: no subscription"
-  occRef <- newIORef mempty
-#ifdef DEBUG_NODEIDS
-  nodeId <- newNodeId
-#endif
-  pure $ EventSelectorInt $ \k -> Event $ \sub -> do
-    isEmpty <- liftIO $ FastMutableIntMap.isEmpty subscribers
-    when isEmpty $ do -- This is the first subscriber, so we need to subscribe to our input
-      let desc = "fanInt" <> showNodeId' nodeId <> ", k = "  <> show k
-      (subscription, parentOcc) <- subscribeAndRead p $ debugSubscriber' desc $ Subscriber
-        { subscriberPropagate = \m -> do
-            -- TODO: this is like writeAndScheduleClearAndPropagate
-            writeAndScheduleIntClear occRef m
-            FastMutableIntMap.forIntersectionWithImmutable_ subscribers m $ \b v ->  --TODO: Do we need to know that no subscribers are being added as we traverse?
-              propagateFast v b
-        , subscriberInvalidateHeight = \old ->
-            FastMutableIntMap.for_ subscribers $ \b ->
-              FastWeakBag.traverse_ b $ \s ->
-                subscriberInvalidateHeight s old
-        , subscriberRecalculateHeight = \new ->
-            FastMutableIntMap.for_ subscribers $ \b ->
-              FastWeakBag.traverse_ b $ \s ->
-                subscriberRecalculateHeight s new
-        }
-      liftIO $ writeIORef subscriptionRef subscription
-      mapM_ (writeAndScheduleIntClear occRef) parentOcc
-    liftIO $ do
-      b <- FastMutableIntMap.lookup subscribers k >>= \case
-        Nothing -> do
-          b <- FastWeakBag.empty
-          FastMutableIntMap.insert subscribers k b
-          return b
-        Just b -> return b
-      ticket <- liftIO $ FastWeakBag.insert sub b
-      currentOcc <- readIORef occRef
-      subscribed <- do
-        subscribedParent <- _eventSubscription_subscribed <$> readIORef subscriptionRef
-        return $ EventSubscribed
-          { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
-          , eventSubscribedRetained = toAny (subscriptionRef, ticket)
-#ifdef DEBUG_CYCLES
-          , eventSubscribedGetParents = return [subscribedParent]
-          , eventSubscribedHasOwnHeightRef = False
-          , eventSubscribedWhoCreated = whoCreatedIORef subscriptionRef
-#endif
-          }
-      return (EventSubscription (FastWeakBag.remove ticket) subscribed, IntMap.lookup k currentOcc)
 
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt =
@@ -1677,20 +1638,18 @@ newEventEnv = do
   initRef <- newIORef []
   heightRef <- newIORef zeroHeight
   toClearRef <- newIORef []
-  toClearIntRef <- newIORef []
   toClearRootRef <- newIORef []
   delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef
+  return $ EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef
 
 clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearIntRef toClearRootRef heightRef delayedRef) = do
+clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef) = do
   writeIORef toAssignRef []
   writeIORef holdInitRef []
   writeIORef mergeUpdateRef []
   writeIORef initRef []
   writeIORef heightRef zeroHeight
   writeIORef toClearRef []
-  writeIORef toClearIntRef []
   writeIORef toClearRootRef []
   writeIORef delayedRef IntMap.empty
 
@@ -1719,8 +1678,6 @@ runFrame a = SpiderHost $ do
         return result
   toClear <- readIORef $ eventEnvClears env
   forM_ toClear $ \(Some (Clear ref)) -> {-# SCC "clear" #-} writeIORef ref Nothing
-  toClearInt <- readIORef $ eventEnvIntClears env
-  forM_ toClearInt $ \(Some (IntClear ref)) -> {-# SCC "intClear" #-} writeIORef ref $! IntMap.empty
   toClearRoot <- readIORef $ eventEnvRootClears env
   forM_ toClearRoot $ \(Some (RootClear ref)) -> {-# SCC "rootClear" #-} writeIORef ref $! DMap.empty
   toAssign <- readIORef $ eventEnvAssignments env
