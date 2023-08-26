@@ -29,9 +29,63 @@
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE TypeApplications #-}
 
-module Reflex.Spider.Core where
-#if MIN_VERSION_base(4,10,0)
-#endif
+module Reflex.Spider.Core
+( EventSelectorG(selectG),
+      EventSelector(select),
+      EventSelectorInt(selectInt),
+      Dyn,
+      EventM(EventM),
+      BehaviorM(BehaviorM),
+      HasSpiderTimeline,
+      SpiderTimelineEnv,
+      Global,
+      Dynamic(dynamicUpdated, dynamicCurrent),
+      DynamicS,
+      Behavior(..),
+      Subscriber(Subscriber, subscriberRecalculateHeight,
+                 subscriberPropagate, subscriberInvalidateHeight),
+      Event(Event),
+      pushCheap,
+      headE,
+      now,
+      subscribe,
+      eventNever,
+      behaviorHoldIdentity,
+      behaviorConst,
+      readBehaviorUntracked,
+      dynamicHold,
+      dynamicHoldIdentity,
+      dynamicConst,
+      dynamicDyn,
+      dynamicDynIdentity,
+      writeAndScheduleClear,
+      hold,
+      newMapDyn,
+      buildDynamic,
+      unsafeBuildDynamic,
+      push,
+      pull,
+      switch,
+      coincidence,
+      run,
+      fanInt,
+      mergeInt,
+      mergeG,
+      mergeWithMove,
+      fanG,
+      runFrame,
+      SpiderPushM(..),
+      SpiderPullM(..),
+      SpiderEventHandle(..),
+      RootTrigger,
+      SpiderHost(SpiderHost),
+      newFanEventWithTriggerIO,
+      newSpiderTimeline,
+      withSpiderTimeline,
+      subscribeAndRead,
+      EventLoopException
+      )
+where
 import Control.Concurrent
 import Control.Exception
 import Control.Monad hiding (forM, forM_, mapM, mapM_)
@@ -69,13 +123,6 @@ import System.IO.Unsafe
 import System.Mem.Weak
 import Unsafe.Coerce
 
-#ifdef MIN_VERSION_semialign
-#if MIN_VERSION_these(0,8,0)
-#endif
-#if MIN_VERSION_semialign(1,1,0)
-#endif
-#endif
-
 #ifdef DEBUG_CYCLES
 import Control.Monad.State hiding (forM, forM_, mapM, mapM_, sequence)
 #endif
@@ -89,7 +136,7 @@ import qualified Data.FastWeakBag as FastWeakBag
 
 import Data.Reflection
 import Data.Some (Some(Some))
-import Data.WeakBag (WeakBag, _weakBag_children)
+import Data.WeakBag (WeakBag)
 import qualified Data.WeakBag as WeakBag
 import Data.Patch
 import qualified Data.Patch.DMap as PatchDMap
@@ -142,13 +189,6 @@ debugInvalidate = True
 #else
 debugInvalidate = False
 #endif
-
-class HasNodeId a where
-  getNodeId :: a -> Int
-
-{-# INLINE showNodeId #-}
-showNodeId :: HasNodeId a => a -> String
-showNodeId = showNodeId' . getNodeId
 
 showNodeId' :: Int -> String
 showNodeId' = ("#"<>) . show
@@ -1090,9 +1130,6 @@ type CanTrace x m = (HasSpiderTimeline x, MonadIO m)
 
 
 #ifdef DEBUG
-
-debugSubscriber :: forall x a. HasSpiderTimeline x => String -> Subscriber x a -> IO (Subscriber x a)
-debugSubscriber description = return . debugSubscriber' description
 
 debugSubscriber' :: forall x a. HasSpiderTimeline x => String -> Subscriber x a -> Subscriber x a
 debugSubscriber' description subscribed = Subscriber
