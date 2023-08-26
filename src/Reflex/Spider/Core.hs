@@ -683,6 +683,19 @@ hold v0 e = do
 #ifdef DEBUG_NODEIDS
   nodeId <- liftIO newNodeId
 #endif
+  let deferAssignment a = do
+        {-# SCC "trace" #-} when debugPropagate $ traceM (Proxy :: Proxy x) $ liftIO $ do
+                  invalidators <- liftIO $ readIORef $ invsRef
+                  return $ "SubscriberHold" <> showNodeId' nodeId <> ": " ++ show (length invalidators)
+        v <- {-# SCC "read" #-} liftIO $ readIORef $ valRef
+        case ({-# SCC "apply" #-} apply a v) of 
+          Nothing -> return ()
+          Just v' -> do
+            {-# SCC "trace2" #-} withIncreasedDepth (Proxy :: Proxy x) $
+              tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId' nodeId)
+            vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ valRef
+            iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ invsRef
+            defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
   defer $ SomeHoldInit $ do
       ep <- liftIO $ readIORef $ parentRef
       case ep of
@@ -690,36 +703,12 @@ hold v0 e = do
         Nothing -> do
           subscriptionRef <- liftIO $ newIORef $ error "getHoldEventSubscription: subdRef uninitialized"
           (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
-             { subscriberPropagate = {-# SCC "traverseHold" #-} \a -> do
-                {-# SCC "trace" #-} when debugPropagate $ traceM (Proxy :: Proxy x) $ liftIO $ do
-                  invalidators <- liftIO $ readIORef $ invsRef
-                  return $ "SubscriberHold" <> showNodeId' nodeId <> ": " ++ show (length invalidators)
-              
-                v <- {-# SCC "read" #-} liftIO $ readIORef $ valRef
-                case {-# SCC "apply" #-} apply a v of
-                  Nothing -> return ()
-                  Just v' -> do
-                    {-# SCC "trace2" #-} withIncreasedDepth (Proxy :: Proxy x) $
-                      tracePropagate (Proxy :: Proxy x) ("propagateSubscriberHold: assigning Hold" <> showNodeId' nodeId)
-                    vRef <- {-# SCC "vRef" #-} liftIO $ evaluate $ valRef
-                    iRef <- {-# SCC "iRef" #-} liftIO $ evaluate $ invsRef
-                    defer $ {-# SCC "assignment" #-} SomeAssignment vRef iRef v'
+             { subscriberPropagate = {-# SCC "traverseHold" #-} deferAssignment
              , subscriberInvalidateHeight = \_ -> return ()
              , subscriberRecalculateHeight = \_ -> return ()
              }
           liftIO $ writeIORef subscriptionRef $! subscription
-          case occ of
-            Nothing -> return ()
-            Just o -> do
-              old <- liftIO $ readIORef $ valRef
-              case apply o old of
-                Nothing -> return ()
-                Just new -> do
-                  -- TODO: identical code above
-                  -- Need to evaluate these so that we don't retain the Hold itself
-                  v <- liftIO $ evaluate $ valRef
-                  i <- liftIO $ evaluate $ invsRef
-                  defer $ SomeAssignment v i new
+          mapM_ deferAssignment occ
           liftIO $ writeIORef parentRef $ Just subscription
   return $ Hold
         { holdValue = valRef
