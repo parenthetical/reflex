@@ -150,6 +150,10 @@ import System.IO (stderr)
 import Data.List (isPrefixOf)
 #endif
 
+
+whenM :: Monad m => m Bool -> m () -> m ()
+whenM mcond m = mcond >>= flip when m
+
 -- TODO stdout might not be the best channel for debug output
 debugStrLn :: String -> IO ()
 debugStrLn = putStrLn
@@ -343,7 +347,7 @@ cacheEvent e = unsafePerformIO $ do
   nodeId <- liftIO newNodeId
 #endif
   pure $ Event $ \sub -> {-# SCC "cacheEvent" #-} do
-    (liftIO (WeakBag.null subscribers) >>=) $ flip when $ do
+    whenM (liftIO (WeakBag.null subscribers)) $ do
       (parentSub, occ) <- subscribeAndRead e $ debugSubscriber' ("cacheEvent" <> showNodeId' nodeId) $
         Subscriber
           { subscriberPropagate = \a -> do
@@ -1320,8 +1324,7 @@ fanG e = unsafePerformIO $ do
   nodeId <- liftIO $ newNodeId
 #endif
   pure $ EventSelectorG $ \(!k) -> Event $ \sub -> do
-    isEmpty <- liftIO $ DMap.null <$> readIORef subscribersRef
-    when isEmpty $ do
+    whenM (liftIO $ DMap.null <$> readIORef subscribersRef) $ do
       -- Not initialized: subscribe to parent.
       (subscription, parentOcc) <- subscribeAndRead e $ debugSubscriber' ("SubscriberFan " <> showNodeId' nodeId) $ Subscriber
         { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
