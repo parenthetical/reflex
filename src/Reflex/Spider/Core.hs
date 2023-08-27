@@ -1395,7 +1395,7 @@ clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRe
   writeIORef delayedRef IntMap.empty
 
 
-invalidate :: forall x. IORef [Weak Invalidator] -> IO ()
+invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
   wis <- readIORef wisRef
   evaluate <=< forM_ wis $ \wi -> do
