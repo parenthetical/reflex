@@ -740,7 +740,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         let subscriber = newSubscriber id
         ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ Invalidator $
          runEventM @x $ defer $ SomeMergeUpdate @x
-          ({-# SCC "switchSubscribed" #-} do
+          (do
             EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
             parentHeight <- getEventSubscribedHeight subd'
             myHeight <- readIORef heightRef
@@ -750,7 +750,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
           (updateCommonHeight heightRef sub
             =<< getEventSubscribedHeight . _eventSubscription_subscribed
             =<< readIORef currentParentSubscriptionRef)
-          ({-# SCC "switchSubscribed" #-} liftIO $ do
+          (liftIO $ do
             oldSubscription <- readIORef currentParentSubscriptionRef
             wi <- readIORef ownWeakInvalidatorRef
             finalize wi
@@ -879,7 +879,6 @@ instance Exception EventLoopException
 instance Show EventLoopException where
   show EventLoopException = "causality loop detected: \n" <>
     "compile reflex with flag 'debug-cycles' and compile with profiling enabled for stack tree"
-
 
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
@@ -1283,21 +1282,14 @@ runFrame a = SpiderHost $ do
         result <- a
         runHoldInits (eventEnvHoldInits env) (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
         return result
-  toClear <- readIORef $ eventEnvClears env
-  forM_ toClear $ \(Some (Clear ref)) -> {-# SCC "clear" #-} writeIORef ref Nothing
-  toClearRoot <- readIORef $ eventEnvRootClears env
-  forM_ toClearRoot $ \(Some (RootClear ref)) -> {-# SCC "rootClear" #-} writeIORef ref $! DMap.empty
-  toAssign <- readIORef $ eventEnvAssignments env
-  forM_ toAssign $ \(SomeAssignment vRef iRef v) -> {-# SCC "assignment" #-} do
+  readIORef (eventEnvClears env) >>= mapM_ (\(Some (Clear ref)) -> writeIORef ref Nothing)
+  readIORef (eventEnvRootClears env) >>= mapM_ (\(Some (RootClear ref)) -> writeIORef ref $! DMap.empty)
+  readIORef (eventEnvAssignments env) >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
     writeIORef vRef v
-    -- TODO: explain what invalidate does:
-    --TODO: There are some things that will need to be re-subscribed every time; we should try to avoid finalizing them.
-    -- TODO: Invalidate used to return an empty list, this might have been in anticipation to the TODO above.
-    invalidate iRef
+    invalidate iRef)
   mergeUpdates <- readIORef (eventEnvMergeUpdates env)
   clearEventEnv env
-  mergeSubscriptionsToKill <- runEventM $ concat <$> mapM _someMergeUpdate_update mergeUpdates
-  liftIO $ mapM_ unsubscribe mergeSubscriptionsToKill
+  liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _someMergeUpdate_update mergeUpdates)
   mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
   return result
