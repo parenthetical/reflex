@@ -246,17 +246,14 @@ cacheEvent e = unsafePerformIO $ do
   parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
   occRef :: IORef (Maybe a) <- newIORef Nothing
   pure $ Event $ \sub -> {-# SCC "cacheEvent" #-} do
-    whenM (liftIO (WeakBag.null subscribers)) $ do
-      (parentSub, occ) <- subscribeAndRead e $
-        Subscriber
-          { subscriberPropagate = \a -> do
-              writeAndScheduleClear occRef a
-              propagate a subscribers
+    whenM (liftIO (WeakBag.null subscribers)) $
+      liftIO . writeIORef parentSubscriptionRef
+        <=< subscribe (pushCheap (\a -> writeAndScheduleClear occRef a >> pure (Just a)) e)
+        $ Subscriber
+          { subscriberPropagate = flip propagate subscribers
           , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . invalidateSubscriberHeight
           , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . recalculateSubscriberHeight
           }
-      mapM_ (writeAndScheduleClear occRef) occ
-      liftIO $ writeIORef parentSubscriptionRef parentSub
     parentSub <- liftIO $ readIORef parentSubscriptionRef
     sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
     occ <- liftIO $ readIORef occRef
