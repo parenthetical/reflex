@@ -722,10 +722,144 @@ commonEvent cleanupSpecific foo sub = do
        , occ
        )
 
+coincidenceExpanded :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
+coincidenceExpanded coincidenceParent = cacheEvent $ Event $ \sub -> do
+  heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
+  toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
+  innerSubdRef <- liftIO $ newIORef $ error "coincidence: innerSubdRef undefined"
+  outerParentSubscriptionRef <- liftIO $ newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
+  occRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
+  -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
+  let getParentSubscribeds = do
+        maybeInnerSubscription <- readIORef innerSubdRef
+        outerSubscription <- readIORef outerParentSubscriptionRef
+        return $ _eventSubscription_subscribed outerSubscription : maybeToList maybeInnerSubscription
+  let invalidateThisHeightRef = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
+  let newSubscriber :: (forall a1. (a1 -> EventM x ()) -> Subscriber x a1)
+      newSubscriber = \propagateSpecific -> Subscriber
+          { subscriberPropagate = propagateSpecific
+          , subscriberInvalidateHeight = const invalidateThisHeightRef -- TODO: what normally happens with the passed in height here?
+          , subscriberRecalculateHeight = updateCommonHeight heightRef sub
+          }
+  let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
+      subscribeCoincidenceInner inner outerHeight = do
+        (innerSubscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
+          subscribeAndReadWithHeight inner $ newSubscriber $ \a ->
+             whenNothingRef occRef $ do
+                writeAndScheduleClear occRef a
+                subscriberPropagate sub a
+        writeAndScheduleClear innerSubdRef innerSubd
+        let innerHeightWasHigher = innerHeight > outerHeight
+        defer $ SomeMergeUpdate @x
+           (do unsubscribe innerSubscription
+               when innerHeightWasHigher invalidateThisHeightRef)
+           (when innerHeightWasHigher $
+             updateCommonHeight heightRef sub =<< do
+               subs <- mapM getEventSubscribedHeight =<< getParentSubscribeds
+               -- TODO: why not order heights with invalid as Top?
+               return $ if invalidHeight `elem` subs then invalidHeight else maximum subs)
+           (pure [])
+        return (innerOcc, max innerHeight outerHeight)
+  (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
+    newSubscriber $ \a ->
+      {-# SCC "traverseCoincidenceOuter" #-} do
+         outerHeight <- liftIO $ readIORef heightRef
+         (occ, innerHeight) <- subscribeCoincidenceInner a outerHeight
+         case occ of
+           Nothing ->
+             when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
+               writeIORef heightRef $! innerHeight
+               invalidateSubscriberHeight outerHeight sub
+               recalculateSubscriberHeight innerHeight sub
+           Just o -> subscriberPropagate sub o -- Since it's already firing, no need to adjust height
+  liftIO $ writeIORef outerParentSubscriptionRef outerSubscription
+  (occ, height) <- case outerOcc of
+    Nothing -> return (Nothing, outerHeight)
+    Just o -> subscribeCoincidenceInner o outerHeight
+  mapM_ (writeAndScheduleClear occRef) occ
+  liftIO $ writeIORef heightRef height
+  liftIO $ writeIORef toRetainRef (sub, (outerParentSubscriptionRef, innerSubdRef)) -- TODO: is toRetain correct?
+  pure ( EventSubscription
+          ((unsubscribe =<< readIORef outerParentSubscriptionRef)
+           >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
+          (EventSubscribed
+            { eventSubscribedHeightRef = heightRef
+            , eventSubscribedRetained = toAny toRetainRef
+            })
+       , occ
+       )
+
+switchExpanded :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
+switchExpanded switchParent = cacheEvent $ Event $ \sub -> do
+  heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
+  toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
+  -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
+  -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
+  --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
+  --          in Behavior to fix that TODO?
+  parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
+  currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
+  ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+  let subscriber = Subscriber
+          { subscriberPropagate = subscriberPropagate sub
+          , subscriberInvalidateHeight = \_height ->
+              invalidateHeightRef heightRef (subscriberInvalidateHeight sub) -- TODO: what normally happens with the passed in height here?
+          , subscriberRecalculateHeight = updateCommonHeight heightRef sub
+          }
+  ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ Invalidator $
+   runEventM @x $ defer $ SomeMergeUpdate @x
+         (do EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
+             parentHeight <- getEventSubscribedHeight subd'
+             myHeight <- readIORef heightRef
+             when (parentHeight /= myHeight) $ do
+               writeIORef heightRef $! invalidHeight
+               invalidateSubscriberHeight myHeight sub)
+         (updateCommonHeight heightRef sub
+           =<< getEventSubscribedHeight . _eventSubscription_subscribed
+           =<< readIORef currentParentSubscriptionRef)
+         (liftIO $ do
+           oldSubscription <- readIORef currentParentSubscriptionRef
+           wi <- readIORef ownWeakInvalidatorRef
+           finalize wi
+           wi' <- mkWeakPtrWithDebug i
+           writeIORef ownWeakInvalidatorRef $! wi'
+           writeIORef parentsRef []
+           -- FIXME: why is this wonky? Can we do better than reusing runHoldInits in this way?
+           holdInitsRef <- newIORef []
+           -- TODO: after this runBehavior holdInitsRef always seems empty...
+           e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) holdInitsRef
+           runEventM $ runHoldInits holdInitsRef =<< liftIO (newIORef [])
+           --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
+           subscription <- unSpiderHost . runFrame . subscribe e $ subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+           writeIORef currentParentSubscriptionRef $! subscription
+           return [oldSubscription])
+  wi <- liftIO $ mkWeakPtrWithDebug ownInvalidator
+  holdInits <- getDeferralQueue
+  (subscription, height, parentOcc) <-
+    join $ subscribeAndReadWithHeight
+    <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
+    <*> pure subscriber
+  liftIO $ writeIORef ownWeakInvalidatorRef wi
+  liftIO $ writeIORef currentParentSubscriptionRef subscription
+  liftIO $ writeIORef heightRef height
+  liftIO $ writeIORef toRetainRef (sub, (ownInvalidator, ownWeakInvalidatorRef, currentParentSubscriptionRef)) -- TODO: is toRetain correct?
+  pure ( EventSubscription
+          (do unsubscribe =<< readIORef currentParentSubscriptionRef
+              finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
+              writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
+          (EventSubscribed
+            { eventSubscribedHeightRef = heightRef
+            , eventSubscribedRetained = toAny toRetainRef
+            })
+       , parentOcc
+       )
+
+switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
+switch = switchExpanded
 -- TODO: Slow, but terminates and doesn't exhibit growing memory when not cached (but memory use is huge).
 {-# INLINABLE switch #-}
-switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switch switchParent = cacheEvent $ Event $ \sub -> do
+switch' :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
+switch' switchParent = cacheEvent $ Event $ \sub -> do
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
   --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
@@ -777,14 +911,16 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         pure (parentOcc, height, (ownInvalidator, ownWeakInvalidatorRef, currentParentSubscriptionRef)))
     sub
 
+coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
+coincidence = coincidenceExpanded
 
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
 -- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
-coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
-coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
+coincidence' :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
+coincidence' coincidenceParent = cacheEvent $ Event $ \sub -> do
   innerSubdRef <- liftIO $ newIORef $ error "coincidence: innerSubdRef undefined"
   outerParentSubscriptionRef <- liftIO $ newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
   occRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
@@ -1321,7 +1457,7 @@ invalidateHeightRef heightRef doOnInvalidate = do
     writeIORef heightRef $! invalidHeight
     doOnInvalidate oldHeight
 
--- TODO: comments say that 'when's should be assertions but tests fail if they are removed
+-- TODO: comments say that "'when's should be assertions" but tests fail if they are removed
 updateCommonHeight :: IORef Height -> Subscriber x a -> Height -> IO ()
 updateCommonHeight heightRef subscriber newHeight = do
   oldHeight <- readIORef heightRef
