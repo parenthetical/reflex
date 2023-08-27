@@ -403,7 +403,7 @@ dynamicDyn !d = Dynamic
 --type role Hold representational
 data Hold x p
    = Hold { holdValue :: !(IORef (PatchTarget p))
-          , holdInvalidators :: !(IORef [Weak (Invalidator x)])
+          , holdInvalidators :: !(IORef [Weak Invalidator])
           , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
           , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
           }
@@ -545,7 +545,7 @@ hold v0 e = do
         forM_ (apply a v) $ \v' -> do
             vRef <- liftIO $ evaluate valRef
             iRef <- liftIO $ evaluate invsRef
-            defer $ SomeAssignment vRef iRef v'
+            defer $ SomeAssignment @x vRef iRef v'
   defer $ SomeHoldInit $ whenNothingRef parentRef $ do
           (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
              { subscriberPropagate = deferAssignment
@@ -561,7 +561,7 @@ hold v0 e = do
         , holdParent = parentRef
         }
 
-type BehaviorEnv x = (Maybe (Weak (Invalidator x), IORef [SomeBehaviorSubscribed x]), IORef [SomeHoldInit x])
+type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeHoldInit x])
 
 -- BehaviorM can sample behaviors
 newtype BehaviorM x a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
@@ -575,9 +575,7 @@ newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscri
 
 -- type role PullSubscribed representational nominal
 
-data Invalidator x
-   = InvalidatorPull (IO ())
-   | InvalidatorSwitch (IO ())
+newtype Invalidator = Invalidator (IO ())
 
 newtype SomeHoldInit x = SomeHoldInit (EventM x ())
 
@@ -652,8 +650,8 @@ push f e = cacheEvent (pushCheap f e)
 -- TODO: what is really needed here?
 data PullSubscribed x a
    = PullSubscribed { pullSubscribedValue :: !a
-                    , pullSubscribedInvalidators :: !(IORef [Weak (Invalidator x)])
-                    , pullSubscribedOwnInvalidator :: !(Invalidator x)
+                    , pullSubscribedInvalidators :: !(IORef [Weak Invalidator])
+                    , pullSubscribedOwnInvalidator :: !Invalidator
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
 
@@ -662,7 +660,7 @@ pull :: BehaviorM x a -> Behavior x a
 pull a = unsafePerformIO $ do
   ref <- newIORef Nothing
   invsRef <- newIORef $ error "pull: invsRef uninitialized"
-  let i = InvalidatorPull $ do
+  let i = Invalidator $ do
             mVal <- readIORef ref
             forM_ mVal $ \_val -> do
               writeIORef ref Nothing
@@ -740,7 +738,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         finalize =<< readIORef ownWeakInvalidatorRef) -- We don't need to get invalidated if we're dead
     (\newSubscriber heightRef -> do
         let subscriber = newSubscriber id
-        ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ InvalidatorSwitch $
+        ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ Invalidator $
          runEventM @x $ defer $ SomeMergeUpdate @x
           ({-# SCC "switchSubscribed" #-} do
             EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
@@ -868,7 +866,7 @@ newtype Clear a = Clear (IORef (Maybe a))
 
 newtype RootClear k = RootClear (IORef (DMap k Identity))
 
-data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak (Invalidator x)]) a
+data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
 
 mkWeakPtrWithDebug :: a -> IO (Weak a)
 mkWeakPtrWithDebug x = do
@@ -883,10 +881,10 @@ instance Show EventLoopException where
     "compile reflex with flag 'debug-cycles' and compile with profiling enabled for stack tree"
 
 
-runBehaviorM :: BehaviorM x a -> Maybe (Weak (Invalidator x), IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
+runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
 
-askInvalidator :: BehaviorM x (Maybe (Weak (Invalidator x)))
+askInvalidator :: BehaviorM x (Maybe (Weak Invalidator))
 askInvalidator = do
   (!m, _) <- ask
   case m of
@@ -1265,18 +1263,16 @@ clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRe
   writeIORef delayedRef IntMap.empty
 
 
-invalidate :: forall x. IORef [Weak (Invalidator x)] -> IO ()
+invalidate :: forall x. IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
   wis <- readIORef wisRef
   evaluate <=< forM_ wis $ \wi -> do
     mi <- deRefWeak wi
     case mi of
       Nothing -> pure () --TODO: Should we clean this up here?
-      Just i -> do
+      Just (Invalidator i) -> do
         finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
-        case i of
-          InvalidatorPull p -> p
-          InvalidatorSwitch someMergeUpdate -> someMergeUpdate
+        i
   writeIORef wisRef []
 
 -- | Run an event action outside of a frame
