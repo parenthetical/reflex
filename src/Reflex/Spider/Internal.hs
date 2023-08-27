@@ -193,7 +193,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE holdIncremental #-}
   holdIncremental v0 (SpiderEvent e) = SpiderPushM $ SpiderIncremental . dynamicHold <$> Reflex.Spider.Core.hold v0 e
   {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 (SpiderEvent e) = SpiderPushM $ fmap (SpiderDynamic . dynamicDynIdentity) $ Reflex.Spider.Core.buildDynamic (coerce getV0) $ coerce e
+  buildDynamic getV0 (SpiderEvent e) = SpiderPushM $ fmap (SpiderDynamic . dynamicDyn) $ Reflex.Spider.Core.buildDynamic (coerce getV0) $ coerce e
   {-# INLINABLE headE #-}
   -- headE = R.slowHeadE
   headE (SpiderEvent e) = SpiderPushM $ SpiderEvent <$> Reflex.Spider.Core.headE e
@@ -205,7 +205,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
   {-# INLINE return #-}
   return = pure
   {-# INLINE (>>=) #-}
-  x >>= f = SpiderDynamic $ dynamicDynIdentity $ newJoinDyn $ newMapDyn (unSpiderDynamic . f) $ unSpiderDynamic x
+  x >>= f = SpiderDynamic $ dynamicDyn $ newJoinDyn $ newMapDyn (unSpiderDynamic . f) $ unSpiderDynamic x
   {-# INLINE (>>) #-}
   (>>) = (*>)
 #if !MIN_VERSION_base(4,13,0)
@@ -250,7 +250,7 @@ holdIncrementalSpiderEventM :: (HasSpiderTimeline x, Patch p) => PatchTarget p -
 holdIncrementalSpiderEventM v0 e = fmap (SpiderIncremental . dynamicHold) $ Reflex.Spider.Core.hold v0 $ unSpiderEvent e
 
 buildDynamicSpiderEventM :: HasSpiderTimeline x => SpiderPushM x a -> Reflex.Class.Event (SpiderTimeline x) a -> EventM x (Reflex.Class.Dynamic (SpiderTimeline x) a)
-buildDynamicSpiderEventM getV0 e = fmap (SpiderDynamic . dynamicDynIdentity) $ Reflex.Spider.Core.buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
+buildDynamicSpiderEventM getV0 e = fmap (SpiderDynamic . dynamicDyn) $ Reflex.Spider.Core.buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
   {-# INLINABLE hold #-}
@@ -278,7 +278,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE holdIncremental #-}
   holdIncremental v0 e = SpiderHostFrame $ fmap (SpiderIncremental . dynamicHold) $ Reflex.Spider.Core.hold v0 $ unSpiderEvent e
   {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 e = SpiderHostFrame $ fmap (SpiderDynamic . dynamicDynIdentity) $ Reflex.Spider.Core.buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
+  buildDynamic getV0 e = SpiderHostFrame $ fmap (SpiderDynamic . dynamicDyn) $ Reflex.Spider.Core.buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
   {-# INLINABLE headE #-}
   -- headE = R.slowHeadE
   headE (SpiderEvent e) = SpiderHostFrame $ SpiderEvent <$> Reflex.Spider.Core.headE e
@@ -399,7 +399,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE updated #-}
   updated = SpiderEvent #. dynamicUpdated .# fmap coerce . unSpiderDynamic
   {-# INLINABLE unsafeBuildDynamic #-}
-  unsafeBuildDynamic readV0 v' = SpiderDynamic $ dynamicDynIdentity $ unsafeBuildDynamic (coerce readV0) $ coerce $ unSpiderEvent v'
+  unsafeBuildDynamic readV0 v' = SpiderDynamic $ dynamicDyn $ unsafeBuildDynamic (coerce readV0) $ coerce $ unSpiderEvent v'
   {-# INLINABLE unsafeBuildIncremental #-}
   unsafeBuildIncremental readV0 dv = SpiderIncremental $ dynamicDyn $ unsafeBuildDynamic (coerce readV0) $ unSpiderEvent dv
   {-# INLINABLE mergeIncrementalG #-}
@@ -411,7 +411,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE updatedIncremental #-}
   updatedIncremental = SpiderEvent . dynamicUpdated . unSpiderIncremental
   {-# INLINABLE incrementalToDynamic #-}
-  incrementalToDynamic (SpiderIncremental i) = SpiderDynamic $ dynamicDynIdentity $ unsafeBuildDynamic (readBehaviorUntracked $ dynamicCurrent i) $ flip push (dynamicUpdated i) $ \p -> do
+  incrementalToDynamic (SpiderIncremental i) = SpiderDynamic $ dynamicDyn $ unsafeBuildDynamic (readBehaviorUntracked $ dynamicCurrent i) $ flip push (dynamicUpdated i) $ \p -> do
     c <- readBehaviorUntracked $ dynamicCurrent i
     return $ Identity <$> apply p c --TODO: Avoid the redundant 'apply'
   eventCoercion Coercion = Coercion
