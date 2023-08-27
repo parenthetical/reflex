@@ -1220,12 +1220,6 @@ mergeWithMove nt =
      pure $ applyAlways ip' s)
   nt
 
-checkCycle :: EventSubscribed x -> EventM x ()
-checkCycle subscribed = liftIO $ do
-    height <- readIORef (eventSubscribedHeightRef subscribed)
-    when (height == invalidHeight) $
-          throwIO EventLoopException
-
 type MergeM x a = WriterT [EventSubscription x] (EventM x) a
 type TellE x a = Event x a -> MergeM x (MergeM x (), EventSubscription x)
 
@@ -1239,8 +1233,7 @@ merge :: forall x ip ipt o s.
   -> (s -> Int)
   -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
- cacheEvent $ Event $ \sub -> do
+merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEvent $ Event $ \sub -> do
   -- TODO: is it worth caching the number of subscriptions?
   --      This is now done with 'getNumSubs' but those functions traverse a tree.
   accumRef :: IORef o <- liftIO $ newIORef mempty
@@ -1248,10 +1241,6 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
   heightBagRef <- liftIO $ newIORef heightBagEmpty
   toRetainRef <- liftIO $ newIORef $ error "getMergeSubscribed: toRetainRef not yet initialized"
   stateRef <- liftIO $ newIORef $ error "merge state not initialized"
-  let subscribed = EventSubscribed
-        { eventSubscribedHeightRef = heightRef
-        , eventSubscribedRetained = toAny toRetainRef
-        }
   let invalidateMyHeight = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
   let recalculateMyHeight = do
           currentHeight <- readIORef heightRef
@@ -1274,7 +1263,9 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
               oldAccum <- liftIO (readIORef accumRef)
               liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
               when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
-                checkCycle subscribed
+                liftIO $ do height <- readIORef heightRef
+                            when (height == invalidHeight) $
+                              throwIO EventLoopException
                 let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
                       height <- liftIO $ readIORef heightRef
                       currentHeight <- getCurrentHeight
@@ -1350,7 +1341,10 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d =
   fmap ( EventSubscription
            (do traverse_ unsubscribe . getSubs =<< readIORef stateRef
                writeIORef stateRef mempty) -- TOOD: needed/useful?
-           subscribed
+           EventSubscribed
+           { eventSubscribedHeightRef = heightRef
+           , eventSubscribedRetained = toAny toRetainRef
+           }
        , ) . runMaybeT $ do
        guard =<< lift ((>=) <$> getCurrentHeight <*> liftIO (readIORef heightRef)) -- If we should have fired by now
        dm <- liftIO $ readIORef accumRef
