@@ -690,8 +690,8 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
         outerSubscription <- readIORef outerParentSubscriptionRef
         return $ _eventSubscription_subscribed outerSubscription : maybeToList maybeInnerSubscription
   let invalidateThisHeightRef = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
-  let newSubscriber :: (forall a1. (a1 -> EventM x ()) -> Subscriber x a1)
-      newSubscriber propagateSpecific = Subscriber
+  let subscribeAndReadWithHeight' :: forall b. Event x b -> (b -> EventM x ()) -> EventM x (EventSubscription x, Height, Maybe b)
+      subscribeAndReadWithHeight' e propagateSpecific = subscribeAndReadWithHeight e $ Subscriber
           { subscriberPropagate = propagateSpecific
           , subscriberInvalidateHeight = const invalidateThisHeightRef -- TODO: what normally happens with the passed in height here?
           , subscriberRecalculateHeight = updateCommonHeight heightRef sub
@@ -699,7 +699,7 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
       subscribeCoincidenceInner inner outerHeight = do
         (innerSubscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
-          subscribeAndReadWithHeight inner $ newSubscriber $ \a ->
+          subscribeAndReadWithHeight' inner $ \a ->
              whenNothingRef occRef $ do
                 writeAndScheduleClear occRef a
                 subscriberPropagate sub a
@@ -715,8 +715,7 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
                return $ if invalidHeight `elem` subs then invalidHeight else maximum subs)
            (pure [])
         return (innerOcc, max innerHeight outerHeight)
-  (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight coincidenceParent $
-    newSubscriber $ \a ->
+  (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight' coincidenceParent $ \a ->
       {-# SCC "traverseCoincidenceOuter" #-} do
          outerHeight <- liftIO $ readIORef heightRef
          (occ, innerHeight) <- subscribeCoincidenceInner a outerHeight
@@ -730,6 +729,7 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   liftIO $ writeIORef outerParentSubscriptionRef outerSubscription
   (occ, height) <- case outerOcc of
     Nothing -> return (Nothing, outerHeight)
+    -- TODO: can we make subscribeCoincidenceInner read the outerHeight on its own? Then can we make heightRef setting more imperative? This all to possibly avoid having to treat occ and propagated value differently.
     Just o -> subscribeCoincidenceInner o outerHeight
   mapM_ (writeAndScheduleClear occRef) occ
   liftIO $ writeIORef heightRef height
@@ -778,18 +778,19 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
            -- FIXME: why is this wonky? Can we do better than reusing runHoldInits in this way?
            holdInitsRef <- newIORef []
            -- TODO: after this runBehavior holdInitsRef always seems empty...
-           e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) holdInitsRef
            runEventM $ runHoldInits holdInitsRef =<< liftIO (newIORef [])
            --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
-           subscription <- unSpiderHost . runFrame . subscribe e $ subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+           subscription <- unSpiderHost . runFrame
+             . flip subscribe subscriber
+             --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+             =<< runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) holdInitsRef
            writeIORef currentParentSubscriptionRef $! subscription
            return [oldSubscription])
   wi <- liftIO $ mkWeakPtrWithDebug ownInvalidator
   holdInits <- getDeferralQueue
   (subscription, height, parentOcc) <-
-    join $ subscribeAndReadWithHeight
-    <$> liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
-    <*> pure subscriber
+    flip subscribeAndReadWithHeight subscriber
+     =<< liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
   liftIO $ writeIORef ownWeakInvalidatorRef wi
   liftIO $ writeIORef currentParentSubscriptionRef subscription
   liftIO $ writeIORef heightRef height
