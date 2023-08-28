@@ -194,6 +194,13 @@ pushCheap !f e = Event $ \sub -> do
   occ' <- join <$> mapM f occ
   return (subscription, occ')
 
+
+terminalSubscriber :: Subscriber x a
+terminalSubscriber = Subscriber { subscriberPropagate = const (pure ())
+                                , subscriberInvalidateHeight = \_ -> return ()
+                                , subscriberRecalculateHeight = \_ -> return ()
+                                }
+
 --TODO: Make this lazy in its input event
 headE :: forall x m a. (Defer (SomeInit x) m) => Event x a -> m (Event x a)
 headE originalE = do
@@ -209,15 +216,10 @@ headE originalE = do
         liftIO $ maybe (writeIORef subscriptionRef $! subscription) (const (unsubscribe subscription)) occ
         return (subscription, occ)
   parent <- liftIO $ newIORef $ Just originalE
-  defer $ SomeInit $ do --TODO: Rename SomeInit appropriately
-    let clearParent = liftIO $ writeIORef parent Nothing
-    (_, occ) <- subscribeAndReadHead originalE $
-      Subscriber
-      { subscriberPropagate = const clearParent
-      , subscriberInvalidateHeight = \_ -> return ()
-      , subscriberRecalculateHeight = \_ -> return ()
-      }
-    when (isJust occ) clearParent
+  --TODO: Rename SomeInit appropriately
+  defer $ SomeInit $ void $ subscribeAndReadHead
+      (pushCheap (\_ -> liftIO $ writeIORef parent Nothing >> pure Nothing) originalE) $
+      terminalSubscriber
   return $ Event $ \sub ->
     liftIO (readIORef parent) >>= maybe subscribeAndReadNever (`subscribeAndReadHead` sub)
 
@@ -533,10 +535,7 @@ hold v0 e = do
                                       vRef <- liftIO $ evaluate valRef
                                       iRef <- liftIO $ evaluate invsRef
                                       defer $ SomeAssignment @x vRef iRef v')
-            $ Subscriber { subscriberPropagate = const (pure ())
-                         , subscriberInvalidateHeight = \_ -> return ()
-                         , subscriberRecalculateHeight = \_ -> return ()
-                         }
+            $ terminalSubscriber
   return $ Hold
         { holdValue = valRef
         , holdInvalidators = invsRef
@@ -1148,17 +1147,13 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
     =<< lift (readBehaviorUntracked (dynamicCurrent d))
   unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
   defer $ SomeInit $ do
-    changeSubscription <- subscribe
-             (pushCheap (\p -> do
+    changeSubscription <- subscribeWith (dynamicUpdated d)
+                       (\p -> do
                             defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
                               oldState <- liftIO $ readIORef stateRef
                               W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False)
                             pure (Just ()))
-               (dynamicUpdated d)) $ Subscriber
-          { subscriberPropagate = pure
-          , subscriberInvalidateHeight = \_ -> return ()
-          , subscriberRecalculateHeight = \_ -> return ()
-          }
+                       $ terminalSubscriber
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
