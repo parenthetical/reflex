@@ -1322,18 +1322,17 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
     =<< lift (readBehaviorUntracked (dynamicCurrent d))
   unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
   defer $ SomeInit $ do
-    let deferUpdateMerge p = do
-          -- TODO: Be able to run as much of this as possible promptly
-          defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
-            oldState <- liftIO $ readIORef stateRef
-            W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False)
-    (changeSubscription, change) <- subscribeAndRead (dynamicUpdated d) $ Subscriber
-          { subscriberPropagate = \a -> {-# SCC "traverseMergeChange" #-} do
-              deferUpdateMerge a
+    changeSubscription <- subscribe
+             (pushCheap (\p -> do
+                            defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
+                              oldState <- liftIO $ readIORef stateRef
+                              W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False)
+                            pure (Just ()))
+               (dynamicUpdated d)) $ Subscriber
+          { subscriberPropagate = pure
           , subscriberInvalidateHeight = \_ -> return ()
           , subscriberRecalculateHeight = \_ -> return ()
           }
-    forM_ change deferUpdateMerge
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
