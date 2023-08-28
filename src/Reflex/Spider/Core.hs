@@ -342,8 +342,7 @@ behaviorConst !a = Behavior $ return a
 readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
 readHoldTracked h = do
   result <- liftIO $ readIORef $ holdValue h
-  askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' (holdInvalidators h) (wi:))
-  addParentB (BehaviorSubscribedHold h)
+  addParentBAndInvalidator (BehaviorSubscribedHold h) (holdInvalidators h)
   liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
   return result
 
@@ -645,24 +644,19 @@ data PullSubscribed x a
 pull :: BehaviorM x a -> Behavior x a
 pull a = unsafePerformIO $ do
   ref <- newIORef Nothing
-  invsRef <- newIORef $ error "pull: invsRef uninitialized"
-  let i = Invalidator $ do
-            mVal <- readIORef ref
-            forM_ mVal $ \_val -> do
-              writeIORef ref Nothing
-              evaluate =<< invalidate invsRef
+  invsRef <- newIORef []
   pure $ Behavior $ do
     subscribed <- liftIO (readIORef ref) >>= \case
-      Just subscribed -> do
-        askInvalidator >>= mapM_ (\wi -> liftIO $ modifyIORef' invsRef (wi:))
-        liftIO $ touch i
-        return subscribed
+      Just subscribed -> pure subscribed
       Nothing -> do
+        let i = Invalidator $ readIORef ref
+                >>= mapM_ (const $ do
+                              writeIORef ref Nothing
+                              evaluate =<< invalidate invsRef)
         wi <- liftIO $ mkWeakPtrWithDebug i
         parentsRef <- liftIO $ newIORef []
         (_, !holdInits) <- ask -- ask behavior hold inits
         aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
-        liftIO . writeIORef invsRef . maybeToList =<< askInvalidator
         parents <- liftIO $ readIORef parentsRef
         let subscribed = PullSubscribed
               { pullSubscribedValue = aVal
@@ -672,7 +666,7 @@ pull a = unsafePerformIO $ do
               }
         liftIO $ writeIORef ref $ Just subscribed
         return subscribed
-    addParentB (BehaviorSubscribedPull subscribed)
+    addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
     pure $ pullSubscribedValue subscribed
 
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
@@ -853,21 +847,16 @@ instance Show EventLoopException where
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
 
-askInvalidator :: BehaviorM x (Maybe (Weak Invalidator))
-askInvalidator = do
-  (!m, _) <- ask
-  case m of
-    Nothing -> return Nothing
-    Just (!wi, _) -> return $ Just wi
-
 -- TODO: What is the meaning of this function?
-addParentB :: BehaviorSubscribed x a -> BehaviorM x ()
-addParentB h = do
+addParentBAndInvalidator :: BehaviorSubscribed x a -> (IORef [Weak Invalidator]) -> BehaviorM x ()
+addParentBAndInvalidator h invsRef = do
   (!m, _) <- ask
   case m of
     Nothing -> pure ()
-    Just (_, !p) ->
+    Just (!wi, !p) -> do
+      liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
+  
 
 {-# INLINE getDynHold #-}
 getDynHold :: (HasSpiderTimeline x, Defer (SomeHoldInit x) m, Patch p) => Dyn x p -> m (Hold x p)
@@ -1157,7 +1146,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
                               oldState <- liftIO $ readIORef stateRef
                               W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False)
                             pure (Just ()))
-                       $ terminalSubscriber
+                       terminalSubscriber
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
