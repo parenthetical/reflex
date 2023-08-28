@@ -224,14 +224,7 @@ now = do
   scheduleClear nowOrNot
   return . Event $ \_ -> do
     occ <- liftIO . readIORef $ nowOrNot
-    return ( EventSubscription
-             (return ())
-             (EventSubscribed
-              { eventSubscribedHeightRef = zeroRef
-              , eventSubscribedRetained = toAny ()
-              })
-           , occ
-           )
+    returnSubscription (pure ()) zeroRef () occ
 
 -- | Construct an 'Event' whose value is guaranteed not to be recomputed
 -- repeatedly
@@ -256,27 +249,21 @@ cacheEvent e = unsafePerformIO $ do
           }
     parentSub <- liftIO $ readIORef parentSubscriptionRef
     sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
-    occ <- liftIO $ readIORef occRef
-    pure ( EventSubscription
-           (WeakBag.remove sln >> touch sln)
-           (EventSubscribed
-              { eventSubscribedHeightRef = eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub
-              , eventSubscribedRetained = toAny (sln, parentSubscriptionRef)
-              }
-           )
-         , occ
-         )
+    returnSubscription (WeakBag.remove sln >> touch sln)
+                       (eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub)
+                       (sln, parentSubscriptionRef)
+                       <=< liftIO $ readIORef occRef
 
 subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
 subscribe e s = fst <$> subscribeAndRead e s
 
+returnSubscription :: forall {k} {m :: * -> *} {a} {b} {x :: k}.
+  Monad m => IO () -> IORef Height -> a -> b -> m (EventSubscription x, b)
+returnSubscription cleanup heightRef retained occ =
+  return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
+
 subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
-subscribeAndReadNever = return (EventSubscription (return ())
-                                (EventSubscribed
-                                  { eventSubscribedHeightRef = zeroRef
-                                  , eventSubscribedRetained = toAny ()
-                                  }),
-                                Nothing)
+subscribeAndReadNever = returnSubscription (pure ()) zeroRef () Nothing
 
 eventNever :: Event x a
 eventNever = Event $ const subscribeAndReadNever
@@ -710,14 +697,11 @@ commonEvent cleanupSpecific foo sub = do
     heightRef
   liftIO $ writeIORef heightRef height
   liftIO $ writeIORef toRetainRef (sub, toRetainSpecific) -- TODO: is toRetain correct?
-  pure ( EventSubscription
-          (cleanupSpecific >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
-          (EventSubscribed
-            { eventSubscribedHeightRef = heightRef
-            , eventSubscribedRetained = toAny toRetainRef
-            })
-       , occ
-       )
+  returnSubscription
+    (cleanupSpecific >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
+    heightRef
+    toRetainRef
+    occ
 
 coincidenceExpanded :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidenceExpanded coincidenceParent = cacheEvent $ Event $ \sub -> do
@@ -776,15 +760,11 @@ coincidenceExpanded coincidenceParent = cacheEvent $ Event $ \sub -> do
   mapM_ (writeAndScheduleClear occRef) occ
   liftIO $ writeIORef heightRef height
   liftIO $ writeIORef toRetainRef (sub, (outerParentSubscriptionRef, innerSubdRef)) -- TODO: is toRetain correct?
-  pure ( EventSubscription
-          ((unsubscribe =<< readIORef outerParentSubscriptionRef)
-           >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
-          (EventSubscribed
-            { eventSubscribedHeightRef = heightRef
-            , eventSubscribedRetained = toAny toRetainRef
-            })
-       , occ
-       )
+  returnSubscription ((unsubscribe =<< readIORef outerParentSubscriptionRef)
+                      >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
+                     heightRef
+                     toRetainRef
+                     occ
 
 switchExpanded :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switchExpanded switchParent = cacheEvent $ Event $ \sub -> do
@@ -840,16 +820,13 @@ switchExpanded switchParent = cacheEvent $ Event $ \sub -> do
   liftIO $ writeIORef currentParentSubscriptionRef subscription
   liftIO $ writeIORef heightRef height
   liftIO $ writeIORef toRetainRef (sub, (ownInvalidator, ownWeakInvalidatorRef, currentParentSubscriptionRef)) -- TODO: is toRetain correct?
-  pure ( EventSubscription
+  returnSubscription 
           (do unsubscribe =<< readIORef currentParentSubscriptionRef
               finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
               writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
-          (EventSubscribed
-            { eventSubscribedHeightRef = heightRef
-            , eventSubscribedRetained = toAny toRetainRef
-            })
-       , parentOcc
-       )
+          heightRef
+          toRetainRef
+          parentOcc
 
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch = switchExpanded
@@ -1114,9 +1091,8 @@ fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
       -- Not initialized: subscribe to parent.
       (subscription, parentOcc) <- subscribeAndRead e $ Subscriber
         { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-            subs <- liftIO $ readIORef subscribersRef
             writeAndScheduleClear occRef a
-            doPropagation a subs
+            doPropagation a <=< liftIO $ readIORef subscribersRef
         , subscriberInvalidateHeight = \old ->
             traverseWeakBags (invalidateSubscriberHeight old) =<< readIORef subscribersRef
         , subscriberRecalculateHeight = \new ->
@@ -1124,30 +1100,26 @@ fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
         }
       liftIO $ writeIORef parentSubscriptionRef subscription
       mapM_ (writeAndScheduleClear occRef) parentOcc
-    liftIO $ do
-      sln <- do
-        subscribers <- readIORef subscribersRef
-        list <- flip fromMaybe (pure <$> lookup subscribers) $ {-# SCC "missSubscribeFanSubscribed" #-} do
-            -- No WeakBag of subscribers yet for this key:
-            list <- WeakBag.empty
-            writeIORef subscribersRef $! insert list subscribers
-            pure list
-        WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
-          reducedSubscribers <- delete <$> readIORef subscribersRef
-          writeIORef subscribersRef $! reducedSubscribers
-          -- When we don't have any subscribers, unsubscribe from e
-          when (isNull reducedSubscribers) $ do
-            unsubscribe =<< readIORef parentSubscriptionRef
-            writeIORef parentSubscriptionRef (error "fanG: parentSubscriptionRef emptied")
-      subscribedParent <- liftIO $ _eventSubscription_subscribed <$> readIORef parentSubscriptionRef
-      ( EventSubscription
-              (WeakBag.remove sln >> touch sln)
-              (EventSubscribed
-               { eventSubscribedHeightRef = eventSubscribedHeightRef subscribedParent
-               , eventSubscribedRetained = toAny (sln, parentSubscriptionRef)
-               })
-            ,)
-        <$> ((lookup2 =<<) <$> liftIO (readIORef occRef))
+    sln <- liftIO $ do
+      subscribers <- readIORef subscribersRef
+      list <- flip fromMaybe (pure <$> lookup subscribers) $ {-# SCC "missSubscribeFanSubscribed" #-} do
+          -- No WeakBag of subscribers yet for this key:
+          list <- WeakBag.empty
+          writeIORef subscribersRef $! insert list subscribers
+          pure list
+      WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
+        reducedSubscribers <- delete <$> readIORef subscribersRef
+        writeIORef subscribersRef $! reducedSubscribers
+        -- When we don't have any subscribers, unsubscribe from e
+        when (isNull reducedSubscribers) $ do
+          unsubscribe =<< readIORef parentSubscriptionRef
+          writeIORef parentSubscriptionRef (error "fanG: parentSubscriptionRef emptied")
+    subscribedParent <- liftIO $ _eventSubscription_subscribed <$> readIORef parentSubscriptionRef
+    returnSubscription (WeakBag.remove sln >> touch sln)
+             (eventSubscribedHeightRef subscribedParent)
+             (sln, parentSubscriptionRef)
+       . (lookup2 =<<)
+       =<< liftIO (readIORef occRef)
 
 newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
 newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
@@ -1337,14 +1309,12 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
     -- If we don't do this, there are certain cases where mergeCheap will fail to properly retain
     -- its subscription.
     liftIO $ writeIORef toRetainRef (changeSubscription, stateRef)
-  fmap ( EventSubscription
+  returnSubscription 
            (do traverse_ unsubscribe . getSubs =<< readIORef stateRef
                writeIORef stateRef mempty) -- TOOD: needed/useful?
-           EventSubscribed
-           { eventSubscribedHeightRef = heightRef
-           , eventSubscribedRetained = toAny toRetainRef
-           }
-       , ) . runMaybeT $ do
+           heightRef
+           toRetainRef
+    <=< runMaybeT $ do
        guard =<< lift ((>=) <$> getCurrentHeight <*> liftIO (readIORef heightRef)) -- If we should have fired by now
        dm <- liftIO $ readIORef accumRef
        guard (not (outputIsEmpty dm))
@@ -1539,12 +1509,5 @@ newFanEventWithTriggerIO f = do
     --   cs <- readIORef $ _weakBag_children subs
     --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
      -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-    occ <- coerce . DMap.lookup k <$> readIORef occRef
-    return ( EventSubscription
-             (WeakBag.remove sln >> touch sln)
-             EventSubscribed
-             { eventSubscribedHeightRef = zeroRef
-             , eventSubscribedRetained = toAny subscribedRef
-             }
-           , occ
-           )
+    returnSubscription (WeakBag.remove sln >> touch sln) zeroRef subscribedRef
+      =<< coerce . DMap.lookup k <$> readIORef occRef
