@@ -207,6 +207,9 @@ headE originalE = do
   let -- | Subscribe to an Event only for the duration of one occurrence
       subscribeAndReadHead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
       subscribeAndReadHead e sub = do
+        -- TODO: Why does this have "cyclic evaluation in fixIO" but the IORef version below not?
+        -- mfix $ \(~(subscription, _)) ->
+        --   subscribeAndRead (pushCheap (\a -> liftIO $ unsubscribe subscription >> pure (Just a)) e) sub
         subscriptionRef <- liftIO $ newIORef $ error "subscribeAndReadHead: not initialized"
         (subscription, occ) <- subscribeAndRead e $ sub
           { subscriberPropagate = \a -> do
@@ -217,9 +220,10 @@ headE originalE = do
         return (subscription, occ)
   parent <- liftIO $ newIORef $ Just originalE
   --TODO: Rename SomeInit appropriately
-  defer $ SomeInit $ void $ subscribeAndReadHead
-      (pushCheap (\_ -> liftIO $ writeIORef parent Nothing >> pure Nothing) originalE) $
-      terminalSubscriber
+  defer $ SomeInit $ void
+      $ subscribeAndReadHead
+        (pushCheap (\_ -> liftIO $ writeIORef parent Nothing >> pure Nothing) originalE)
+        terminalSubscriber
   return $ Event $ \sub ->
     liftIO (readIORef parent) >>= maybe subscribeAndReadNever (`subscribeAndReadHead` sub)
 
