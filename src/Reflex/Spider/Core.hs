@@ -164,6 +164,9 @@ newtype Event x a = Event { unEvent :: Subscriber x a -> EventM x (EventSubscrip
 subscribeAndRead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
 subscribeAndRead = unEvent
 
+subscribeWith :: Event x a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
+subscribeWith e f = subscribe (pushCheap (\a -> f a >> pure (Just a)) e)
+
 subscribeAndReadWithHeight :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Height, Maybe a)
 subscribeAndReadWithHeight e subscriber = do
   (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e subscriber
@@ -241,8 +244,7 @@ cacheEvent e = unsafePerformIO $ do
   pure $ Event $ \sub -> {-# SCC "cacheEvent" #-} do
     whenM (liftIO (WeakBag.null subscribers)) $
       liftIO . writeIORef parentSubscriptionRef
-        <=< subscribe (pushCheap (\a -> writeAndScheduleClear occRef a >> pure (Just a)) e)
-        $ Subscriber
+      <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
           { subscriberPropagate = flip propagate subscribers
           , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . invalidateSubscriberHeight
           , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . recalculateSubscriberHeight
@@ -524,20 +526,18 @@ hold v0 e = do
   valRef <- liftIO $ newIORef v0
   invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
-  let deferAssignment a = do
-        v <- liftIO $ readIORef valRef
-        forM_ (apply a v) $ \v' -> do
-            vRef <- liftIO $ evaluate valRef
-            iRef <- liftIO $ evaluate invsRef
-            defer $ SomeAssignment @x vRef iRef v'
   defer $ SomeHoldInit $ whenNothingRef parentRef $ do
-          (subscription@(EventSubscription _ _), occ) <- subscribeAndRead e $ Subscriber
-             { subscriberPropagate = deferAssignment
-             , subscriberInvalidateHeight = \_ -> return ()
-             , subscriberRecalculateHeight = \_ -> return ()
-             }
-          mapM_ deferAssignment occ
-          liftIO $ writeIORef parentRef $ Just subscription
+          liftIO . writeIORef parentRef . Just
+            <=< subscribeWith e (\a -> do
+                                    v <- liftIO $ readIORef valRef
+                                    forM_ (apply a v) $ \v' -> do
+                                      vRef <- liftIO $ evaluate valRef
+                                      iRef <- liftIO $ evaluate invsRef
+                                      defer $ SomeAssignment @x vRef iRef v')
+            $ Subscriber { subscriberPropagate = const (pure ())
+                         , subscriberInvalidateHeight = \_ -> return ()
+                         , subscriberRecalculateHeight = \_ -> return ()
+                         }
   return $ Hold
         { holdValue = valRef
         , holdInvalidators = invsRef
@@ -1089,17 +1089,15 @@ fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
   pure $ eventSelector $ \(lookup,lookup2,insert,delete,doPropagation) -> Event $ \sub -> do
     whenM (liftIO $ isNull <$> readIORef subscribersRef) $ do
       -- Not initialized: subscribe to parent.
-      (subscription, parentOcc) <- subscribeAndRead e $ Subscriber
-        { subscriberPropagate = \a -> {-# SCC "traverseFan" #-} do
-            writeAndScheduleClear occRef a
-            doPropagation a <=< liftIO $ readIORef subscribersRef
+      liftIO . writeIORef parentSubscriptionRef
+      <=< subscribeWith e (writeAndScheduleClear occRef)
+        $ Subscriber
+        { subscriberPropagate = \a -> doPropagation a <=< liftIO $ readIORef subscribersRef
         , subscriberInvalidateHeight = \old ->
             traverseWeakBags (invalidateSubscriberHeight old) =<< readIORef subscribersRef
         , subscriberRecalculateHeight = \new ->
             traverseWeakBags (recalculateSubscriberHeight new) =<< readIORef subscribersRef
         }
-      liftIO $ writeIORef parentSubscriptionRef subscription
-      mapM_ (writeAndScheduleClear occRef) parentOcc
     sln <- liftIO $ do
       subscribers <- readIORef subscribersRef
       list <- flip fromMaybe (pure <$> lookup subscribers) $ {-# SCC "missSubscribeFanSubscribed" #-} do
@@ -1258,9 +1256,9 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
                             subscriberPropagate sub vals
                 scheduleMerge' <=< liftIO $ readIORef heightRef
         -- TODO: is "subscribeAndReadWithThisPropagation" something handy? Avoids defining having to define and use addAccum twice here, and it might lead to more consistency everywhere.
-        (subscription@(EventSubscription _ parentSubd), parentOcc) <-
-          lift $ subscribeAndRead e $ Subscriber
-             { subscriberPropagate = addAccum
+        subscription@(EventSubscription _ parentSubd) <-
+          lift $ subscribeWith e addAccum $ Subscriber
+             { subscriberPropagate = const (pure ())
              , subscriberInvalidateHeight = \old -> do
                  --TODO: When removing a parent doesn't actually change the height, maybe we can avoid invalidating
                  modifyIORef' heightBagRef $ heightBagRemove old
@@ -1271,7 +1269,6 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
              }
         height <- liftIO $ getEventSubscribedHeight parentSubd
         -- TODO: Can isInit be avoided?
-        lift $ mapM_ addAccum parentOcc
         liftIO $ if not isInit
           then modifyIORef' heightBagRef $ heightBagAdd height -- new parent height
           else do
