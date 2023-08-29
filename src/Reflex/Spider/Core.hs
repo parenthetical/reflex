@@ -343,7 +343,7 @@ readHoldTracked h = do
   return result
 
 {-# INLINABLE readBehaviorUntracked #-}
-readBehaviorUntracked :: Defer (SomeHoldInit x) m => Behavior x a -> m a
+readBehaviorUntracked :: Defer (SomeInit x) m => Behavior x a -> m a
 readBehaviorUntracked b = do
   holdInits <- getDeferralQueue
   liftIO $ runBehaviorM (readBehaviorTracked b) Nothing holdInits --TODO: Specialize readBehaviorTracked to the Nothing and Just cases
@@ -426,7 +426,6 @@ instance GEq SpiderTimelineEnv where
 
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe
-              , eventEnvHoldInits :: !(IORef [SomeHoldInit x]) -- Needed for Subscribe
               , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
               , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Some Clear]) -- Needed for Subscribe
@@ -451,17 +450,13 @@ defer a = do
   q <- getDeferralQueue
   liftIO $ modifyIORef' q (a:)
 
+instance Defer (SomeInit x) (BehaviorM x) where
+  {-# INLINE getDeferralQueue #-}
+  getDeferralQueue = BehaviorM $ asks snd
+
 instance HasSpiderTimeline x => Defer (SomeAssignment x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvAssignments
-
-instance HasSpiderTimeline x => Defer (SomeHoldInit x) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvHoldInits
-
-instance Defer (SomeHoldInit x) (BehaviorM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = BehaviorM $ asks snd
 
 instance HasSpiderTimeline x => Defer (SomeMergeUpdate x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
@@ -514,12 +509,12 @@ instance HasSpiderTimeline x => Defer (Some RootClear) (EventM x) where
 
 -- Note: hold cannot examine its event until after the phase is over
 {-# INLINE [1] hold #-}
-hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeHoldInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
+hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
 hold v0 e = do
   valRef <- liftIO $ newIORef v0
   invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
-  defer $ SomeHoldInit $ whenNothingRef parentRef $ do
+  defer $ SomeInit $ whenNothingRef parentRef $ do
           liftIO . writeIORef parentRef . Just
             <=< subscribeWith e (\a -> do
                                     v <- liftIO $ readIORef valRef
@@ -535,7 +530,7 @@ hold v0 e = do
         , holdParent = parentRef
         }
 
-type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeHoldInit x])
+type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeInit x])
 
 -- BehaviorM can sample behaviors
 newtype BehaviorM x a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
@@ -550,8 +545,6 @@ newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscri
 -- type role PullSubscribed representational nominal
 
 newtype Invalidator = Invalidator (IO ())
-
-newtype SomeHoldInit x = SomeHoldInit (EventM x ())
 
 data SomeMergeUpdate x = SomeMergeUpdate
   { _someMergeUpdate_invalidateHeight :: !(IO ())
@@ -596,7 +589,7 @@ newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (EventM x (Hold x p)) }
 newMapDyn :: HasSpiderTimeline x => (a -> b) -> DynamicS x (Identity a) -> DynamicS x (Identity b)
 newMapDyn f d = dynamicDyn $ unsafeBuildDynamic (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
 
-buildDynamic :: forall x m p. (HasSpiderTimeline x, Patch p, Defer (SomeHoldInit x) m) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
+buildDynamic :: forall x m p. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
 buildDynamic readV0 v' = mdo
   result <- liftIO $ mfix $ \ref -> newIORef (do
       v0 <- liftIO $ runEventM readV0
@@ -604,7 +597,7 @@ buildDynamic readV0 v' = mdo
       liftIO $ writeIORef ref $ pure h
       return h)
   let !d = Dyn result
-  defer $ SomeHoldInit @x $ void $ join $ liftIO $ readIORef result
+  defer $ SomeInit $ void $ join $ liftIO $ readIORef result
   return d
 
 unsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
@@ -767,15 +760,15 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
            wi' <- mkWeakPtrWithDebug i
            writeIORef ownWeakInvalidatorRef $! wi'
            writeIORef parentsRef []
-           -- FIXME: why is this wonky? Can we do better than reusing runHoldInits in this way?
-           holdInitsRef <- newIORef []
+           -- FIXME: why is this wonky? Can we do better than reusing runInits in this way?
+           initsRef <- newIORef []
            -- TODO: after this runBehavior holdInitsRef always seems empty...
-           runEventM $ runHoldInits holdInitsRef =<< liftIO (newIORef [])
+           runEventM $ runInits initsRef
            --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
            subscription <- unSpiderHost . runFrame
              . flip subscribe subscriber
              --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-             =<< runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) holdInitsRef
+             =<< runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) initsRef
            writeIORef currentParentSubscriptionRef $! subscription
            return [oldSubscription])
   wi <- liftIO $ mkWeakPtrWithDebug ownInvalidator
@@ -839,7 +832,7 @@ instance Show EventLoopException where
   show EventLoopException = "causality loop detected: \n" <>
     "compile reflex with flag 'debug-cycles' and compile with profiling enabled for stack tree"
 
-runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeHoldInit x] -> IO a
+runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
 
 -- TODO: What is the meaning of this function?
@@ -1143,35 +1136,28 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
        liftIO $ writeIORef accumRef mempty
        pure dm
 
--- TODO: Getting rid of all these different types which get initialized at the same time anyway
---   might lead to patterns showing up in code.
-runHoldInits :: forall x. HasSpiderTimeline x => IORef [SomeHoldInit x] -> IORef [SomeInit x] -> EventM x ()
-runHoldInits holdInitRef initRef = do
-  holdInits <- liftIO $ readIORef holdInitRef
+runInits :: forall x. HasSpiderTimeline x => IORef [SomeInit x] -> EventM x ()
+runInits initRef = do
   inits <- liftIO $ readIORef initRef
-  unless (null holdInits && null inits) $ do
-    liftIO $ writeIORef holdInitRef []
+  unless (null inits) $ do
     liftIO $ writeIORef initRef []
-    forM_ holdInits $ \(SomeHoldInit h) ->  h
-    forM_ inits unSomeInit -- TODO: why is merge init just a thunk but do dyn/hold inits use a data type?
-    runHoldInits holdInitRef initRef
+    forM_ inits unSomeInit
+    runInits initRef
 
 newEventEnv :: IO (EventEnv x)
 newEventEnv = do
   toAssignRef <- newIORef [] -- This should only actually get used when events are firing
-  holdInitRef <- newIORef []
   mergeUpdateRef <- newIORef []
   initRef <- newIORef []
   heightRef <- newIORef zeroHeight
   toClearRef <- newIORef []
   toClearRootRef <- newIORef []
   delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef
+  return $ EventEnv toAssignRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef
 
 clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef holdInitRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef) = do
+clearEventEnv (EventEnv toAssignRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef) = do
   writeIORef toAssignRef []
-  writeIORef holdInitRef []
   writeIORef mergeUpdateRef []
   writeIORef initRef []
   writeIORef heightRef zeroHeight
@@ -1198,13 +1184,13 @@ runFrame a = SpiderHost $ do
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- runEventM $ do
         result <- a
-        runHoldInits (eventEnvHoldInits env) (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
+        runInits (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
         return result
+  readIORef (eventEnvAssignments env) >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
+                                                    writeIORef vRef v
+                                                    invalidate iRef)
   readIORef (eventEnvClears env) >>= mapM_ (\(Some (Clear ref)) -> writeIORef ref Nothing)
   readIORef (eventEnvRootClears env) >>= mapM_ (\(Some (RootClear ref)) -> writeIORef ref $! DMap.empty)
-  readIORef (eventEnvAssignments env) >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
-    writeIORef vRef v
-    invalidate iRef)
   mergeUpdates <- readIORef (eventEnvMergeUpdates env)
   clearEventEnv env
   liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _someMergeUpdate_update mergeUpdates)
