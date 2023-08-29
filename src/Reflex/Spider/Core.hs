@@ -377,10 +377,11 @@ dynamicConst !a = Dynamic
   }
 
 dynamicDyn :: Dyn x p -> DynamicS x p
-dynamicDyn !d = Dynamic
-  { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM (getDynHold d))
-  , dynamicUpdated = Event $ \sub -> getDynHold d >>= \h -> subscribeHoldEvent h sub
-  }
+dynamicDyn !d =
+ let dh = getDynHold d
+ in  Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
+             , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
+             }
 
 --------------------------------------------------------------------------------
 -- Combinators
