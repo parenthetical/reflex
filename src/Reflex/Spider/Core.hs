@@ -19,15 +19,11 @@
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE InstanceSigs #-}
-
-
-
-
-
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE RecursiveDo #-}
 
 module Reflex.Spider.Core
 ( EventSelectorG(selectG),
@@ -380,9 +376,9 @@ dynamicConst !a = Dynamic
   , dynamicUpdated = eventNever
   }
 
-dynamicDyn :: (HasSpiderTimeline x, Patch p) => Dyn x p -> DynamicS x p
+dynamicDyn :: Dyn x p -> DynamicS x p
 dynamicDyn !d = Dynamic
-  { dynamicCurrent = Behavior $ readHoldTracked =<< getDynHold d
+  { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM (getDynHold d))
   , dynamicUpdated = Event $ \sub -> getDynHold d >>= \h -> subscribeHoldEvent h sub
   }
 
@@ -602,25 +598,31 @@ heightBagRemove (Height h) b@(HeightBag s c) = case IntMap.lookup h c of
 heightBagMax :: HeightBag -> Height
 heightBagMax (HeightBag _ c) = maybe zeroHeight (\((h, _), _) -> Height h) . IntMap.maxViewWithKey $ c
 
-data DynType x p = UnsafeDyn !(BehaviorM x (PatchTarget p), Event x p)
-                 | BuildDyn  !(EventM x (PatchTarget p), Event x p)
-                 | HoldDyn   !(Hold x p)
-
-newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (DynType x p) }
+newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (EventM x (Hold x p)) }
 
 newMapDyn :: HasSpiderTimeline x => (a -> b) -> DynamicS x (Identity a) -> DynamicS x (Identity b)
 newMapDyn f d = dynamicDyn $ unsafeBuildDynamic (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
 
-buildDynamic :: forall x m p. (HasSpiderTimeline x, Defer (SomeHoldInit x) m, Patch p) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
-buildDynamic readV0 v' = do
-  result <- liftIO $ newIORef $ BuildDyn (readV0, v')
+buildDynamic :: forall x m p. (HasSpiderTimeline x, Patch p, Defer (SomeHoldInit x) m) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
+buildDynamic readV0 v' = mdo
+  result <- liftIO $ mfix $ \ref -> newIORef (do
+      v0 <- liftIO $ runEventM readV0
+      h <- hold v0 v'
+      liftIO $ writeIORef ref $ pure h
+      return h)
   let !d = Dyn result
-  defer $ SomeHoldInit @x $ void $ getDynHold d
+  defer $ SomeHoldInit @x $ void $ join $ liftIO $ readIORef result
   return d
 
-unsafeBuildDynamic :: BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
+unsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
 unsafeBuildDynamic readV0 v' =
-  Dyn $ unsafePerformIO $ newIORef $ UnsafeDyn (readV0, v')
+  Dyn $ unsafePerformIO $ mfix $ \ref -> newIORef $ do
+      holdInits <- getDeferralQueue
+      v0 <- liftIO $ runBehaviorM readV0 Nothing holdInits
+      -- TODO: repeated in buildDynami
+      h <- hold v0 v'
+      liftIO $ writeIORef ref $ pure h
+      return h
 
 instance HasSpiderTimeline x => Functor (Event x) where
   fmap f = push $ return . Just . f
@@ -848,7 +850,7 @@ runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSub
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
 
 -- TODO: What is the meaning of this function?
-addParentBAndInvalidator :: BehaviorSubscribed x a -> (IORef [Weak Invalidator]) -> BehaviorM x ()
+addParentBAndInvalidator :: BehaviorSubscribed x a -> IORef [Weak Invalidator] -> BehaviorM x ()
 addParentBAndInvalidator h invsRef = do
   (!m, _) <- ask
   case m of
@@ -859,24 +861,9 @@ addParentBAndInvalidator h invsRef = do
   
 
 {-# INLINE getDynHold #-}
-getDynHold :: (HasSpiderTimeline x, Defer (SomeHoldInit x) m, Patch p) => Dyn x p -> m (Hold x p)
-getDynHold d = do
-  mh <- liftIO $ readIORef $ unDyn d
-  case mh of
-    HoldDyn h -> return h
-    UnsafeDyn (readV0, v') -> do
-      holdInits <- getDeferralQueue
-      v0 <- liftIO $ runBehaviorM readV0 Nothing holdInits
-      hold' v0 v'
-    BuildDyn (readV0, v') -> do
-      v0 <- liftIO $ runEventM readV0
-      hold' v0 v'
-  where
-    hold' v0 v' = do
-      h <- hold v0 v'
-      liftIO $ writeIORef (unDyn d) $ HoldDyn h
-      return h
-
+getDynHold :: forall x p. Dyn x p -> EventM x (Hold x p)
+getDynHold (Dyn d) = do
+  join $ liftIO $ (readIORef d)
 
 -- Always refers to 0
 {-# NOINLINE zeroRef #-}
