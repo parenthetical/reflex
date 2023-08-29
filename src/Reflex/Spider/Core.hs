@@ -226,7 +226,7 @@ headE originalE = do
 now :: (Defer (Some Clear) m) => m (Event x ())
 now = do
   nowOrNot <- liftIO $ newIORef $ Just ()
-  scheduleClear nowOrNot
+  defer $ Some $ Clear nowOrNot
   return . Event $ \_ -> do
     occ <- liftIO . readIORef $ nowOrNot
     returnSubscription (pure ()) zeroRef () occ
@@ -501,23 +501,15 @@ instance HasSpiderTimeline x => Defer (Some Clear) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvClears
 
-{-# INLINE scheduleClear #-}
-scheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> m ()
-scheduleClear r = defer $ Some $ Clear r
-
 {-# INLINE writeAndScheduleClear #-}
 writeAndScheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> a -> m ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
-  scheduleClear ref
+  defer $ Some $ Clear ref
 
 instance HasSpiderTimeline x => Defer (Some RootClear) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvRootClears
-
-{-# INLINE scheduleRootClear #-}
-scheduleRootClear :: Defer (Some RootClear) m => IORef (DMap k Identity) -> m ()
-scheduleRootClear r = defer $ Some $ RootClear r
 
 -- Note: hold cannot examine its event until after the phase is over
 {-# INLINE [1] hold #-}
@@ -812,7 +804,7 @@ run roots after = do
         writeIORef occRef $! DMap.insert k a occBefore
         return occBefore
       if DMap.null occBefore
-        then do scheduleRootClear occRef
+        then do defer $ Some $ RootClear occRef
                 return $ Just r
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
