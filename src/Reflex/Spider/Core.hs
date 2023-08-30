@@ -223,10 +223,10 @@ headE originalE = do
   return $ Event $ \sub ->
     liftIO (readIORef parent) >>= maybe subscribeAndReadNever (`subscribeAndReadHead` sub)
 
-now :: (Defer (Some Clear) m) => m (Event x ())
+now :: (Defer Clear m) => m (Event x ())
 now = do
   nowOrNot <- liftIO $ newIORef $ Just ()
-  defer $ Some $ Clear nowOrNot
+  defer $ Clear $ writeIORef nowOrNot Nothing
   return . Event $ \_ -> do
     occ <- liftIO . readIORef $ nowOrNot
     returnSubscription (pure ()) zeroRef () occ
@@ -238,7 +238,7 @@ now = do
 --there's only one subscriber, and then build our own FastWeakBag only when a second
 --subscriber joins
 {-# NOINLINE [0] cacheEvent #-}
-cacheEvent :: forall x a. HasSpiderTimeline x => Event x a -> Event x a
+cacheEvent :: forall x a. (Defer Clear (EventM x)) => Event x a -> Event x a
 cacheEvent e = unsafePerformIO $ do
   subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
   parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
@@ -428,8 +428,7 @@ data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe
               , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
               , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
-              , eventEnvClears :: !(IORef [Some Clear]) -- Needed for Subscribe
-              , eventEnvRootClears :: !(IORef [Some RootClear])
+              , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
               , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
               , eventEnvDelayedMerges :: !(IORef (IntMap [EventM x ()]))
               }
@@ -493,19 +492,16 @@ putCurrentHeight h = do
   heightRef <- asksEventEnv eventEnvCurrentHeight
   liftIO $ writeIORef heightRef $! h
 
-instance HasSpiderTimeline x => Defer (Some Clear) (EventM x) where
+instance HasSpiderTimeline x => Defer Clear (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvClears
 
 {-# INLINE writeAndScheduleClear #-}
-writeAndScheduleClear :: Defer (Some Clear) m => IORef (Maybe a) -> a -> m ()
+writeAndScheduleClear :: Defer Clear m => IORef (Maybe a) -> a -> m ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
-  defer $ Some $ Clear ref
+  defer $ Clear $ writeIORef ref Nothing
 
-instance HasSpiderTimeline x => Defer (Some RootClear) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvRootClears
 
 -- Note: hold cannot examine its event until after the phase is over
 {-# INLINE [1] hold #-}
@@ -603,8 +599,7 @@ buildDynamic readV0 v' = mdo
 unsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
 unsafeBuildDynamic readV0 v' =
   Dyn $ unsafePerformIO $ mfix $ \ref -> newIORef $ do
-      holdInits <- getDeferralQueue
-      v0 <- liftIO $ runBehaviorM readV0 Nothing holdInits
+      v0 <- liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue -- holdInits queue
       -- TODO: repeated in buildDynami
       h <- hold v0 v'
       liftIO $ writeIORef ref $ pure h
@@ -798,7 +793,7 @@ run roots after = do
         writeIORef occRef $! DMap.insert k a occBefore
         return occBefore
       if DMap.null occBefore
-        then do defer $ Some $ RootClear occRef
+        then do defer $ Clear $ rootClear occRef
                 return $ Just r
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
@@ -814,9 +809,7 @@ run roots after = do
     putCurrentHeight maxBound
     after
 
-newtype Clear a = Clear (IORef (Maybe a))
-
-newtype RootClear k = RootClear (IORef (DMap k Identity))
+newtype Clear = Clear (IO ())
 
 data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
 
@@ -1151,18 +1144,16 @@ newEventEnv = do
   initRef <- newIORef []
   heightRef <- newIORef zeroHeight
   toClearRef <- newIORef []
-  toClearRootRef <- newIORef []
   delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef
+  return $ EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef
 
 clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef mergeUpdateRef initRef toClearRef toClearRootRef heightRef delayedRef) = do
+clearEventEnv (EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef) = do
   writeIORef toAssignRef []
   writeIORef mergeUpdateRef []
   writeIORef initRef []
   writeIORef heightRef zeroHeight
   writeIORef toClearRef []
-  writeIORef toClearRootRef []
   writeIORef delayedRef IntMap.empty
 
 
@@ -1178,6 +1169,8 @@ invalidate wisRef = do
         i
   writeIORef wisRef []
 
+rootClear ref = writeIORef ref $! DMap.empty
+
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
@@ -1189,8 +1182,7 @@ runFrame a = SpiderHost $ do
   readIORef (eventEnvAssignments env) >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                                     writeIORef vRef v
                                                     invalidate iRef)
-  readIORef (eventEnvClears env) >>= mapM_ (\(Some (Clear ref)) -> writeIORef ref Nothing)
-  readIORef (eventEnvRootClears env) >>= mapM_ (\(Some (RootClear ref)) -> writeIORef ref $! DMap.empty)
+  readIORef (eventEnvClears env) >>= mapM_ (\(Clear m) -> m)
   mergeUpdates <- readIORef (eventEnvMergeUpdates env)
   clearEventEnv env
   liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _someMergeUpdate_update mergeUpdates)
