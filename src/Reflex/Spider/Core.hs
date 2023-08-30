@@ -660,65 +660,50 @@ pull a = unsafePerformIO $ do
 coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
-  toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
-  innerSubdRef <- liftIO $ newIORef $ error "coincidence: innerSubdRef undefined"
-  outerParentSubscriptionRef <- liftIO $ newIORef $ error "coincidence : outerParentSubscriptionRef undefined"
-  occRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
-  -- TODO: switch returns currentParent which is ~ outerParent, coincidence also returns innerParent
-  let getParentSubscribeds = do
-        maybeInnerSubscription <- readIORef innerSubdRef
-        outerSubscription <- readIORef outerParentSubscriptionRef
-        return $ _eventSubscription_subscribed outerSubscription : maybeToList maybeInnerSubscription
+  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
+  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
+  hasOccurredRef :: IORef Bool <- liftIO $ newIORef False
+  -- TODO: comments say that "'when's should be assertions" but tests fail if they are removed
+  let updateCommonHeight :: Height -> IO ()
+      updateCommonHeight newHeight = do
+        oldHeight <- readIORef heightRef
+        when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+          when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+            writeIORef heightRef $! newHeight
+            recalculateSubscriberHeight newHeight sub
+  let getMyHeight = do
+        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
+        pure $ if null subs
+               then Height 0
+               else if invalidHeight `elem` subs then invalidHeight else maximum subs
   let invalidateThisHeightRef = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
-  let subscribeAndReadWithHeight' :: forall b. Event x b -> (b -> EventM x ()) -> EventM x (EventSubscription x, Height, Maybe b)
-      subscribeAndReadWithHeight' e propagateSpecific = subscribeAndReadWithHeight e $ Subscriber
-          { subscriberPropagate = propagateSpecific
-          , subscriberInvalidateHeight = const invalidateThisHeightRef -- TODO: what normally happens with the passed in height here?
-          , subscriberRecalculateHeight = updateCommonHeight heightRef sub
-          }
-  let subscribeCoincidenceInner :: Event x a -> Height -> EventM x (Maybe a, Height)
-      subscribeCoincidenceInner inner outerHeight = do
-        (innerSubscription@(EventSubscription _ innerSubd), innerHeight, innerOcc) <-
-          subscribeAndReadWithHeight' inner $ \a ->
-             whenNothingRef occRef $ do
-                writeAndScheduleClear occRef a
-                subscriberPropagate sub a
-        writeAndScheduleClear innerSubdRef innerSubd
-        let innerHeightWasHigher = innerHeight > outerHeight
-        defer $ SomeMergeUpdate @x
-           (do unsubscribe innerSubscription
-               when innerHeightWasHigher invalidateThisHeightRef)
-           (when innerHeightWasHigher $
-             updateCommonHeight heightRef sub =<< do
-               subs <- mapM getEventSubscribedHeight =<< getParentSubscribeds
-               -- TODO: why not order heights with invalid as Top?
-               return $ if invalidHeight `elem` subs then invalidHeight else maximum subs)
-           (pure [])
-        return (innerOcc, max innerHeight outerHeight)
-  (outerSubscription, outerHeight, outerOcc) <- subscribeAndReadWithHeight' coincidenceParent $ \a ->
-      {-# SCC "traverseCoincidenceOuter" #-} do
-         outerHeight <- liftIO $ readIORef heightRef
-         (occ, innerHeight) <- subscribeCoincidenceInner a outerHeight
-         case occ of
-           Nothing ->
-             when (innerHeight > outerHeight) $ liftIO $ do -- If the event fires, it will fire at a later height
-               writeIORef heightRef $! innerHeight
-               invalidateSubscriberHeight outerHeight sub
-               recalculateSubscriberHeight innerHeight sub
-           Just o -> subscriberPropagate sub o -- Since it's already firing, no need to adjust height
-  liftIO $ writeIORef outerParentSubscriptionRef outerSubscription
-  (occ, height) <- case outerOcc of
-    Nothing -> return (Nothing, outerHeight)
-    -- TODO: can we make subscribeCoincidenceInner read the outerHeight on its own? Then can we make heightRef setting more imperative? This all to possibly avoid having to treat occ and propagated value differently.
-    Just o -> subscribeCoincidenceInner o outerHeight
-  mapM_ (writeAndScheduleClear occRef) occ
-  liftIO $ writeIORef heightRef height
-  liftIO $ writeIORef toRetainRef (sub, (outerParentSubscriptionRef, innerSubdRef)) -- TODO: is toRetain correct?
-  returnSubscription ((unsubscribe =<< readIORef outerParentSubscriptionRef)
-                      >> writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
-                     heightRef
-                     toRetainRef
-                     occ
+  let subscribeAndReadWithHeight' :: forall b. Event x b -> (b -> EventM x ()) -> EventM x (IO (), Height, Maybe b)
+      subscribeAndReadWithHeight' e propagateSpecific = do
+        (subscription, height, occ) <- subscribeAndReadWithHeight e
+                                       $ Subscriber propagateSpecific (const invalidateThisHeightRef) updateCommonHeight -- TODO: what normally happens with the passed in height here? (re: const invalidate)
+        i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
+        liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
+        pure (unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i), height, occ)
+  (unsubscribeOuterSubscription, outerHeight, occ) <-
+    subscribeAndReadWithHeight' (pushCheap (\e -> do
+                                               previousHeight <- liftIO getMyHeight
+                                               (doUnsubscribe, height, occ) <-
+                                                 subscribeAndReadWithHeight' e $ \a -> do
+                                                   hasOccurred <- liftIO $ readIORef hasOccurredRef
+                                                   unless hasOccurred $ do
+                                                     defer $ Clear $ writeIORef hasOccurredRef False
+                                                     subscriberPropagate sub a
+                                               defer $ Clear doUnsubscribe
+                                               when (height > previousHeight) $ 
+                                                 defer $ SomeMergeUpdate @x
+                                                  invalidateThisHeightRef
+                                                  (updateCommonHeight =<< getMyHeight)
+                                                  (pure [])
+                                               return occ)
+                                 coincidenceParent)
+    $ subscriberPropagate sub
+  liftIO $ writeIORef heightRef =<< getMyHeight
+  returnSubscription unsubscribeOuterSubscription heightRef subscriptionsRef occ
 
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ Event $ \sub -> do
@@ -782,6 +767,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
           heightRef
           toRetainRef
           parentOcc
+
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
 run roots after = do
