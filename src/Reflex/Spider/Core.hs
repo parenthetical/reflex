@@ -663,7 +663,7 @@ getSubscriptionsHeight subscriptionsRef = do
 -- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
 coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
-  heightRef <- liftIO $ newIORef invalidHeight
+  heightRef <- liftIO $ newIORef zeroHeight -- TODO: both zeroHeight and invalidHeight work here
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
   let subscribeAndRead' e = do
