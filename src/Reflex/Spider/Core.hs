@@ -659,7 +659,7 @@ pull a = unsafePerformIO $ do
 -- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
 coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
-  heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
+  heightRef <- liftIO $ newIORef invalidHeight
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
   -- TODO: comments say that "'when's should be assertions" but tests fail if they are removed
@@ -672,29 +672,35 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
             recalculateSubscriberHeight newHeight sub
   let getMyHeight = do
         subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-        pure $ if null subs
-               then Height 0
-               else if invalidHeight `elem` subs then invalidHeight else maximum subs
-  let invalidateThisHeightRef = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
-  let subscribeAndReadWithHeight' e = do
-        (subscription, height, occ) <- subscribeAndReadWithHeight e
-                                       $ Subscriber (subscriberPropagate sub) (const invalidateThisHeightRef) updateCommonHeight -- TODO: what normally happens with the passed in height here? (re: const invalidate)
+        pure $ if null subs then Height 0 else if invalidHeight `elem` subs then invalidHeight else maximum subs
+  let invalidateThisHeightRef = do
+        oldHeight <- readIORef heightRef
+        -- Don't do anything if the height is already invalid
+        when (oldHeight /= invalidHeight) $ do
+          writeIORef heightRef $! invalidHeight
+          subscriberInvalidateHeight sub oldHeight
+  let subscribeAndRead' e = do
+        (subscription, height, occ) <-
+          subscribeAndReadWithHeight e $ Subscriber
+            { subscriberPropagate = subscriberPropagate sub
+            , subscriberInvalidateHeight = const invalidateThisHeightRef -- TODO: what normally happens with the passed in height here?
+            , subscriberRecalculateHeight = updateCommonHeight
+            }
+        previousHeight <- liftIO getMyHeight
         i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
         liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-        pure (unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i), height, occ)
-  (unsubscribeOuterSubscription, _outerHeight, occ) <-
-    subscribeAndReadWithHeight' (pushCheap (\e -> do
-                                               previousHeight <- liftIO getMyHeight
-                                               (doUnsubscribe, height, occ) <- subscribeAndReadWithHeight' e
-                                               defer $ Clear doUnsubscribe
-                                               when (height > previousHeight) $ 
-                                                 defer $ SomeMergeUpdate @x
+        when (height > previousHeight) $ defer $ SomeMergeUpdate @x
                                                   invalidateThisHeightRef
                                                   (updateCommonHeight =<< getMyHeight)
                                                   (pure [])
-                                               return occ)
-                                 coincidenceParent)
-  liftIO $ writeIORef heightRef =<< getMyHeight
+        liftIO $ updateCommonHeight height
+        pure (unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i), occ)
+  (unsubscribeOuterSubscription, occ) <-
+    subscribeAndRead' (pushCheap (\e -> do
+                                     (doUnsubscribe, occ) <- subscribeAndRead' e
+                                     defer $ Clear doUnsubscribe
+                                     return occ)
+                       coincidenceParent)
   returnSubscription unsubscribeOuterSubscription heightRef subscriptionsRef occ
 
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
