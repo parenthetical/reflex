@@ -652,6 +652,10 @@ pull a = unsafePerformIO $ do
     addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
     pure $ pullSubscribedValue subscribed
 
+getSubscriptionsHeight subscriptionsRef = do
+  subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
+  pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
+
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
@@ -662,39 +666,30 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef invalidHeight
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
-  -- TODO: comments say that "'when's should be assertions" but tests fail if they are removed
-  let updateCommonHeight :: Height -> IO ()
-      updateCommonHeight newHeight = do
-        oldHeight <- readIORef heightRef
-        when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-          when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-            writeIORef heightRef $! newHeight
-            recalculateSubscriberHeight newHeight sub
-  let getMyHeight = do
-        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-        pure $ if null subs then Height 0 else if invalidHeight `elem` subs then invalidHeight else maximum subs
-  let invalidateThisHeightRef = do
-        oldHeight <- readIORef heightRef
-        -- Don't do anything if the height is already invalid
-        when (oldHeight /= invalidHeight) $ do
-          writeIORef heightRef $! invalidHeight
-          subscriberInvalidateHeight sub oldHeight
   let subscribeAndRead' e = do
         (subscription, height, occ) <-
           subscribeAndReadWithHeight e $ Subscriber
             { subscriberPropagate = subscriberPropagate sub
-            , subscriberInvalidateHeight = const invalidateThisHeightRef -- TODO: what normally happens with the passed in height here?
-            , subscriberRecalculateHeight = updateCommonHeight
+            , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
+               oldHeight <- readIORef heightRef
+               -- Don't do anything if the height is already invalid
+               when (oldHeight /= invalidHeight) $ do
+                 writeIORef heightRef $! invalidHeight
+                 subscriberInvalidateHeight sub oldHeight 
+            , subscriberRecalculateHeight = \newHeight -> do
+                 oldHeight <- readIORef heightRef
+                 assert (oldHeight == invalidHeight && newHeight /= invalidHeight) $ do
+                   writeIORef heightRef $! newHeight
+                   recalculateSubscriberHeight newHeight sub
             }
-        previousHeight <- liftIO getMyHeight
-        i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
-        liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-        when (height > previousHeight) $ defer $ SomeMergeUpdate @x
-                                                  invalidateThisHeightRef
-                                                  (updateCommonHeight =<< getMyHeight)
-                                                  (pure [])
-        liftIO $ updateCommonHeight height
-        pure (unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i), occ)
+        liftIO $ do oldHeight <- readIORef heightRef
+                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+                      assert (height /= invalidHeight) $ do
+                        writeIORef heightRef $! height
+                        recalculateSubscriberHeight height sub
+        do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
+           liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
+           pure (unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i), occ)
   (unsubscribeOuterSubscription, occ) <-
     subscribeAndRead' (pushCheap (\e -> do
                                      (doUnsubscribe, occ) <- subscribeAndRead' e
