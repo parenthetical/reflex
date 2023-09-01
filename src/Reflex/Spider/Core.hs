@@ -325,6 +325,16 @@ subscribeHoldEvent = subscribeAndRead . holdEvent
 
 newtype Behavior x a = Behavior { readBehaviorTracked :: BehaviorM x a }
 
+--type role Hold representational
+data Hold x p
+   = Hold { holdValue :: !(IORef (PatchTarget p))
+          , holdInvalidators :: !(IORef [Weak Invalidator])
+          , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
+          , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
+          }
+
+
+
 behaviorHold :: Hold x p -> Behavior x (PatchTarget p)
 behaviorHold !h = Behavior $ readHoldTracked h
 
@@ -347,6 +357,101 @@ readBehaviorUntracked :: Defer (SomeInit x) m => Behavior x a -> m a
 readBehaviorUntracked b = do
   holdInits <- getDeferralQueue
   liftIO $ runBehaviorM (readBehaviorTracked b) Nothing holdInits --TODO: Specialize readBehaviorTracked to the Nothing and Just cases
+
+-- TODO: what is really needed here?
+data PullSubscribed x a
+   = PullSubscribed { pullSubscribedValue :: !a
+                    , pullSubscribedInvalidators :: !(IORef [Weak Invalidator])
+                    , pullSubscribedOwnInvalidator :: !Invalidator
+                    , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
+                    }
+
+{-# INLINABLE pull #-}
+pull :: BehaviorM x a -> Behavior x a
+pull a = unsafePerformIO $ do
+  ref <- newIORef Nothing
+  invsRef <- newIORef []
+  pure $ Behavior $ do
+    subscribed <- liftIO (readIORef ref) >>= \case
+      Just subscribed -> pure subscribed
+      Nothing -> do
+        let i = Invalidator $ readIORef ref
+                >>= mapM_ (const $ do
+                              writeIORef ref Nothing
+                              evaluate =<< invalidate invsRef)
+        wi <- liftIO $ mkWeakPtrWithDebug i
+        parentsRef <- liftIO $ newIORef []
+        (_, !holdInits) <- ask -- ask behavior hold inits
+        aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
+        parents <- liftIO $ readIORef parentsRef
+        let subscribed = PullSubscribed
+              { pullSubscribedValue = aVal
+              , pullSubscribedInvalidators = invsRef
+              , pullSubscribedOwnInvalidator = i
+              , pullSubscribedParents = parents
+              }
+        liftIO $ writeIORef ref $ Just subscribed
+        return subscribed
+    addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
+    pure $ pullSubscribedValue subscribed
+
+-- Note: hold cannot examine its event until after the phase is over
+{-# INLINE [1] hold #-}
+hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
+hold v0 e = do
+  valRef <- liftIO $ newIORef v0
+  invsRef <- liftIO $ newIORef [] -- invalidators
+  parentRef <- liftIO $ newIORef Nothing
+  defer $ SomeInit $ whenNothingRef parentRef $ do
+          liftIO . writeIORef parentRef . Just
+            <=< subscribeWith e (\a -> do
+                                    v <- liftIO $ readIORef valRef
+                                    forM_ (apply a v) $ \v' -> do
+                                      vRef <- liftIO $ evaluate valRef
+                                      iRef <- liftIO $ evaluate invsRef
+                                      defer $ SomeAssignment @x vRef iRef v')
+            $ terminalSubscriber
+  return $ Hold
+        { holdValue = valRef
+        , holdInvalidators = invsRef
+        , holdEvent = e
+        , holdParent = parentRef
+        }
+
+type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeInit x])
+
+-- BehaviorM can sample behaviors
+newtype BehaviorM x a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
+  deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
+
+data BehaviorSubscribed x a
+   = forall p. BehaviorSubscribedHold (Hold x p)
+   | BehaviorSubscribedPull (PullSubscribed x a)
+
+newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscribed x))
+
+-- type role PullSubscribed representational nominal
+
+newtype Invalidator = Invalidator (IO ())
+
+runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
+runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
+
+-- TODO: What is the meaning of this function?
+addParentBAndInvalidator :: BehaviorSubscribed x a -> IORef [Weak Invalidator] -> BehaviorM x ()
+addParentBAndInvalidator h invsRef = do
+  (!m, _) <- ask
+  case m of
+    Nothing -> pure ()
+    Just (!wi, !p) -> do
+      liftIO $ modifyIORef' invsRef (wi:)
+      liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
+
+
+{-# INLINE getDynHold #-}
+getDynHold :: forall x p. Dyn x p -> EventM x (Hold x p)
+getDynHold (Dyn d) = do
+  join $ liftIO $ (readIORef d)
 
 --------------------------------------------------------------------------------
 -- Dynamic
@@ -386,14 +491,6 @@ dynamicDyn !d =
 --------------------------------------------------------------------------------
 -- Combinators
 --------------------------------------------------------------------------------
-
---type role Hold representational
-data Hold x p
-   = Hold { holdValue :: !(IORef (PatchTarget p))
-          , holdInvalidators :: !(IORef [Weak Invalidator])
-          , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
-          , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
-          }
 
 -- | A statically allocated 'SpiderTimeline'
 data Global
@@ -503,45 +600,6 @@ writeAndScheduleClear ref val = do
   defer $ Clear $ writeIORef ref Nothing
 
 
--- Note: hold cannot examine its event until after the phase is over
-{-# INLINE [1] hold #-}
-hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
-hold v0 e = do
-  valRef <- liftIO $ newIORef v0
-  invsRef <- liftIO $ newIORef [] -- invalidators
-  parentRef <- liftIO $ newIORef Nothing
-  defer $ SomeInit $ whenNothingRef parentRef $ do
-          liftIO . writeIORef parentRef . Just
-            <=< subscribeWith e (\a -> do
-                                    v <- liftIO $ readIORef valRef
-                                    forM_ (apply a v) $ \v' -> do
-                                      vRef <- liftIO $ evaluate valRef
-                                      iRef <- liftIO $ evaluate invsRef
-                                      defer $ SomeAssignment @x vRef iRef v')
-            $ terminalSubscriber
-  return $ Hold
-        { holdValue = valRef
-        , holdInvalidators = invsRef
-        , holdEvent = e
-        , holdParent = parentRef
-        }
-
-type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeInit x])
-
--- BehaviorM can sample behaviors
-newtype BehaviorM x a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
-
-data BehaviorSubscribed x a
-   = forall p. BehaviorSubscribedHold (Hold x p)
-   | BehaviorSubscribedPull (PullSubscribed x a)
-
-newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscribed x))
-
--- type role PullSubscribed representational nominal
-
-newtype Invalidator = Invalidator (IO ())
-
 data SomeMergeUpdate x = SomeMergeUpdate
   { _someMergeUpdate_invalidateHeight :: !(IO ())
   , _someMergeUpdate_recalculateHeight :: !(IO ())
@@ -614,43 +672,6 @@ instance HasSpiderTimeline x => Functor (Behavior x) where
 {-# INLINE push #-}
 push :: HasSpiderTimeline x => (a -> EventM x (Maybe b)) -> Event x a -> Event x b
 push f e = cacheEvent (pushCheap f e)
-
--- TODO: what is really needed here?
-data PullSubscribed x a
-   = PullSubscribed { pullSubscribedValue :: !a
-                    , pullSubscribedInvalidators :: !(IORef [Weak Invalidator])
-                    , pullSubscribedOwnInvalidator :: !Invalidator
-                    , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
-                    }
-
-{-# INLINABLE pull #-}
-pull :: BehaviorM x a -> Behavior x a
-pull a = unsafePerformIO $ do
-  ref <- newIORef Nothing
-  invsRef <- newIORef []
-  pure $ Behavior $ do
-    subscribed <- liftIO (readIORef ref) >>= \case
-      Just subscribed -> pure subscribed
-      Nothing -> do
-        let i = Invalidator $ readIORef ref
-                >>= mapM_ (const $ do
-                              writeIORef ref Nothing
-                              evaluate =<< invalidate invsRef)
-        wi <- liftIO $ mkWeakPtrWithDebug i
-        parentsRef <- liftIO $ newIORef []
-        (_, !holdInits) <- ask -- ask behavior hold inits
-        aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
-        parents <- liftIO $ readIORef parentsRef
-        let subscribed = PullSubscribed
-              { pullSubscribedValue = aVal
-              , pullSubscribedInvalidators = invsRef
-              , pullSubscribedOwnInvalidator = i
-              , pullSubscribedParents = parents
-              }
-        liftIO $ writeIORef ref $ Just subscribed
-        return subscribed
-    addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
-    pure $ pullSubscribedValue subscribed
 
 getSubscriptionsHeight subscriptionsRef = do
   subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
@@ -803,25 +824,6 @@ instance Exception EventLoopException
 instance Show EventLoopException where
   show EventLoopException = "causality loop detected: \n" <>
     "compile reflex with flag 'debug-cycles' and compile with profiling enabled for stack tree"
-
-runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
-runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
-
--- TODO: What is the meaning of this function?
-addParentBAndInvalidator :: BehaviorSubscribed x a -> IORef [Weak Invalidator] -> BehaviorM x ()
-addParentBAndInvalidator h invsRef = do
-  (!m, _) <- ask
-  case m of
-    Nothing -> pure ()
-    Just (!wi, !p) -> do
-      liftIO $ modifyIORef' invsRef (wi:)
-      liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
-  
-
-{-# INLINE getDynHold #-}
-getDynHold :: forall x p. Dyn x p -> EventM x (Hold x p)
-getDynHold (Dyn d) = do
-  join $ liftIO $ (readIORef d)
 
 -- Always refers to 0
 {-# NOINLINE zeroRef #-}
