@@ -710,18 +710,26 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
   toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
-  -- Adriaan: I think this is because only readBehaviorTracked is run so its argument is the only parent
-  --          that will be put in parentsRef. However you'd have to parameterize over "setting parents"
-  --          in Behavior to fix that TODO?
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  let subscriber = Subscriber
+  let mySubscribe :: EventM x (Height, Maybe a)
+      mySubscribe = do
+        wi <- liftIO $ readIORef ownWeakInvalidatorRef
+        --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+        initsRef <- liftIO $ newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
+        liftIO $ writeIORef parentsRef []
+        e <- liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef)
+        liftIO $ putStrLn . ("Parents size: " <>) . show . length =<< readIORef parentsRef
+        (subscription, height, parentOcc) <- subscribeAndReadWithHeight e Subscriber
           { subscriberPropagate = subscriberPropagate sub
           , subscriberInvalidateHeight = \_height ->
               invalidateHeightRef heightRef (subscriberInvalidateHeight sub) -- TODO: what normally happens with the passed in height here?
           , subscriberRecalculateHeight = updateCommonHeight heightRef sub
           }
+        liftIO $ writeIORef currentParentSubscriptionRef subscription
+        inits <- liftIO $ readIORef initsRef
+        assert (null inits) $ pure (height, parentOcc)
   ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ Invalidator $
    runEventM @x $ defer $ SomeMergeUpdate @x
          (do EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
@@ -735,31 +743,16 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
            =<< readIORef currentParentSubscriptionRef)
          (liftIO $ do
            oldSubscription <- readIORef currentParentSubscriptionRef
-           wi <- readIORef ownWeakInvalidatorRef
-           finalize wi
+           finalize =<< readIORef ownWeakInvalidatorRef
            wi' <- mkWeakPtrWithDebug i
            writeIORef ownWeakInvalidatorRef $! wi'
-           writeIORef parentsRef []
-           -- FIXME: why is this wonky? Can we do better than reusing runInits in this way?
-           initsRef <- newIORef []
-           -- TODO: after this runBehavior holdInitsRef always seems empty...
-           runEventM $ runInits initsRef
-           --TODO: Make sure we touch the pieces of the SwitchSubscribed at the appropriate times
-           subscription <- unSpiderHost . runFrame
-             . flip subscribe subscriber
-             --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-             =<< runBehaviorM (readBehaviorTracked switchParent) (Just (wi', parentsRef)) initsRef
-           writeIORef currentParentSubscriptionRef $! subscription
+           _ <- unSpiderHost . runFrame $ mySubscribe
            return [oldSubscription])
   wi <- liftIO $ mkWeakPtrWithDebug ownInvalidator
-  holdInits <- getDeferralQueue
-  (subscription, height, parentOcc) <-
-    flip subscribeAndReadWithHeight subscriber
-     =<< liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) holdInits)
   liftIO $ writeIORef ownWeakInvalidatorRef wi
-  liftIO $ writeIORef currentParentSubscriptionRef subscription
+  (height, parentOcc) <- mySubscribe
   liftIO $ writeIORef heightRef height
-  liftIO $ writeIORef toRetainRef (sub, (ownInvalidator, ownWeakInvalidatorRef, currentParentSubscriptionRef)) -- TODO: is toRetain correct?
+  liftIO $ writeIORef toRetainRef (ownInvalidator, currentParentSubscriptionRef) -- TODO: is toRetain correct?
   returnSubscription 
           (do unsubscribe =<< readIORef currentParentSubscriptionRef
               finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
