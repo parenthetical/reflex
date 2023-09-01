@@ -663,19 +663,8 @@ getSubscriptionsHeight subscriptionsRef = do
   subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
   pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
 
--- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
---     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
---     of all used heights.
--- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
--- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
-coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
-coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
-  heightRef <- liftIO $ newIORef zeroHeight -- TODO: both zeroHeight and invalidHeight work here
-  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
-  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
-  let subscribeAndRead' e = do
-        (subscription, height, occ) <-
-          subscribeAndReadWithHeight e $ Subscriber
+
+commonSubscribeAndReadWithHeight sub heightRef e = subscribeAndReadWithHeight e $ Subscriber
             { subscriberPropagate = subscriberPropagate sub
             , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
                oldHeight <- readIORef heightRef
@@ -689,6 +678,19 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
                    writeIORef heightRef $! newHeight
                    recalculateSubscriberHeight newHeight sub
             }
+
+-- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
+--     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
+--     of all used heights.
+-- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
+-- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
+coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
+coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
+  heightRef <- liftIO $ newIORef zeroHeight -- TODO: both zeroHeight and invalidHeight work here
+  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
+  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
+  let subscribeAndRead' e = do
+        (subscription, height, occ) <- commonSubscribeAndReadWithHeight sub heightRef e
         liftIO $ do oldHeight <- readIORef heightRef
                     when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
                       assert (height /= invalidHeight) $ do
@@ -707,51 +709,53 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
 
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ Event $ \sub -> do
-  heightRef <- liftIO $ newIORef $ error "commonEvent: heightRef uninitialized"
+  heightRef <- liftIO $ newIORef $ invalidHeight -- error "commonEvent: heightRef uninitialized"
   toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  let mySubscribe :: EventM x (Height, Maybe a)
+  let writeNewWeakInvalidator i = do
+        wi <-  mkWeakPtrWithDebug i
+        writeIORef ownWeakInvalidatorRef $! wi
+  let mySubscribe :: EventM x (Maybe a)
       mySubscribe = do
         wi <- liftIO $ readIORef ownWeakInvalidatorRef
         --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
         initsRef <- liftIO $ newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
         liftIO $ writeIORef parentsRef []
         e <- liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef)
-        liftIO $ putStrLn . ("Parents size: " <>) . show . length =<< readIORef parentsRef
-        (subscription, height, parentOcc) <- subscribeAndReadWithHeight e Subscriber
-          { subscriberPropagate = subscriberPropagate sub
-          , subscriberInvalidateHeight = \_height ->
-              invalidateHeightRef heightRef (subscriberInvalidateHeight sub) -- TODO: what normally happens with the passed in height here?
-          , subscriberRecalculateHeight = updateCommonHeight heightRef sub
-          }
+        (subscription, height, parentOcc) <- commonSubscribeAndReadWithHeight sub heightRef e
         liftIO $ writeIORef currentParentSubscriptionRef subscription
+        liftIO $ do oldHeight <- readIORef heightRef
+                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+                      assert (height /= invalidHeight) $ do
+                        writeIORef heightRef $! height
+                        recalculateSubscriberHeight height sub
         inits <- liftIO $ readIORef initsRef
-        assert (null inits) $ pure (height, parentOcc)
-  ownInvalidator <- mfix $ \i -> liftIO $ evaluate $ Invalidator $
-   runEventM @x $ defer $ SomeMergeUpdate @x
+        assert (null inits) $ pure parentOcc
+  ownInvalidator <- mfix $ \i -> liftIO $ do
+    evaluate $ Invalidator $ runEventM @x $ defer $ SomeMergeUpdate @x
          (do EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
              parentHeight <- getEventSubscribedHeight subd'
              myHeight <- readIORef heightRef
              when (parentHeight /= myHeight) $ do
                writeIORef heightRef $! invalidHeight
                invalidateSubscriberHeight myHeight sub)
-         (updateCommonHeight heightRef sub
-           =<< getEventSubscribedHeight . _eventSubscription_subscribed
-           =<< readIORef currentParentSubscriptionRef)
+         (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
+             oldHeight <- readIORef heightRef
+             when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+               when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+                 writeIORef heightRef $! newHeight
+                 recalculateSubscriberHeight newHeight sub)
          (liftIO $ do
            oldSubscription <- readIORef currentParentSubscriptionRef
            finalize =<< readIORef ownWeakInvalidatorRef
-           wi' <- mkWeakPtrWithDebug i
-           writeIORef ownWeakInvalidatorRef $! wi'
+           writeNewWeakInvalidator i
            _ <- unSpiderHost . runFrame $ mySubscribe
            return [oldSubscription])
-  wi <- liftIO $ mkWeakPtrWithDebug ownInvalidator
-  liftIO $ writeIORef ownWeakInvalidatorRef wi
-  (height, parentOcc) <- mySubscribe
-  liftIO $ writeIORef heightRef height
+  liftIO $ writeNewWeakInvalidator ownInvalidator
+  parentOcc <- mySubscribe
   liftIO $ writeIORef toRetainRef (ownInvalidator, currentParentSubscriptionRef) -- TODO: is toRetain correct?
   returnSubscription 
           (do unsubscribe =<< readIORef currentParentSubscriptionRef
@@ -1176,15 +1180,6 @@ invalidateHeightRef heightRef doOnInvalidate = do
   when (oldHeight /= invalidHeight) $ do
     writeIORef heightRef $! invalidHeight
     doOnInvalidate oldHeight
-
--- TODO: comments say that "'when's should be assertions" but tests fail if they are removed
-updateCommonHeight :: IORef Height -> Subscriber x a -> Height -> IO ()
-updateCommonHeight heightRef subscriber newHeight = do
-  oldHeight <- readIORef heightRef
-  when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-    when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-      writeIORef heightRef $! newHeight
-      recalculateSubscriberHeight newHeight subscriber
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
