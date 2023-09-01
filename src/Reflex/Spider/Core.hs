@@ -50,7 +50,6 @@ module Reflex.Spider.Core
       behaviorConst,
       readBehaviorUntracked,
       dynamicHold,
-      dynamicHoldIdentity,
       dynamicConst,
       dynamicDyn,
       writeAndScheduleClear,
@@ -447,12 +446,6 @@ addParentBAndInvalidator h invsRef = do
       liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
 
-
-{-# INLINE getDynHold #-}
-getDynHold :: forall x p. Dyn x p -> EventM x (Hold x p)
-getDynHold (Dyn d) = do
-  join $ liftIO $ (readIORef d)
-
 --------------------------------------------------------------------------------
 -- Dynamic
 --------------------------------------------------------------------------------
@@ -472,9 +465,6 @@ dynamicHold !h = Dynamic
   , dynamicUpdated = Event $ subscribeHoldEvent h
   }
 
-dynamicHoldIdentity :: Hold x (Identity a) -> DynamicS x (Identity a)
-dynamicHoldIdentity = dynamicHold
-
 dynamicConst :: PatchTarget p -> DynamicS x p
 dynamicConst !a = Dynamic
   { dynamicCurrent = behaviorConst a
@@ -482,8 +472,8 @@ dynamicConst !a = Dynamic
   }
 
 dynamicDyn :: Dyn x p -> DynamicS x p
-dynamicDyn !d =
- let dh = getDynHold d
+dynamicDyn (Dyn !d) =
+ let dh = join $ liftIO $ readIORef d
  in  Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
              , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
              }
@@ -529,10 +519,6 @@ data EventEnv x
               , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
               , eventEnvDelayedMerges :: !(IORef (IntMap [EventM x ()]))
               }
-
-{-# INLINE runEventM #-}
-runEventM :: EventM x a -> IO a
-runEventM = unEventM
 
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
 asksEventEnv f = return $ f $ _spiderTimeline_eventEnv (unSTE (spiderTimeline :: SpiderTimelineEnv x))
@@ -609,7 +595,7 @@ data SomeMergeUpdate x = SomeMergeUpdate
 newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
 
 -- EventM can do everything BehaviorM can, plus create holds
-newtype EventM x a = EventM { unEventM :: IO a }
+newtype EventM x a = EventM { runEventM :: IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
 
 data HeightBag = HeightBag
