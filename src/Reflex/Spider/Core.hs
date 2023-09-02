@@ -664,6 +664,11 @@ getSubscriptionsHeight subscriptionsRef = do
   pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
 
 
+commonSubscribeAndReadWithHeight :: forall {k} {x :: k} {a}.
+  Subscriber x a
+  -> IORef Height
+  -> Event x a
+  -> EventM x (EventSubscription x, Height, Maybe a)
 commonSubscribeAndReadWithHeight sub heightRef e = subscribeAndReadWithHeight e $ Subscriber
             { subscriberPropagate = subscriberPropagate sub
             , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
@@ -710,7 +715,6 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef $ invalidHeight -- error "commonEvent: heightRef uninitialized"
-  toRetainRef <- liftIO $ newIORef $ error "commonEvent: toRetainRef uninitialized"
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
@@ -736,12 +740,11 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         assert (null inits) $ pure parentOcc
   ownInvalidator <- mfix $ \i -> liftIO $ do
     evaluate $ Invalidator $ runEventM @x $ defer $ SomeMergeUpdate @x
-         (do EventSubscription _ subd' <- readIORef currentParentSubscriptionRef
-             parentHeight <- getEventSubscribedHeight subd'
-             myHeight <- readIORef heightRef
-             when (parentHeight /= myHeight) $ do
+         (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
+             oldHeight <- readIORef heightRef
+             when (newHeight /= oldHeight) $ do
                writeIORef heightRef $! invalidHeight
-               invalidateSubscriberHeight myHeight sub)
+               invalidateSubscriberHeight oldHeight sub)
          (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
              oldHeight <- readIORef heightRef
              when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
@@ -749,20 +752,22 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                  writeIORef heightRef $! newHeight
                  recalculateSubscriberHeight newHeight sub)
          (liftIO $ do
-           oldSubscription <- readIORef currentParentSubscriptionRef
-           finalize =<< readIORef ownWeakInvalidatorRef
-           writeNewWeakInvalidator i
-           _ <- unSpiderHost . runFrame $ mySubscribe
-           return [oldSubscription])
+             finalize =<< readIORef ownWeakInvalidatorRef
+             writeNewWeakInvalidator i
+             -- The above can also be put straight into Invalidator without seemingly ill effects
+             putStrLn "Running inits inside switch"
+             -- TODO: this used to be runFrame but in the tests only inits are generated
+             oldSubscription <- readIORef currentParentSubscriptionRef
+             _ <- unSpiderHost . justRunInits $ mySubscribe
+             pure [oldSubscription])
   liftIO $ writeNewWeakInvalidator ownInvalidator
   parentOcc <- mySubscribe
-  liftIO $ writeIORef toRetainRef (ownInvalidator, currentParentSubscriptionRef) -- TODO: is toRetain correct?
   returnSubscription 
           (do unsubscribe =<< readIORef currentParentSubscriptionRef
               finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
-              writeIORef toRetainRef (error "commonEvent: toRetainRef uninitialized after unsubscribe"))
+          )
           heightRef
-          toRetainRef
+          (ownInvalidator, currentParentSubscriptionRef) -- toRetainRef
           parentOcc
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
@@ -1135,23 +1140,49 @@ invalidate wisRef = do
 
 rootClear ref = writeIORef ref $! DMap.empty
 
--- | Run an event action outside of a frame
-runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
-runFrame a = SpiderHost $ do
+justRunInits :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
+justRunInits a = SpiderHost $ do
+  let printQL :: forall t a. Foldable t => String -> (EventEnv x -> IORef (t a)) -> IO ()
+      printQL name q = do
+        let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
+        putStr $ name <> ": "
+        print . length =<< readIORef (q env)
+  putStrLn ">>> start runInits"
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- runEventM $ do
         result <- a
+        liftIO $ printQL "inits" eventEnvInits
         runInits (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
         return result
+  putStrLn "<<< end runInits"
+  pure result
+  
+
+-- | Run an event action outside of a frame
+runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
+runFrame a = SpiderHost $ do
+  putStrLn ">> start frame"
+  let printQL :: forall t a. Foldable t => String -> (EventEnv x -> IORef (t a)) -> IO ()
+      printQL name q = do
+        let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
+        putStr $ name <> ": "
+        print . length =<< readIORef (q env)
+
+  let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
+  result <- unSpiderHost $ justRunInits a
+  printQL "assignments" eventEnvAssignments
   readIORef (eventEnvAssignments env) >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                                     writeIORef vRef v
                                                     invalidate iRef)
+  printQL "clears" eventEnvClears
   readIORef (eventEnvClears env) >>= mapM_ (\(Clear m) -> m)
+  printQL "mergeUpdates" eventEnvMergeUpdates
   mergeUpdates <- readIORef (eventEnvMergeUpdates env)
   clearEventEnv env
   liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _someMergeUpdate_update mergeUpdates)
   mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
+  putStrLn "<< end frame"
   return result
 
 newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
