@@ -505,7 +505,7 @@ instance GEq SpiderTimelineEnv where
               else Nothing
 
 data EventEnv x
-   = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe
+   = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
               , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
@@ -1107,26 +1107,6 @@ runInits initRef = do
     forM_ inits unSomeInit
     runInits initRef
 
-newEventEnv :: IO (EventEnv x)
-newEventEnv = do
-  toAssignRef <- newIORef [] -- This should only actually get used when events are firing
-  mergeUpdateRef <- newIORef []
-  initRef <- newIORef []
-  heightRef <- newIORef zeroHeight
-  toClearRef <- newIORef []
-  delayedRef <- newIORef IntMap.empty
-  return $ EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef
-
-clearEventEnv :: EventEnv x -> IO ()
-clearEventEnv (EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef) = do
-  writeIORef toAssignRef []
-  writeIORef mergeUpdateRef []
-  writeIORef initRef []
-  writeIORef heightRef zeroHeight
-  writeIORef toClearRef []
-  writeIORef delayedRef IntMap.empty
-
-
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
   wis <- readIORef wisRef
@@ -1157,7 +1137,6 @@ justRunInits a = SpiderHost $ do
         return result
   putStrLn "<<< end runInits"
   pure result
-  
 
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
@@ -1169,17 +1148,23 @@ runFrame a = SpiderHost $ do
         putStr $ name <> ": "
         print . length =<< readIORef (q env)
 
-  let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
+  let (EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef) =
+        _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- unSpiderHost $ justRunInits a
   printQL "assignments" eventEnvAssignments
-  readIORef (eventEnvAssignments env) >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
+  readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                                     writeIORef vRef v
                                                     invalidate iRef)
   printQL "clears" eventEnvClears
-  readIORef (eventEnvClears env) >>= mapM_ (\(Clear m) -> m)
+  readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
   printQL "mergeUpdates" eventEnvMergeUpdates
-  mergeUpdates <- readIORef (eventEnvMergeUpdates env)
-  clearEventEnv env
+  mergeUpdates <- readIORef mergeUpdateRef
+  do writeIORef toAssignRef []
+     writeIORef mergeUpdateRef []
+     writeIORef initRef []
+     writeIORef heightRef zeroHeight
+     writeIORef toClearRef []
+     writeIORef delayedRef IntMap.empty
   liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _someMergeUpdate_update mergeUpdates)
   mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
   mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
@@ -1216,7 +1201,13 @@ invalidateHeightRef heightRef doOnInvalidate = do
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
   lock <- newMVar ()
-  env <- newEventEnv
+  env <- do toAssignRef <- newIORef []
+            mergeUpdateRef <- newIORef []
+            initRef <- newIORef []
+            heightRef <- newIORef zeroHeight
+            toClearRef <- newIORef []
+            delayedRef <- newIORef IntMap.empty
+            return $ EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef
   return $ STE $ SpiderTimelineEnv
     { _spiderTimeline_lock = lock
     , _spiderTimeline_eventEnv = env
