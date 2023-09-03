@@ -162,13 +162,6 @@ subscribeAndRead = unEvent
 subscribeWith :: Event x a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
 subscribeWith e f = subscribe (pushCheap (\a -> f a >> pure (Just a)) e)
 
-subscribeAndReadWithHeight :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Height, Maybe a)
-subscribeAndReadWithHeight e subscriber = do
-  (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e subscriber
-  height <- liftIO $ getEventSubscribedHeight subd
-  pure (subscription, height, occ)
-
-
 {-# RULES
 "cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
 "cacheEvent/pushCheap" forall f e. pushCheap f (cacheEvent e) = cacheEvent (pushCheap f e)
@@ -669,7 +662,8 @@ commonSubscribeAndReadWithHeight :: forall {k} {x :: k} {a}.
   -> IORef Height
   -> Event x a
   -> EventM x (EventSubscription x, Height, Maybe a)
-commonSubscribeAndReadWithHeight sub heightRef e = subscribeAndReadWithHeight e $ Subscriber
+commonSubscribeAndReadWithHeight sub heightRef e = do
+  (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
             { subscriberPropagate = subscriberPropagate sub
             , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
                oldHeight <- readIORef heightRef
@@ -683,6 +677,8 @@ commonSubscribeAndReadWithHeight sub heightRef e = subscribeAndReadWithHeight e 
                    writeIORef heightRef $! newHeight
                    recalculateSubscriberHeight newHeight sub
             }
+  height <- liftIO $ getEventSubscribedHeight subd
+  pure (subscription, height, occ)  
 
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
