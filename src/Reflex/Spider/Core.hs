@@ -506,7 +506,7 @@ instance GEq SpiderTimelineEnv where
 
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
-              , eventEnvMergeUpdates :: !(IORef [SomeMergeUpdate x])
+              , eventEnvMergeUpdates :: !(IORef [MergeUpdate x])
               , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
               , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
@@ -533,7 +533,7 @@ instance HasSpiderTimeline x => Defer (SomeAssignment x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvAssignments
 
-instance HasSpiderTimeline x => Defer (SomeMergeUpdate x) (EventM x) where
+instance HasSpiderTimeline x => Defer (MergeUpdate x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvMergeUpdates
 
@@ -579,10 +579,10 @@ writeAndScheduleClear ref val = do
   defer $ Clear $ writeIORef ref Nothing
 
 
-data SomeMergeUpdate x = SomeMergeUpdate
-  { _someMergeUpdate_update :: !(EventM x [EventSubscription x])
-  , _someMergeUpdate_invalidateHeight :: !(IO ())
-  , _someMergeUpdate_recalculateHeight :: !(IO ())
+data MergeUpdate x = MergeUpdate
+  { _mergeUpdate_update :: !(EventM x [EventSubscription x])
+  , _mergeUpdate_invalidateHeight :: !(IO ())
+  , _mergeUpdate_recalculateHeight :: !(IO ())
   }
 
 newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
@@ -690,11 +690,13 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
                         recalculateSubscriberHeight height sub
         do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
            liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-           pure (unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i), occ)
+           pure ( unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i)
+                , occ
+                )
   (unsubscribeOuterSubscription, occ) <-
     subscribeAndRead' (pushCheap (\e -> do
                                      (doUnsubscribe, occ) <- subscribeAndRead' e
-                                     defer $ SomeMergeUpdate @x (liftIO doUnsubscribe >> pure []) (pure ()) (pure ())
+                                     defer $ MergeUpdate @x (liftIO doUnsubscribe >> pure []) (pure ()) (pure ())
                                      return occ)
                        coincidenceParent)
   returnSubscription unsubscribeOuterSubscription heightRef subscriptionsRef occ
@@ -742,7 +744,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         liftIO $ writeIORef currentParentSubscriptionRef subscription
         pure occ
   ownInvalidator <- mfix $ \i -> liftIO $ do
-    evaluate $ Invalidator $ runEventM @x $ defer $ SomeMergeUpdate @x
+    evaluate $ Invalidator $ runEventM @x $ defer $ MergeUpdate @x
          (liftIO $ do
              finalize =<< readIORef ownWeakInvalidatorRef
              writeNewWeakInvalidator i
@@ -1085,7 +1087,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
   defer $ SomeInit $ do
     changeSubscription <- subscribeWith (dynamicUpdated d)
                        (\p -> do
-                            defer $ SomeMergeUpdate
+                            defer $ MergeUpdate
                               (do oldState <- liftIO $ readIORef stateRef
                                   W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False))
                               invalidateMyHeight
@@ -1174,9 +1176,9 @@ runFrame a = SpiderHost $ do
      writeIORef heightRef zeroHeight
      writeIORef toClearRef []
      writeIORef delayedRef IntMap.empty
-  liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _someMergeUpdate_update mergeUpdates)
-  mapM_ _someMergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
-  mapM_ _someMergeUpdate_recalculateHeight mergeUpdates
+  liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _mergeUpdate_update mergeUpdates)
+  mapM_ _mergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
+  mapM_ _mergeUpdate_recalculateHeight mergeUpdates
   putStrLn "<< end frame"
   return result
 
