@@ -587,9 +587,9 @@ writeAndScheduleClear ref val = do
 
 
 data SomeMergeUpdate x = SomeMergeUpdate
-  { _someMergeUpdate_invalidateHeight :: !(IO ())
+  { _someMergeUpdate_update :: !(EventM x [EventSubscription x])
+  , _someMergeUpdate_invalidateHeight :: !(IO ())
   , _someMergeUpdate_recalculateHeight :: !(IO ())
-  , _someMergeUpdate_update :: !(EventM x [EventSubscription x])
   }
 
 newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
@@ -743,6 +743,15 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         pure parentOcc
   ownInvalidator <- mfix $ \i -> liftIO $ do
     evaluate $ Invalidator $ runEventM @x $ defer $ SomeMergeUpdate @x
+         (liftIO $ do
+             finalize =<< readIORef ownWeakInvalidatorRef
+             writeNewWeakInvalidator i
+             -- The above can also be put straight into Invalidator without seemingly ill effects
+             putStrLn "Running inits inside switch"
+             -- TODO: this used to be runFrame but in the tests only inits are generated
+             oldSubscription <- readIORef currentParentSubscriptionRef
+             _ <- unSpiderHost . justRunInits $ mySubscribe
+             pure [oldSubscription])
          (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
              oldHeight <- readIORef heightRef
              when (newHeight /= oldHeight) $ do
@@ -754,15 +763,6 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
                  writeIORef heightRef $! newHeight
                  recalculateSubscriberHeight newHeight sub)
-         (liftIO $ do
-             finalize =<< readIORef ownWeakInvalidatorRef
-             writeNewWeakInvalidator i
-             -- The above can also be put straight into Invalidator without seemingly ill effects
-             putStrLn "Running inits inside switch"
-             -- TODO: this used to be runFrame but in the tests only inits are generated
-             oldSubscription <- readIORef currentParentSubscriptionRef
-             _ <- unSpiderHost . justRunInits $ mySubscribe
-             pure [oldSubscription])
   liftIO $ writeNewWeakInvalidator ownInvalidator
   parentOcc <- mySubscribe
   returnSubscription 
@@ -1080,9 +1080,11 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
   defer $ SomeInit $ do
     changeSubscription <- subscribeWith (dynamicUpdated d)
                        (\p -> do
-                            defer $ SomeMergeUpdate invalidateMyHeight recalculateMyHeight $ do
-                              oldState <- liftIO $ readIORef stateRef
-                              W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False)
+                            defer $ SomeMergeUpdate
+                              (do oldState <- liftIO $ readIORef stateRef
+                                  W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState (mergeSubscribeAndRead False))
+                              invalidateMyHeight
+                              recalculateMyHeight
                             pure (Just ()))
                        terminalSubscriber
     -- We explicitly hold on to the unsubscribe function from subscribing to the update event.
