@@ -657,29 +657,6 @@ getSubscriptionsHeight subscriptionsRef = do
   pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
 
 
-commonSubscribeAndReadWithHeight :: forall {k} {x :: k} {a}.
-  Subscriber x a
-  -> IORef Height
-  -> Event x a
-  -> EventM x (EventSubscription x, Height, Maybe a)
-commonSubscribeAndReadWithHeight sub heightRef e = do
-  (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
-            { subscriberPropagate = subscriberPropagate sub
-            , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
-               oldHeight <- readIORef heightRef
-               -- Don't do anything if the height is already invalid
-               when (oldHeight /= invalidHeight) $ do
-                 writeIORef heightRef $! invalidHeight
-                 subscriberInvalidateHeight sub oldHeight 
-            , subscriberRecalculateHeight = \newHeight -> do
-                 oldHeight <- readIORef heightRef
-                 assert (oldHeight == invalidHeight && newHeight /= invalidHeight) $ do
-                   writeIORef heightRef $! newHeight
-                   recalculateSubscriberHeight newHeight sub
-            }
-  height <- liftIO $ getEventSubscribedHeight subd
-  pure (subscription, height, occ)
-
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
@@ -691,7 +668,21 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
   let subscribeAndRead' e = do
-        (subscription, height, occ) <- commonSubscribeAndReadWithHeight sub heightRef e
+        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
+                  { subscriberPropagate = subscriberPropagate sub
+                  , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
+                     oldHeight <- readIORef heightRef
+                     -- Don't do anything if the height is already invalid
+                     when (oldHeight /= invalidHeight) $ do
+                       writeIORef heightRef $! invalidHeight
+                       subscriberInvalidateHeight sub oldHeight
+                  , subscriberRecalculateHeight = \newHeight -> do
+                       oldHeight <- readIORef heightRef
+                       assert (oldHeight == invalidHeight && newHeight /= invalidHeight) $ do
+                         writeIORef heightRef $! newHeight
+                         recalculateSubscriberHeight newHeight sub
+                  }
+        height <- liftIO $ getEventSubscribedHeight subd
         liftIO $ do oldHeight <- readIORef heightRef
                     when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
                       assert (height /= invalidHeight) $ do
@@ -719,24 +710,37 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         wi <-  mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
   let getE = do
-        wi <- liftIO $ readIORef ownWeakInvalidatorRef
+        wi <- readIORef ownWeakInvalidatorRef
         --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-        initsRef <- liftIO $ newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
-        liftIO $ writeIORef parentsRef []
-        e <- liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef)
-        inits <- liftIO $ readIORef initsRef
+        initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
+        writeIORef parentsRef []
+        e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
+        inits <- readIORef initsRef
         assert (null inits) $ pure e        
-  let mySubscribe :: EventM x (Maybe a)
-      mySubscribe = do
-        e <- getE
-        (subscription, height, parentOcc) <- commonSubscribeAndReadWithHeight sub heightRef e
-        liftIO $ writeIORef currentParentSubscriptionRef subscription
+  let mySubscribe :: Event x _ -> EventM x (Maybe a)
+      mySubscribe e = do
+        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
+                  { subscriberPropagate = subscriberPropagate sub
+                  , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
+                     oldHeight <- readIORef heightRef
+                     -- Don't do anything if the height is already invalid
+                     when (oldHeight /= invalidHeight) $ do
+                       writeIORef heightRef $! invalidHeight
+                       subscriberInvalidateHeight sub oldHeight
+                  , subscriberRecalculateHeight = \newHeight -> do
+                       oldHeight <- readIORef heightRef
+                       assert (oldHeight == invalidHeight && newHeight /= invalidHeight) $ do
+                         writeIORef heightRef $! newHeight
+                         recalculateSubscriberHeight newHeight sub
+                  }
+        height <- liftIO $ getEventSubscribedHeight subd
         liftIO $ do oldHeight <- readIORef heightRef
                     when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
                       assert (height /= invalidHeight) $ do
                         writeIORef heightRef $! height
                         recalculateSubscriberHeight height sub
-        pure parentOcc
+        liftIO $ writeIORef currentParentSubscriptionRef subscription
+        pure occ
   ownInvalidator <- mfix $ \i -> liftIO $ do
     evaluate $ Invalidator $ runEventM @x $ defer $ SomeMergeUpdate @x
          (liftIO $ do
@@ -746,7 +750,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
              putStrLn "Running inits inside switch"
              -- TODO: this used to be runFrame but in the tests only inits are generated
              oldSubscription <- readIORef currentParentSubscriptionRef
-             _ <- unSpiderHost . justRunInits $ mySubscribe
+             _ <- unSpiderHost . justRunInits . mySubscribe =<< getE
              pure [oldSubscription])
          (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
              oldHeight <- readIORef heightRef
@@ -760,7 +764,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                  writeIORef heightRef $! newHeight
                  recalculateSubscriberHeight newHeight sub)
   liftIO $ writeNewWeakInvalidator ownInvalidator
-  parentOcc <- mySubscribe
+  parentOcc <- mySubscribe =<< liftIO getE
   returnSubscription 
           (do unsubscribe =<< readIORef currentParentSubscriptionRef
               finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
@@ -994,7 +998,12 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
   heightBagRef <- liftIO $ newIORef heightBagEmpty
   toRetainRef <- liftIO $ newIORef $ error "getMergeSubscribed: toRetainRef not yet initialized"
   stateRef <- liftIO $ newIORef $ error "merge state not initialized"
-  let invalidateMyHeight = invalidateHeightRef heightRef (subscriberInvalidateHeight sub)
+  let invalidateMyHeight = do
+         oldHeight <- readIORef heightRef
+         -- Don't do anything if the height is already invalid
+         when (oldHeight /= invalidHeight) $ do
+           writeIORef heightRef $! invalidHeight
+           subscriberInvalidateHeight sub oldHeight
   let recalculateMyHeight = do
           currentHeight <- readIORef heightRef
           -- revalidateMergeHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
@@ -1188,15 +1197,6 @@ succHeight h@(Height a) =
   if h == invalidHeight
   then invalidHeight
   else Height $ succ a
-
--- TODO: what should this function be called?
-invalidateHeightRef :: IORef Height -> (Height -> IO ()) -> IO ()
-invalidateHeightRef heightRef doOnInvalidate = do
-  oldHeight <- readIORef heightRef
-  -- Don't do anything if the height is already invalid
-  when (oldHeight /= invalidHeight) $ do
-    writeIORef heightRef $! invalidHeight
-    doOnInvalidate oldHeight
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
