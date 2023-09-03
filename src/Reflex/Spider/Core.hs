@@ -722,13 +722,17 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
   let writeNewWeakInvalidator i = do
         wi <-  mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
-  let mySubscribe :: EventM x (Maybe a)
-      mySubscribe = do
+  let getE = do
         wi <- liftIO $ readIORef ownWeakInvalidatorRef
         --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
         initsRef <- liftIO $ newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
         liftIO $ writeIORef parentsRef []
         e <- liftIO (runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef)
+        inits <- liftIO $ readIORef initsRef
+        assert (null inits) $ pure e        
+  let mySubscribe :: EventM x (Maybe a)
+      mySubscribe = do
+        e <- getE
         (subscription, height, parentOcc) <- commonSubscribeAndReadWithHeight sub heightRef e
         liftIO $ writeIORef currentParentSubscriptionRef subscription
         liftIO $ do oldHeight <- readIORef heightRef
@@ -736,8 +740,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                       assert (height /= invalidHeight) $ do
                         writeIORef heightRef $! height
                         recalculateSubscriberHeight height sub
-        inits <- liftIO $ readIORef initsRef
-        assert (null inits) $ pure parentOcc
+        pure parentOcc
   ownInvalidator <- mfix $ \i -> liftIO $ do
     evaluate $ Invalidator $ runEventM @x $ defer $ SomeMergeUpdate @x
          (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
