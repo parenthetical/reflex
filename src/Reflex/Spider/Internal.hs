@@ -305,9 +305,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Refle
 -- Deprecated items
 --------------------------------------------------------------------------------
 
--- | 'SpiderEnv' is the old name for 'SpiderTimeline'
-{-# DEPRECATED SpiderEnv "Use 'SpiderTimelineEnv' instead" #-}
-type SpiderEnv = SpiderTimeline
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
   {-# INLINABLE subscribeEvent #-}
   subscribeEvent e = SpiderHostFrame $ do
