@@ -678,14 +678,14 @@ commonSubscribeAndReadWithHeight sub heightRef e = do
                    recalculateSubscriberHeight newHeight sub
             }
   height <- liftIO $ getEventSubscribedHeight subd
-  pure (subscription, height, occ)  
+  pure (subscription, height, occ)
 
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
 -- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
-coincidence :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
+coincidence :: forall x a. _ => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight -- TODO: both zeroHeight and invalidHeight work here
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
@@ -703,7 +703,7 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   (unsubscribeOuterSubscription, occ) <-
     subscribeAndRead' (pushCheap (\e -> do
                                      (doUnsubscribe, occ) <- subscribeAndRead' e
-                                     defer $ Clear doUnsubscribe
+                                     defer $ SomeMergeUpdate @x (liftIO doUnsubscribe >> pure []) (pure ()) (pure ())
                                      return occ)
                        coincidenceParent)
   returnSubscription unsubscribeOuterSubscription heightRef subscriptionsRef occ
