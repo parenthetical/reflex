@@ -652,11 +652,6 @@ instance HasSpiderTimeline x => Functor (Behavior x) where
 push :: HasSpiderTimeline x => (a -> EventM x (Maybe b)) -> Event x a -> Event x b
 push f e = cacheEvent (pushCheap f e)
 
-getSubscriptionsHeight subscriptionsRef = do
-  subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-  pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
-
-
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
@@ -667,39 +662,52 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight -- TODO: both zeroHeight and invalidHeight work here
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
+  let invalidateMyHeight = do
+         oldHeight <- readIORef heightRef
+         -- Don't do anything if the height is already invalid
+         when (oldHeight /= invalidHeight) $ do
+           writeIORef heightRef $! invalidHeight
+           subscriberInvalidateHeight sub oldHeight
+  let getSubscriptionsHeight = do
+        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
+        pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
+  let recalculateMyHeight = do
+          currentHeight <- readIORef heightRef
+          -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
+          -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
+          when (currentHeight == invalidHeight) $ do
+            maybeNewHeight <- getSubscriptionsHeight
+            when (maybeNewHeight /= invalidHeight) $ do
+              writeIORef heightRef maybeNewHeight
+              subscriberRecalculateHeight sub maybeNewHeight
   let subscribeAndRead' e = do
         (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
                   { subscriberPropagate = subscriberPropagate sub
-                  , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
-                     oldHeight <- readIORef heightRef
-                     -- Don't do anything if the height is already invalid
-                     when (oldHeight /= invalidHeight) $ do
-                       writeIORef heightRef $! invalidHeight
-                       subscriberInvalidateHeight sub oldHeight
-                  , subscriberRecalculateHeight = \newHeight -> do
-                       oldHeight <- readIORef heightRef
-                       assert (oldHeight == invalidHeight && newHeight /= invalidHeight) $ do
-                         writeIORef heightRef $! newHeight
-                         recalculateSubscriberHeight newHeight sub
+                  , subscriberInvalidateHeight = const $ invalidateMyHeight
+                  , subscriberRecalculateHeight = const $ recalculateMyHeight
                   }
         height <- liftIO $ getEventSubscribedHeight subd
+        -- WASHERE: I don't quite understand how this is supposed to work, look at 'merge' to see how to make it more general
         liftIO $ do oldHeight <- readIORef heightRef
                     when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
                       assert (height /= invalidHeight) $ do
                         writeIORef heightRef $! height
                         recalculateSubscriberHeight height sub
+        -- WASHERE: delete should also cause height invalidation/recalculation? Look at 'merge'.
         do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
            liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-           pure ( unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i)
+           pure ( runEventM @x $ defer $ MergeUpdate @x (liftIO $ unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i) >> pure [])
+                              (pure ()) (pure ())
                 , occ
                 )
-  (unsubscribeOuterSubscription, occ) <-
+  (_unsubscribeOuterSubscription, occ) <-
     subscribeAndRead' (pushCheap (\e -> do
+                                     -- This is: "subscribe for one frame"
                                      (doUnsubscribe, occ) <- subscribeAndRead' e
-                                     defer $ MergeUpdate @x (liftIO doUnsubscribe >> pure []) (pure ()) (pure ())
+                                     liftIO $ doUnsubscribe
                                      return occ)
                        coincidenceParent)
-  returnSubscription unsubscribeOuterSubscription heightRef subscriptionsRef occ
+  returnSubscription (mapM_ unsubscribe =<< readIORef subscriptionsRef) heightRef subscriptionsRef occ
 
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ Event $ \sub -> do
