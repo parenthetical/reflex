@@ -714,6 +714,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+  eventUnsubscribeRef <- liftIO $ newIORef $ error "switch: eventUnsubscribeRef uninitialized"
   let writeNewWeakInvalidator i = do
         wi <-  mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
@@ -725,6 +726,44 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
         inits <- readIORef initsRef
         assert (null inits) $ pure e        
+  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
+  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
+  let invalidateMyHeight = do
+         oldHeight <- readIORef heightRef
+         -- Don't do anything if the height is already invalid
+         when (oldHeight /= invalidHeight) $ do
+           writeIORef heightRef $! invalidHeight
+           subscriberInvalidateHeight sub oldHeight
+  let getSubscriptionsHeight = do
+        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
+        -- succHeight is not needed for coincidence/switch
+        pure $ if invalidHeight `elem` subs then invalidHeight else succHeight (maximum (zeroHeight:subs))
+  let recalculateMyHeight = do
+          currentHeight <- readIORef heightRef
+          -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
+          -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
+          when (currentHeight == invalidHeight) $ do
+            maybeNewHeight <- getSubscriptionsHeight
+            when (maybeNewHeight /= invalidHeight) $ do
+              writeIORef heightRef maybeNewHeight
+              subscriberRecalculateHeight sub maybeNewHeight
+  let subscribeAndRead' e = do
+        (subscription, occ) <- subscribeAndRead e $ Subscriber
+                  { subscriberPropagate = subscriberPropagate sub
+                  , subscriberInvalidateHeight = const invalidateMyHeight
+                  , subscriberRecalculateHeight = const recalculateMyHeight
+                  }
+        -- TODO: do the right thing here for general case
+        liftIO invalidateMyHeight
+        liftIO recalculateMyHeight
+        do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
+           liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
+           pure ( runEventM @x $ defer $
+                  MergeUpdate @x (liftIO $ unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i) >> pure [])
+                              invalidateMyHeight
+                              recalculateMyHeight
+                , occ
+                )
   let mySubscribe :: Event x _ -> EventM x (Maybe a)
       mySubscribe e = do
         (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
@@ -750,14 +789,14 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         liftIO $ writeIORef currentParentSubscriptionRef subscription
         pure occ
   ownInvalidator <- mfix $ \i -> liftIO $ do
-    evaluate $ Invalidator $ runEventM @x $ defer $ MergeUpdate @x
+    evaluate $ Invalidator $ do
+      finalize =<< readIORef ownWeakInvalidatorRef
+      writeNewWeakInvalidator i
+      oldSubscription <- readIORef currentParentSubscriptionRef
+      runEventM @x $ defer $ MergeUpdate @x
          (liftIO $ do
-             finalize =<< readIORef ownWeakInvalidatorRef
-             writeNewWeakInvalidator i
-             -- The above can also be put straight into Invalidator without seemingly ill effects
              putStrLn "Running inits inside switch"
              -- TODO: this used to be runFrame but in the tests only inits are generated
-             oldSubscription <- readIORef currentParentSubscriptionRef
              _ <- unSpiderHost . justRunInits . mySubscribe =<< getE
              pure [oldSubscription])
          (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
@@ -773,6 +812,8 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                  recalculateSubscriberHeight newHeight sub)
   liftIO $ writeNewWeakInvalidator ownInvalidator
   parentOcc <- mySubscribe =<< liftIO getE
+  -- (unsubscribeE, parentOcc) <- subscribeAndRead' =<< liftIO getE
+  -- liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
   returnSubscription 
           (do unsubscribe =<< readIORef currentParentSubscriptionRef
               finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
