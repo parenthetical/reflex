@@ -670,7 +670,8 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
            subscriberInvalidateHeight sub oldHeight
   let getSubscriptionsHeight = do
         subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-        pure $ if null subs then zeroHeight else if invalidHeight `elem` subs then invalidHeight else maximum subs
+        -- succHeight is not needed for coincidence/switch
+        pure $ if invalidHeight `elem` subs then invalidHeight else succHeight (maximum (zeroHeight:subs))
   let recalculateMyHeight = do
           currentHeight <- readIORef heightRef
           -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
@@ -681,30 +682,27 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
               writeIORef heightRef maybeNewHeight
               subscriberRecalculateHeight sub maybeNewHeight
   let subscribeAndRead' e = do
-        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
+        (subscription, occ) <- subscribeAndRead e $ Subscriber
                   { subscriberPropagate = subscriberPropagate sub
-                  , subscriberInvalidateHeight = const $ invalidateMyHeight
-                  , subscriberRecalculateHeight = const $ recalculateMyHeight
+                  , subscriberInvalidateHeight = const invalidateMyHeight
+                  , subscriberRecalculateHeight = const recalculateMyHeight
                   }
-        height <- liftIO $ getEventSubscribedHeight subd
-        -- WASHERE: I don't quite understand how this is supposed to work, look at 'merge' to see how to make it more general
-        liftIO $ do oldHeight <- readIORef heightRef
-                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-                      assert (height /= invalidHeight) $ do
-                        writeIORef heightRef $! height
-                        recalculateSubscriberHeight height sub
-        -- WASHERE: delete should also cause height invalidation/recalculation? Look at 'merge'.
+        -- TODO: do the right thing here for general case
+        liftIO invalidateMyHeight
+        liftIO recalculateMyHeight
         do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
            liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-           pure ( runEventM @x $ defer $ MergeUpdate @x (liftIO $ unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i) >> pure [])
-                              (pure ()) (pure ())
+           pure ( runEventM @x $ defer $
+                  MergeUpdate @x (liftIO $ unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i) >> pure [])
+                              invalidateMyHeight
+                              recalculateMyHeight
                 , occ
                 )
   (_unsubscribeOuterSubscription, occ) <-
     subscribeAndRead' (pushCheap (\e -> do
                                      -- This is: "subscribe for one frame"
                                      (doUnsubscribe, occ) <- subscribeAndRead' e
-                                     liftIO $ doUnsubscribe
+                                     liftIO doUnsubscribe
                                      return occ)
                        coincidenceParent)
   returnSubscription (mapM_ unsubscribe =<< readIORef subscriptionsRef) heightRef subscriptionsRef occ
@@ -1072,6 +1070,7 @@ merge doInitialInput doPatchInput outputIsEmpty getSubs getNumSubs d = cacheEven
         height <- liftIO $ getEventSubscribedHeight parentSubd
         -- TODO: Can isInit be avoided?
         liftIO $ if not isInit
+          -- TODO: This implies height can't be invalid after init phase
           then modifyIORef' heightBagRef $ heightBagAdd height -- new parent height
           else do
             if height == invalidHeight
