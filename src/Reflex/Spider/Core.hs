@@ -682,14 +682,18 @@ coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
               writeIORef heightRef maybeNewHeight
               subscriberRecalculateHeight sub maybeNewHeight
   let subscribeAndRead' e = do
-        (subscription, occ) <- subscribeAndRead e $ Subscriber
+        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
                   { subscriberPropagate = subscriberPropagate sub
                   , subscriberInvalidateHeight = const invalidateMyHeight
                   , subscriberRecalculateHeight = const recalculateMyHeight
                   }
         -- TODO: do the right thing here for general case
-        liftIO invalidateMyHeight
-        liftIO recalculateMyHeight
+        height <- liftIO $ getEventSubscribedHeight subd
+        liftIO $ do oldHeight <- readIORef heightRef
+                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+                      assert (height /= invalidHeight) $ do
+                        writeIORef heightRef $! height
+                        recalculateSubscriberHeight height sub
         do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
            liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
            pure ( runEventM @x $ defer $
@@ -712,7 +716,6 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
   heightRef <- liftIO $ newIORef $ invalidHeight -- error "commonEvent: heightRef uninitialized"
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
-  currentParentSubscriptionRef <- liftIO $ newIORef $ error "switch: currentParentSubscriptionRef uninitialized"
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   eventUnsubscribeRef <- liftIO $ newIORef $ error "switch: eventUnsubscribeRef uninitialized"
   let writeNewWeakInvalidator i = do
@@ -748,14 +751,19 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
               writeIORef heightRef maybeNewHeight
               subscriberRecalculateHeight sub maybeNewHeight
   let subscribeAndRead' e = do
-        (subscription, occ) <- subscribeAndRead e $ Subscriber
+        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
                   { subscriberPropagate = subscriberPropagate sub
                   , subscriberInvalidateHeight = const invalidateMyHeight
                   , subscriberRecalculateHeight = const recalculateMyHeight
                   }
         -- TODO: do the right thing here for general case
-        liftIO invalidateMyHeight
-        liftIO recalculateMyHeight
+        height <- liftIO $ getEventSubscribedHeight subd
+        liftIO $ do oldHeight <- readIORef heightRef
+                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+                      assert (height /= invalidHeight) $ do
+                        writeIORef heightRef $! height
+                        recalculateSubscriberHeight height sub
+
         do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
            liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
            pure ( runEventM @x $ defer $
@@ -764,62 +772,31 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                               recalculateMyHeight
                 , occ
                 )
-  let mySubscribe :: Event x _ -> EventM x (Maybe a)
-      mySubscribe e = do
-        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
-                  { subscriberPropagate = subscriberPropagate sub
-                  , subscriberInvalidateHeight = const $ do -- TODO: what normally happens with the passed in height here?
-                     oldHeight <- readIORef heightRef
-                     -- Don't do anything if the height is already invalid
-                     when (oldHeight /= invalidHeight) $ do
-                       writeIORef heightRef $! invalidHeight
-                       subscriberInvalidateHeight sub oldHeight
-                  , subscriberRecalculateHeight = \newHeight -> do
-                       oldHeight <- readIORef heightRef
-                       assert (oldHeight == invalidHeight && newHeight /= invalidHeight) $ do
-                         writeIORef heightRef $! newHeight
-                         recalculateSubscriberHeight newHeight sub
-                  }
-        height <- liftIO $ getEventSubscribedHeight subd
-        liftIO $ do oldHeight <- readIORef heightRef
-                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-                      assert (height /= invalidHeight) $ do
-                        writeIORef heightRef $! height
-                        recalculateSubscriberHeight height sub
-        liftIO $ writeIORef currentParentSubscriptionRef subscription
-        pure occ
   ownInvalidator <- mfix $ \i -> liftIO $ do
     evaluate $ Invalidator $ do
-      finalize =<< readIORef ownWeakInvalidatorRef
-      writeNewWeakInvalidator i
-      oldSubscription <- readIORef currentParentSubscriptionRef
-      runEventM @x $ defer $ MergeUpdate @x
-         (liftIO $ do
+      runEventM @x $ defer $ Clear
+         (do
              putStrLn "Running inits inside switch"
-             -- TODO: this used to be runFrame but in the tests only inits are generated
-             _ <- unSpiderHost . justRunInits . mySubscribe =<< getE
-             pure [oldSubscription])
-         (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
-             oldHeight <- readIORef heightRef
-             when (newHeight /= oldHeight) $ do
-               writeIORef heightRef $! invalidHeight
-               invalidateSubscriberHeight oldHeight sub)
-         (do newHeight <- getEventSubscribedHeight . _eventSubscription_subscribed =<< readIORef currentParentSubscriptionRef
-             oldHeight <- readIORef heightRef
-             when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-               when (newHeight /= invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-                 writeIORef heightRef $! newHeight
-                 recalculateSubscriberHeight newHeight sub)
+             -- TODO: this used to be runFrame but in the tests only
+             -- inits are generated, also it now loops if you use
+             -- runFrame (if you defer to MergeUpdate it doesn't loop).
+             _ <- unSpiderHost . justRunInits $ do
+               liftIO $ do
+                 finalize =<< readIORef ownWeakInvalidatorRef
+                 writeNewWeakInvalidator i
+                 join . readIORef $ eventUnsubscribeRef
+               (unsubscribeE, _parentOcc) <- subscribeAndRead' =<< liftIO getE
+               liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
+             pure ())
   liftIO $ writeNewWeakInvalidator ownInvalidator
-  parentOcc <- mySubscribe =<< liftIO getE
-  -- (unsubscribeE, parentOcc) <- subscribeAndRead' =<< liftIO getE
-  -- liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
+  -- parentOcc <- mySubscribe =<< liftIO getE
+  (unsubscribeE, parentOcc) <- subscribeAndRead' =<< liftIO getE
+  liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
   returnSubscription 
-          (do unsubscribe =<< readIORef currentParentSubscriptionRef
-              finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
-          )
+          (do mapM_ unsubscribe =<< readIORef subscriptionsRef
+              finalize =<< readIORef ownWeakInvalidatorRef) -- We don't need to get invalidated if we're dead
           heightRef
-          (ownInvalidator, currentParentSubscriptionRef) -- toRetainRef
+          (subscriptionsRef, ownInvalidator) -- toRetainRef
           parentOcc
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
