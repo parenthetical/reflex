@@ -740,8 +740,9 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
 
         do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
            liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-           pure ( runEventM @x $ defer $
-                  MergeUpdate @x (liftIO $ unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i) >> pure [])
+           pure ( runEventM @x $ do
+                    liftIO $ modifyIORef subscriptionsRef (IntMap.delete i)
+                    defer $ MergeUpdate @x (pure [subscription])
                               invalidateMyHeight
                               recalculateMyHeight
                 , occ
