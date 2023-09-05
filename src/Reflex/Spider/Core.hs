@@ -124,6 +124,7 @@ import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import qualified Control.Monad.Writer as W
 import Control.Monad.Writer (WriterT, MonadTrans (lift))
 import Control.Monad.Trans.Maybe
+import Control.Monad.Reader
 
 whenNothingRef :: MonadIO m => IORef (Maybe a) -> m () -> m ()
 whenNothingRef ref m = do
@@ -626,72 +627,121 @@ instance HasSpiderTimeline x => Functor (Behavior x) where
 push :: HasSpiderTimeline x => (a -> EventM x (Maybe b)) -> Event x a -> Event x b
 push f e = cacheEvent (pushCheap f e)
 
+data EvD x res =
+  EvD { _heightRef :: IORef Height
+      , _subscriptionsCtr :: IORef Int
+      , _subscriptionsRef :: IORef (IntMap (EventSubscription x))
+      , _sub :: Subscriber x res
+      }
+
+type EvM x res a = ReaderT (EvD x res) (EventM x) a
+
+heightInvalidator :: EvM x res (IO ())
+heightInvalidator = do
+  heightRef <- asks _heightRef
+  sub <- asks _sub
+  pure $ do
+         oldHeight <- readIORef heightRef
+         -- Don't do anything if the height is already invalid
+         when (oldHeight /= invalidHeight) $ do
+           writeIORef heightRef $! invalidHeight
+           subscriberInvalidateHeight sub oldHeight
+
+heightUpdater :: EvM x res (IO ())
+heightUpdater = do
+  heightRef <- asks _heightRef
+  subscriptionsRef <- asks _subscriptionsRef
+  sub <- asks _sub
+  pure $ do
+    currentHeight <- readIORef heightRef
+    -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
+    -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
+    when (currentHeight == invalidHeight) $ do
+      maybeNewHeight <- do
+        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
+        -- succHeight is not needed for coincidence/switch
+        pure $ if invalidHeight `elem` subs then invalidHeight else succHeight (maximum (zeroHeight:subs))
+      when (maybeNewHeight /= invalidHeight) $ do
+        writeIORef heightRef $! maybeNewHeight
+        subscriberRecalculateHeight sub maybeNewHeight
+  
+
+subscribeAndRead_ :: forall x res a. _ => Event x a -> Subscriber x a -> EvM x res (IO (), Maybe a)
+subscribeAndRead_ e subscriber = do
+  heightRef <- asks _heightRef
+  subscriptionsCtr <- asks _subscriptionsCtr
+  subscriptionsRef <- asks _subscriptionsRef
+  invalidateMyHeight <- heightInvalidator
+  recalculateMyHeight <- heightUpdater
+  sub <- asks _sub
+  (subscription@(EventSubscription _ subd), occ) <- lift $ subscribeAndRead e subscriber
+  -- TODO: do the right thing here for general case
+  height <- liftIO $ getEventSubscribedHeight subd
+  liftIO $ do oldHeight <- readIORef heightRef
+              when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
+                assert (height /= invalidHeight) $ do
+                  writeIORef heightRef $! height
+                  recalculateSubscriberHeight height sub
+  do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
+     liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
+     pure ( runEventM @x $ do
+              liftIO $ modifyIORef subscriptionsRef (IntMap.delete i)
+              defer $ MergeUpdate @x (pure [subscription])
+                        invalidateMyHeight
+                        recalculateMyHeight
+          , occ
+          )
+
+subscriber_ :: EvM x res (Subscriber x res)
+subscriber_ = do
+  invalidateMyHeight <- heightInvalidator
+  recalculateMyHeight <- heightUpdater
+  sub <- asks _sub
+  pure $ Subscriber
+            { subscriberPropagate = subscriberPropagate sub
+            , subscriberInvalidateHeight = const invalidateMyHeight
+            , subscriberRecalculateHeight = const recalculateMyHeight
+            }
+
+toEvent :: Height -> EvM x res (IO (), b, Maybe res) -> Event x res
+toEvent initHeight evM = Event $ \sub -> do
+  heightRef <- liftIO $ newIORef initHeight -- TODO: why is this messed up? (switch fails with zeroHeight)
+  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
+  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
+  (unsubscribeExtra, retainExtra, occ) <- runReaderT evM (EvD heightRef subscriptionsCtr subscriptionsRef sub)
+  returnSubscription
+    (do mapM_ unsubscribe =<< readIORef subscriptionsRef
+        unsubscribeExtra)
+    heightRef
+    (subscriptionsRef, retainExtra)
+    occ
+
 -- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
 --     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
 --     of all used heights.
 -- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
 -- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
 coincidence :: forall x a. (Defer (MergeUpdate x) (EventM x), Defer Clear (EventM x)) => Event x (Event x a) -> Event x a
-coincidence coincidenceParent = cacheEvent $ Event $ \sub -> do
-  heightRef <- liftIO $ newIORef zeroHeight -- TODO: both zeroHeight and invalidHeight work here
-  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
-  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
-  let invalidateMyHeight = do
-         oldHeight <- readIORef heightRef
-         -- Don't do anything if the height is already invalid
-         when (oldHeight /= invalidHeight) $ do
-           writeIORef heightRef $! invalidHeight
-           subscriberInvalidateHeight sub oldHeight
-  let getSubscriptionsHeight = do
-        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-        -- succHeight is not needed for coincidence/switch
-        pure $ if invalidHeight `elem` subs then invalidHeight else succHeight (maximum (zeroHeight:subs))
-  let recalculateMyHeight = do
-          currentHeight <- readIORef heightRef
-          -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
-          -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-          when (currentHeight == invalidHeight) $ do
-            maybeNewHeight <- getSubscriptionsHeight
-            when (maybeNewHeight /= invalidHeight) $ do
-              writeIORef heightRef maybeNewHeight
-              subscriberRecalculateHeight sub maybeNewHeight
-  let subscribeAndRead' e = do
-        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
-                  { subscriberPropagate = subscriberPropagate sub
-                  , subscriberInvalidateHeight = const invalidateMyHeight
-                  , subscriberRecalculateHeight = const recalculateMyHeight
-                  }
-        -- TODO: do the right thing here for general case
-        height <- liftIO $ getEventSubscribedHeight subd
-        liftIO $ do oldHeight <- readIORef heightRef
-                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-                      assert (height /= invalidHeight) $ do
-                        writeIORef heightRef $! height
-                        recalculateSubscriberHeight height sub
-        do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
-           liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-           pure ( runEventM @x $ defer $
-                  MergeUpdate @x (liftIO $ unsubscribe subscription >> modifyIORef subscriptionsRef (IntMap.delete i) >> pure [])
-                              invalidateMyHeight
-                              recalculateMyHeight
-                , occ
-                )
+coincidence coincidenceParent = cacheEvent $ toEvent zeroHeight $ do
+  evD <- ask
   (_unsubscribeOuterSubscription, occ) <-
-    subscribeAndRead' (pushCheap (\e -> do
+    subscribeAndRead_ (pushCheap (\e -> do
                                      -- This is: "subscribe for one frame"
-                                     (doUnsubscribe, occ) <- subscribeAndRead' e
+                                     (doUnsubscribe, occ) <- runReaderT (subscribeAndRead_ e =<< subscriber_) evD
                                      liftIO doUnsubscribe
                                      return occ)
                        coincidenceParent)
-  returnSubscription (mapM_ unsubscribe =<< readIORef subscriptionsRef) heightRef subscriptionsRef occ
+      =<< subscriber_
+  pure (pure (), (), occ)
 
+-- TODO: can switch be written using something like unsafeUpdated and tellEvent?
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switch switchParent = cacheEvent $ Event $ \sub -> do
-  heightRef <- liftIO $ newIORef invalidHeight -- error "commonEvent: heightRef uninitialized"
+switch switchParent = cacheEvent $ toEvent invalidHeight $ do
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   eventUnsubscribeRef <- liftIO $ newIORef $ error "switch: eventUnsubscribeRef uninitialized"
+  evD <- ask
   let writeNewWeakInvalidator i = do
         wi <-  mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
@@ -702,51 +752,7 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
         writeIORef parentsRef []
         e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
         inits <- readIORef initsRef
-        assert (null inits) $ pure e        
-  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
-  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
-  let invalidateMyHeight = do
-         oldHeight <- readIORef heightRef
-         -- Don't do anything if the height is already invalid
-         when (oldHeight /= invalidHeight) $ do
-           writeIORef heightRef $! invalidHeight
-           subscriberInvalidateHeight sub oldHeight
-  let getSubscriptionsHeight = do
-        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-        -- succHeight is not needed for coincidence/switch
-        pure $ if invalidHeight `elem` subs then invalidHeight else succHeight (maximum (zeroHeight:subs))
-  let recalculateMyHeight = do
-          currentHeight <- readIORef heightRef
-          -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
-          -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-          when (currentHeight == invalidHeight) $ do
-            maybeNewHeight <- getSubscriptionsHeight
-            when (maybeNewHeight /= invalidHeight) $ do
-              writeIORef heightRef $! maybeNewHeight
-              subscriberRecalculateHeight sub maybeNewHeight
-  let subscribeAndRead' e = do
-        (subscription@(EventSubscription _ subd), occ) <- subscribeAndRead e $ Subscriber
-                  { subscriberPropagate = subscriberPropagate sub
-                  , subscriberInvalidateHeight = const invalidateMyHeight
-                  , subscriberRecalculateHeight = const recalculateMyHeight
-                  }
-        -- TODO: do the right thing here for general case
-        height <- liftIO $ getEventSubscribedHeight subd
-        liftIO $ do oldHeight <- readIORef heightRef
-                    when (oldHeight == invalidHeight) $ do --TODO: This 'when' should probably be an assertion
-                      assert (height /= invalidHeight) $ do
-                        writeIORef heightRef $! height
-                        recalculateSubscriberHeight height sub
-
-        do i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
-           liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-           pure ( runEventM @x $ do
-                    liftIO $ modifyIORef subscriptionsRef (IntMap.delete i)
-                    defer $ MergeUpdate @x (pure [subscription])
-                              invalidateMyHeight
-                              recalculateMyHeight
-                , occ
-                )
+        assert (null inits) $ pure e
   ownInvalidator <- mfix $ \i -> liftIO $ do
     evaluate $ Invalidator $ do
       runEventM @x $ defer $ Clear
@@ -760,19 +766,20 @@ switch switchParent = cacheEvent $ Event $ \sub -> do
                  finalize =<< readIORef ownWeakInvalidatorRef
                  writeNewWeakInvalidator i
                  join . readIORef $ eventUnsubscribeRef
-               (unsubscribeE, _parentOcc) <- subscribeAndRead' =<< liftIO getE
+               (unsubscribeE, _parentOcc) <- flip runReaderT evD $ do
+                 subscriber <- subscriber_
+                 flip subscribeAndRead_ subscriber =<< liftIO getE
                liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
              pure ())
   liftIO $ writeNewWeakInvalidator ownInvalidator
-  -- parentOcc <- mySubscribe =<< liftIO getE
-  (unsubscribeE, parentOcc) <- subscribeAndRead' =<< liftIO getE
+  (unsubscribeE, parentOcc) <- do
+    subscriber <- subscriber_
+    flip subscribeAndRead_ subscriber =<< liftIO getE
   liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
-  returnSubscription 
-          (do mapM_ unsubscribe =<< readIORef subscriptionsRef
-              finalize =<< readIORef ownWeakInvalidatorRef) -- We don't need to get invalidated if we're dead
-          heightRef
-          (subscriptionsRef, ownInvalidator) -- toRetainRef
-          parentOcc
+  pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
+       , ownInvalidator
+       , parentOcc
+       )
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
@@ -922,16 +929,16 @@ mergeInt =
   (\ipt tellE -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
   (\(PatchIntMap ip) s tellE -> do
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
-     traverse_ fst $ IntMap.intersection s ip
+     sequence_ $ IntMap.intersection s ip
      pure $ applyAlways (PatchIntMap ip') s)
   IntMap.null
 
 {-# INLINE mergeG' #-}
 mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
   => ( patch k q
-       -> DMap k (Constant (MergeM x (), EventSubscription x))
+       -> DMap k (Constant (EventM x ()))
        -> TellE x (DMap k v)
-       -> MergeM x (DMap k (Constant (MergeM x (), EventSubscription x))))
+       -> EventM x (DMap k (Constant (EventM x ()))))
   -> (forall a. q a -> Event x (v a))
   -> DynamicS x (patch k q)
   -> Event x (DMap k v)
@@ -948,7 +955,7 @@ mergeG nt =
   (\ip s tellE -> do
      ip' <- traversePatchDMapWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
-     mapM_ (\(_ :=> v) -> fst $ getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
+     mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
      pure $ applyAlways ip' s)
   nt
 
@@ -966,7 +973,7 @@ mergeWithMove nt =
             (\_ to (Constant unsub) ->
                 Constant $ case getComposeMaybe to of
                   Nothing -> -- We are deleting/replacing
-                    Just (fst unsub)
+                    Just unsub
                   Just _toKey -> do -- We are moving
                     Nothing)
             (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
@@ -974,18 +981,85 @@ mergeWithMove nt =
      pure $ applyAlways ip' s)
   nt
 
-type MergeM x a = WriterT [EventSubscription x] (EventM x) a
-type TellE x a = Event x a -> MergeM x (MergeM x (), EventSubscription x)
+type TellE x a = Event x a -> EventM x (EventM x ())
 
 {-# INLINE merge #-}
 merge :: forall x ip ipt o s.
   ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Monoid s)
-  => (ipt -> TellE x o -> MergeM x s)
-  -> (ip -> s -> TellE x o -> MergeM x s)
+  => (ipt -> TellE x o -> EventM x s)
+  -> (ip -> s -> TellE x o -> EventM x s)
   -> (o -> Bool)
   -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ Event $ \sub -> do
+merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHeight $ do
+  accumRef :: IORef o <- liftIO $ newIORef mempty
+  stateRef <- liftIO $ newIORef $ error "merge state not initialized"
+  heightRef <- asks _heightRef
+  sub <- asks _sub
+  evD <- ask
+  recalculateMyHeight <- heightUpdater
+  invalidateMyHeight <- heightInvalidator
+  let addAccum :: (o -> EventM x ())
+      addAccum !a = do
+        oldAccum <- liftIO (readIORef accumRef)
+        liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
+        when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
+          liftIO $ do height <- readIORef heightRef
+                      when (height == invalidHeight) $
+                        throwIO EventLoopException
+          let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
+                height <- liftIO $ readIORef heightRef
+                currentHeight <- getCurrentHeight
+                case height `compare` currentHeight of
+                  LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+                  -- The height has been increased (by a coincidence event;
+                  -- TODO: is this the only way?)
+                  GT -> scheduleMerge' height
+                  EQ -> do
+                    vals <- liftIO $ readIORef accumRef
+                     -- TODO: this is an unfortunate effect of my
+                     -- attempt to use addAccum both at init time and
+                     -- update time.
+                    unless (outputIsEmpty vals) $ do
+                    -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
+                    -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
+                      liftIO $ writeIORef accumRef $! mempty
+                      subscriberPropagate sub vals
+          scheduleMerge' <=< liftIO $ readIORef heightRef
+  let blaSubscriber = Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)
+  let subscribeAndReadWith' :: forall a a1. (a -> EventM x a1) -> Event x a -> Subscriber x a1 -> EventM x (IO (), Maybe a1)
+      subscribeAndReadWith' f e subscriber = runReaderT (subscribeAndRead_ (pushCheap (fmap Just . f) e) subscriber) evD
+  let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
+      mergeSubscribeAndRead e = liftIO . fst <$> subscribeAndReadWith' addAccum e blaSubscriber
+  liftIO . writeIORef stateRef
+    =<< lift . (\input -> doInitialInput input mergeSubscribeAndRead)
+    =<< lift (readBehaviorUntracked (dynamicCurrent d))
+  lift $ defer $ SomeInit $ do
+    void $ subscribeAndReadWith' (\p -> do
+                                     oldState <- liftIO $ readIORef stateRef
+                                     liftIO . writeIORef stateRef =<< doPatchInput p oldState mergeSubscribeAndRead)
+                          (dynamicUpdated d)
+                          terminalSubscriber
+  occ <- runMaybeT $ do
+       -- TODO: this is the same logic as in 'scheduleMerge''
+       guard =<< lift ((>=) <$> lift getCurrentHeight <*> liftIO (readIORef heightRef)) -- If we should have fired by now
+       dm <- liftIO $ readIORef accumRef
+       guard (not (outputIsEmpty dm))
+       liftIO $ writeIORef accumRef mempty
+       pure dm
+  pure ( writeIORef stateRef mempty
+       , ()
+       , occ
+       )
+
+merge' :: forall x ip ipt o s.
+  ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Monoid s)
+  => (ipt -> TellE x o -> EventM x s)
+  -> (ip -> s -> TellE x o -> EventM x s)
+  -> (o -> Bool)
+  -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
+  -> Event x o
+merge' doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ Event $ \sub -> do
   -- TODO: is it worth caching the number of subscriptions?
   --      This is now done with 'getNumSubs' but those functions traverse a tree.
   accumRef :: IORef o <- liftIO $ newIORef mempty
@@ -1041,9 +1115,9 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ Event $ \sub ->
           scheduleMerge' <=< liftIO $ readIORef heightRef
   let blaSubscriber = Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)
   let {-# INLINE [1] subscribeAndRead' #-}
-      subscribeAndRead' :: Event x a -> Subscriber x a -> MergeM x (MergeM x (), EventSubscription x)
+      subscribeAndRead' :: Event x a -> Subscriber x a -> EventM x (EventM x ())
       subscribeAndRead' e subscriber = do
-        subscription@(EventSubscription _ parentSubd) <- lift $ subscribe e subscriber
+        subscription@(EventSubscription _ parentSubd) <- subscribe e subscriber
         height <- liftIO $ getEventSubscribedHeight parentSubd
         i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
         liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
@@ -1054,26 +1128,23 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ Event $ \sub ->
                      if oldHeight == invalidHeight
                      then invalidHeight
                      else max (succHeight height) oldHeight
-        liftIO $ pure . (, subscription) $ do
+        liftIO $ pure $ do
           liftIO $ modifyIORef subscriptionsRef (IntMap.delete i)
-          W.tell [subscription]
+          defer $ MergeUpdate (pure [subscription]) (pure ()) (pure ())
   let subscribeAndReadWith' :: forall a b. (a -> EventM x b)
                             -> Event x a
                             -> Subscriber x b
-                            -> MergeM x (MergeM x (), EventSubscription x)
+                            -> EventM x (EventM x ())
       subscribeAndReadWith' f = subscribeAndRead' . pushCheap (fmap Just . f)
-  let mergeSubscribeAndRead :: Event x o -> MergeM x (MergeM x (), EventSubscription x)
+  let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
       mergeSubscribeAndRead e = subscribeAndReadWith' addAccum e blaSubscriber
-  subsToKillIllegal <- W.execWriterT $
-    liftIO . writeIORef stateRef
+  liftIO . writeIORef stateRef
     =<< flip doInitialInput mergeSubscribeAndRead
-    =<< lift (readBehaviorUntracked (dynamicCurrent d))
-  unless (null subsToKillIllegal) $ error "Merge init function killed subscriptions, this shouldn't happen"
+    =<< readBehaviorUntracked (dynamicCurrent d)
   defer $ SomeInit $ do
-    void . W.execWriterT $ subscribeAndReadWith' (\p -> do
+    void $ subscribeAndReadWith' (\p -> do
                               oldState <- liftIO $ readIORef stateRef
-                              toDelete <- W.execWriterT $ liftIO . writeIORef stateRef =<< doPatchInput p oldState mergeSubscribeAndRead
-                              defer $ MergeUpdate (pure toDelete) invalidateMyHeight recalculateMyHeight)
+                              liftIO . writeIORef stateRef =<< doPatchInput p oldState mergeSubscribeAndRead)
                           (dynamicUpdated d)
                           terminalSubscriber
   returnSubscription (do mapM_ unsubscribe =<< readIORef subscriptionsRef
@@ -1087,6 +1158,7 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ Event $ \sub ->
        guard (not (outputIsEmpty dm))
        liftIO $ writeIORef accumRef mempty
        pure dm
+
 
 runInits :: forall x. HasSpiderTimeline x => IORef [SomeInit x] -> EventM x ()
 runInits initRef = do
