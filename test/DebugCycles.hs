@@ -28,7 +28,7 @@ import Reflex
 import Reflex.EventWriter.Base
 import Test.Run
 import Test.Hspec
-import Reflex.Spider.Core (EventLoopException)
+import Reflex.Spider.Internal (EventLoopException)
 import Data.Witherable (Filterable)
 
 #if defined(MIN_VERSION_these_lens) || (MIN_VERSION_these(0,8,0) && !MIN_VERSION_these(0,9,0))

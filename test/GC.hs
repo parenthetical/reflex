@@ -25,7 +25,6 @@ import Data.Patch
 
 import qualified Reflex.Host.Class as Host
 import qualified Reflex.Spider.Internal as S
-import qualified Reflex.Spider.Core as S
 
 import System.Exit
 import System.Mem
