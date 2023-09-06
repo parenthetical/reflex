@@ -646,14 +646,14 @@ heightUpdater = do
         subscriberRecalculateHeight sub maybeNewHeight
   
 
-subscribeAndRead_ :: forall x res a. _ => Event x a -> Subscriber x a -> EvM x res (IO (), Maybe a)
+subscribeAndRead_ :: forall x res a. Defer (MergeUpdate x) (EventM x) => Event x a -> Subscriber x a -> EvM x res (IO (), Maybe a)
 subscribeAndRead_ e subscriber = do
   heightRef <- asks _heightRef
   subscriptionsCtr <- asks _subscriptionsCtr
   subscriptionsRef <- asks _subscriptionsRef
   invalidateMyHeight <- heightInvalidator
   recalculateMyHeight <- heightUpdater
-  (subscription@(EventSubscription _ subd), occ) <- lift $ subscribeAndRead e subscriber
+  (subscription, occ) <- lift $ subscribeAndRead e subscriber
   i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
   liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
   liftIO $ writeIORef heightRef invalidHeight
@@ -900,25 +900,25 @@ newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a 
 mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt =
   merge
-  (\ipt tellE -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
-  (\(PatchIntMap ip) s tellE -> do
+  (\tellE ipt -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
+  (\tellE (PatchIntMap ip) s -> do
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
      sequence_ $ IntMap.intersection s ip
      pure $ applyAlways (PatchIntMap ip') s)
   IntMap.null
 
 {-# INLINE mergeG' #-}
-mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
-  => ( patch k q
+mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q, Patch (patch k q))
+  => ( TellE x (DMap k v)
+       -> patch k q
        -> DMap k (Constant (EventM x ()))
-       -> TellE x (DMap k v)
        -> EventM x (DMap k (Constant (EventM x ()))))
   -> (forall a. q a -> Event x (v a))
   -> DynamicS x (patch k q)
   -> Event x (DMap k v)
 mergeG' doPatch nt =
   merge
-  (\ipt tellE -> DMap.traverseWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ipt)
+  (\tellE ipt -> DMap.traverseWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ipt)
   doPatch
   DMap.null
 
@@ -926,7 +926,7 @@ mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMap k q) -> Event x (DMap k v)
 mergeG nt =
   mergeG'
-  (\ip s tellE -> do
+  (\tellE ip s -> do
      ip' <- traversePatchDMapWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
      mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
@@ -937,7 +937,7 @@ mergeWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMapWithMove k q) -> Event x (DMap k v)
 mergeWithMove nt =
   mergeG'
-  (\ip s tellE -> do
+  (\tellE ip s -> do
      ip' <- traversePatchDMapWithMoveWithKey (\k v ->
                                Constant <$> tellE (DMap.singleton k <$> nt v))
             ip
@@ -959,62 +959,57 @@ type TellE x a = Event x a -> EventM x (EventM x ())
 
 {-# INLINE merge #-}
 merge :: forall x ip ipt o s.
-  ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Monoid s)
-  => (ipt -> TellE x o -> EventM x s)
-  -> (ip -> s -> TellE x o -> EventM x s)
+  ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Patch ip)
+  => (TellE x o -> ipt -> EventM x s)
+  -> (TellE x o -> ip -> s -> EventM x s)
   -> (o -> Bool)
   -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
 merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHeight $ do
   accumRef :: IORef o <- liftIO $ newIORef mempty
-  stateRef <- liftIO $ newIORef $ error "merge state not initialized"
   heightRef <- asks _heightRef
   sub <- asks _sub
   evD <- ask
   recalculateMyHeight <- heightUpdater
   invalidateMyHeight <- heightInvalidator
-  let blaSubscriber = Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)
-  let subscribeAndReadWith' :: forall a a1. (a -> EventM x a1) -> Event x a -> Subscriber x a1 -> EventM x (IO (), Maybe a1)
-      subscribeAndReadWith' f e subscriber = runReaderT (subscribeAndRead_ (pushCheap (fmap Just . f) e) subscriber) evD
   let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
-      mergeSubscribeAndRead e = liftIO . fst <$> subscribeAndReadWith'
-          (\a -> do
-             oldAccum <- liftIO (readIORef accumRef)
-             liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
-             liftIO $ do height <- readIORef heightRef
-                         when (height == invalidHeight) $
-                           throwIO EventLoopException
-             when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
-               let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
-                     height <- liftIO $ readIORef heightRef
-                     currentHeight <- getCurrentHeight
-                     case height `compare` currentHeight of
-                       LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-                       -- The height has been increased (by a coincidence event;
-                       -- TODO: is this the only way?)
-                       GT -> scheduleMerge' height
-                       EQ -> do
-                         vals <- liftIO $ readIORef accumRef
-                          -- TODO: "unless (outputIsEmpty vals)" is an unfortunate effect of my
-                          -- attempt to use addAccum both at init time and
-                          -- update time.
-                         unless (outputIsEmpty vals) $ do
-                         -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
-                         -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                           liftIO $ writeIORef accumRef $! mempty
-                           subscriberPropagate sub vals
-               scheduleMerge' <=< liftIO $ readIORef heightRef)
-          e
-          blaSubscriber
-  liftIO . writeIORef stateRef
-    =<< lift . (\input -> doInitialInput input mergeSubscribeAndRead)
-    =<< lift (readBehaviorUntracked (dynamicCurrent d))
-  lift $ defer $ SomeInit $ do
-    void $ subscribeAndReadWith' (\p -> do
-                                     oldState <- liftIO $ readIORef stateRef
-                                     liftIO . writeIORef stateRef =<< doPatchInput p oldState mergeSubscribeAndRead)
-                          (dynamicUpdated d)
-                          terminalSubscriber
+      mergeSubscribeAndRead e =
+        runReaderT (liftIO . fst <$> subscribeAndRead_ 
+          (pushCheap (\a -> do
+               oldAccum <- liftIO (readIORef accumRef)
+               liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
+               liftIO $ do height <- readIORef heightRef
+                           when (height == invalidHeight) $
+                             throwIO EventLoopException
+               when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
+                 let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
+                       height <- liftIO $ readIORef heightRef
+                       currentHeight <- getCurrentHeight
+                       case height `compare` currentHeight of
+                         LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+                         -- The height has been increased (by a coincidence event;
+                         -- TODO: is this the only way?)
+                         GT -> scheduleMerge' height
+                         EQ -> do
+                           vals <- liftIO $ readIORef accumRef
+                            -- TODO: "unless (outputIsEmpty vals)" is an unfortunate effect of my
+                            -- attempt to use addAccum both at init time and
+                            -- update time.
+                           unless (outputIsEmpty vals) $ do
+                           -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
+                           -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
+                             liftIO $ writeIORef accumRef $! mempty
+                             subscriberPropagate sub vals
+                 scheduleMerge' <=< liftIO $ readIORef heightRef
+               pure (Just ()))
+           e)
+          (Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)))
+        evD
+  initialState <- lift $ doInitialInput mergeSubscribeAndRead =<< R.sample (SpiderBehavior (dynamicCurrent d))
+  stateB <- mfix $ \stateB -> R.hold initialState . R.pushCheap (\p -> SpiderPushM $ do
+                                                                  oldState <- R.sample stateB
+                                                                  Just <$> doPatchInput mergeSubscribeAndRead p oldState)
+                           $ R.updatedIncremental (SpiderIncremental d)
   occ <- runMaybeT $ do
        -- TODO: this is the same logic as in 'scheduleMerge''
        guard =<< lift ((>=) <$> lift getCurrentHeight <*> liftIO (readIORef heightRef)) -- If we should have fired by now
@@ -1022,8 +1017,8 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHei
        guard (not (outputIsEmpty dm))
        liftIO $ writeIORef accumRef mempty
        pure dm
-  pure ( writeIORef stateRef mempty
-       , ()
+  pure ( pure ()
+       , stateB -- TODO: without this GC-semantics tests fail, but how can it be automated?
        , occ
        )
 
@@ -1047,6 +1042,7 @@ invalidate wisRef = do
         i
   writeIORef wisRef []
 
+rootClear :: IORef (DMap k v) -> IO ()
 rootClear ref = writeIORef ref $! DMap.empty
 
 justRunInits :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
@@ -1550,11 +1546,10 @@ instance NotReady (SpiderTimeline x) (SpiderHostFrame x) where
   notReadyUntil _ = pure ()
   notReady = pure ()
 
-newEventWithTriggerIO :: forall x a. HasSpiderTimeline x => (RootTrigger x a -> IO (IO ())) -> IO (Event x a)
+newEventWithTriggerIO :: forall x a. (RootTrigger x a -> IO (IO ())) -> IO (Event x a)
 newEventWithTriggerIO f = do
   es <- newFanEventWithTriggerIO $ \Refl -> f
   return $ select es Refl
-
 
 newtype ReadPhase x a = ReadPhase (EventM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
