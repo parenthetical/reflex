@@ -973,38 +973,39 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHei
   evD <- ask
   recalculateMyHeight <- heightUpdater
   invalidateMyHeight <- heightInvalidator
-  let addAccum :: (o -> EventM x ())
-      addAccum !a = do
-        oldAccum <- liftIO (readIORef accumRef)
-        liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
-        liftIO $ do height <- readIORef heightRef
-                    when (height == invalidHeight) $
-                      throwIO EventLoopException
-        when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
-          let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
-                height <- liftIO $ readIORef heightRef
-                currentHeight <- getCurrentHeight
-                case height `compare` currentHeight of
-                  LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-                  -- The height has been increased (by a coincidence event;
-                  -- TODO: is this the only way?)
-                  GT -> scheduleMerge' height
-                  EQ -> do
-                    vals <- liftIO $ readIORef accumRef
-                     -- TODO: "unless (outputIsEmpty vals)" is an unfortunate effect of my
-                     -- attempt to use addAccum both at init time and
-                     -- update time.
-                    unless (outputIsEmpty vals) $ do
-                    -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
-                    -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                      liftIO $ writeIORef accumRef $! mempty
-                      subscriberPropagate sub vals
-          scheduleMerge' <=< liftIO $ readIORef heightRef
   let blaSubscriber = Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)
   let subscribeAndReadWith' :: forall a a1. (a -> EventM x a1) -> Event x a -> Subscriber x a1 -> EventM x (IO (), Maybe a1)
       subscribeAndReadWith' f e subscriber = runReaderT (subscribeAndRead_ (pushCheap (fmap Just . f) e) subscriber) evD
   let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
-      mergeSubscribeAndRead e = liftIO . fst <$> subscribeAndReadWith' addAccum e blaSubscriber
+      mergeSubscribeAndRead e = liftIO . fst <$> subscribeAndReadWith'
+          (\a -> do
+             oldAccum <- liftIO (readIORef accumRef)
+             liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
+             liftIO $ do height <- readIORef heightRef
+                         when (height == invalidHeight) $
+                           throwIO EventLoopException
+             when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
+               let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
+                     height <- liftIO $ readIORef heightRef
+                     currentHeight <- getCurrentHeight
+                     case height `compare` currentHeight of
+                       LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+                       -- The height has been increased (by a coincidence event;
+                       -- TODO: is this the only way?)
+                       GT -> scheduleMerge' height
+                       EQ -> do
+                         vals <- liftIO $ readIORef accumRef
+                          -- TODO: "unless (outputIsEmpty vals)" is an unfortunate effect of my
+                          -- attempt to use addAccum both at init time and
+                          -- update time.
+                         unless (outputIsEmpty vals) $ do
+                         -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
+                         -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
+                           liftIO $ writeIORef accumRef $! mempty
+                           subscriberPropagate sub vals
+               scheduleMerge' <=< liftIO $ readIORef heightRef)
+          e
+          blaSubscriber
   liftIO . writeIORef stateRef
     =<< lift . (\input -> doInitialInput input mergeSubscribeAndRead)
     =<< lift (readBehaviorUntracked (dynamicCurrent d))
