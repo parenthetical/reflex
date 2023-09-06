@@ -348,7 +348,7 @@ pull a = unsafePerformIO $ do
     subscribed <- liftIO (readIORef ref) >>= \case
       Just subscribed -> pure subscribed
       Nothing -> do
-        let i = Invalidator $ readIORef ref
+        let i = readIORef ref
                 >>= mapM_ (const $ do
                               writeIORef ref Nothing
                               evaluate =<< invalidate invsRef)
@@ -405,7 +405,7 @@ newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscri
 
 -- type role PullSubscribed representational nominal
 
-newtype Invalidator = Invalidator (IO ())
+type Invalidator = IO ()
 
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
@@ -728,7 +728,7 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
         inits <- readIORef initsRef
         assert (null inits) $ pure e
   ownInvalidator <- mfix $ \i -> liftIO $ do
-    evaluate $ Invalidator $ do
+    evaluate $ do
       runEventM @x $ defer $ Clear
          (do
              putStrLn "Running inits inside switch"
@@ -1037,7 +1037,7 @@ invalidate wisRef = do
     mi <- deRefWeak wi
     case mi of
       Nothing -> pure () --TODO: Should we clean this up here?
-      Just (Invalidator i) -> do
+      Just i -> do
         finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
         i
   writeIORef wisRef []
