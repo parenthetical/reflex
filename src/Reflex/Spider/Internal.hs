@@ -716,6 +716,7 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
   ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   eventUnsubscribeRef <- liftIO $ newIORef $ error "switch: eventUnsubscribeRef uninitialized"
   evD <- ask
+  subscriber <- subscriber_
   let writeNewWeakInvalidator i = do
         wi <-  mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
@@ -740,15 +741,11 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
                  finalize =<< readIORef ownWeakInvalidatorRef
                  writeNewWeakInvalidator i
                  join . readIORef $ eventUnsubscribeRef
-               (unsubscribeE, _parentOcc) <- flip runReaderT evD $ do
-                 subscriber <- subscriber_
-                 flip subscribeAndRead_ subscriber =<< liftIO getE
+               (unsubscribeE, _parentOcc) <- flip runReaderT evD $ flip subscribeAndRead_ subscriber =<< liftIO getE
                liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
              pure ())
   liftIO $ writeNewWeakInvalidator ownInvalidator
-  (unsubscribeE, parentOcc) <- do
-    subscriber <- subscriber_
-    flip subscribeAndRead_ subscriber =<< liftIO getE
+  (unsubscribeE, parentOcc) <- flip subscribeAndRead_ subscriber =<< liftIO getE
   liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
   pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
        , ownInvalidator
