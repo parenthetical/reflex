@@ -721,27 +721,27 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
         wi <- mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
   liftIO $ writeNewWeakInvalidator (pure ())
-  rec let foo = do
-            liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
-            liftIO $ join . readIORef $ eventUnsubscribeRef
-            liftIO $ writeNewWeakInvalidator $ runEventM @x $ defer $ Clear $ do
+  mdo
+    let ownInvalidator = runEventM @x $ defer $ Clear $ do
                  putStrLn "Running inits inside switch"
                  -- TODO: this used to be runFrame but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
                  unSpiderHost . justRunInits $ void $ runReaderT foo evD
+    let foo = do
+            liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
+            liftIO $ join . readIORef $ eventUnsubscribeRef
+            liftIO $ writeNewWeakInvalidator $ ownInvalidator
             (unsubscribeE, parentOcc) <- flip subscribeAndRead_ subscriber <=< liftIO $ do
               wi <- readIORef ownWeakInvalidatorRef
               initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
               writeIORef parentsRef []
-              e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
-              inits <- readIORef initsRef
-              assert (null inits) $ pure e
+              runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
             liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
             pure parentOcc
-  parentOcc <- foo
-  pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
-       , foo
-       , parentOcc
-       )
+    parentOcc <- foo
+    pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
+         , foo -- TODO: what exactly should go here?
+         , parentOcc
+         )
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
