@@ -711,8 +711,6 @@ coincidence coincidenceParent = cacheEvent $ toEvent zeroHeight $ do
 -- TODO: can switch be written using something like unsafeUpdated and tellEvent?
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ toEvent invalidHeight $ do
-  -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
-  parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   eventUnsubscribeRef <- liftIO $ newIORef $ pure ()
   evD <- ask
@@ -721,27 +719,31 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
         wi <- mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
   liftIO $ writeNewWeakInvalidator (pure ())
-  mdo
-    let ownInvalidator = runEventM @x $ defer $ Clear $ do
-                 putStrLn "Running inits inside switch"
-                 -- TODO: this used to be runFrame but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
-                 unSpiderHost . justRunInits $ void $ runReaderT foo evD
-    let foo = do
-            liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
-            liftIO $ join . readIORef $ eventUnsubscribeRef
-            liftIO $ writeNewWeakInvalidator $ ownInvalidator
-            (unsubscribeE, parentOcc) <- flip subscribeAndRead_ subscriber <=< liftIO $ do
-              wi <- readIORef ownWeakInvalidatorRef
-              initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
-              writeIORef parentsRef []
-              runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
-            liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
-            pure parentOcc
-    parentOcc <- foo
-    pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
-         , foo -- TODO: what exactly should go here?
-         , parentOcc
-         )
+  ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
+  let withB :: forall b c. Behavior x b -> (b -> EvM x a c) -> EvM x a c 
+      withB b f = do
+       let ownInvalidator = runEventM @x $ defer $ Clear $ do
+                    putStrLn "Running inits inside switch"
+                    -- TODO: this used to be runFrame but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
+                    unSpiderHost . justRunInits $ void $ runReaderT (withB b f) evD
+       liftIO $ writeIORef ownInvalidatorRef ownInvalidator
+       liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
+       liftIO $ writeNewWeakInvalidator ownInvalidator
+       f <=< liftIO $ do
+         wi <- readIORef ownWeakInvalidatorRef
+         initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
+         parentsRef <- newIORef []
+         runBehaviorM (readBehaviorTracked b) (Just (wi, parentsRef)) initsRef
+  let subscribeAndReadE e = do
+        liftIO $ join . readIORef $ eventUnsubscribeRef
+        (unsubscribeE, parentOcc) <- subscribeAndRead_ e subscriber
+        liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
+        pure parentOcc
+  parentOcc <- withB switchParent subscribeAndReadE
+  pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
+       , ownInvalidatorRef -- TODO: what exactly should go here?
+       , parentOcc
+       )
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
