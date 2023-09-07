@@ -713,42 +713,33 @@ switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ toEvent invalidHeight $ do
   -- TODO: This should be unnecessary, because it will always be filled with just the single parent behavior:
   parentsRef :: IORef [SomeBehaviorSubscribed x] <- liftIO $ newIORef []
-  ownWeakInvalidatorRef <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  eventUnsubscribeRef <- liftIO $ newIORef $ error "switch: eventUnsubscribeRef uninitialized"
+  ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+  eventUnsubscribeRef <- liftIO $ newIORef $ pure ()
   evD <- ask
   subscriber <- subscriber_
   let writeNewWeakInvalidator i = do
-        wi <-  mkWeakPtrWithDebug i
+        wi <- mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
-  let getE = do
-        wi <- readIORef ownWeakInvalidatorRef
-        --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-        initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
-        writeIORef parentsRef []
-        e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
-        inits <- readIORef initsRef
-        assert (null inits) $ pure e
-  ownInvalidator <- mfix $ \i -> liftIO $ do
-    evaluate $ do
-      runEventM @x $ defer $ Clear
-         (do
-             putStrLn "Running inits inside switch"
-             -- TODO: this used to be runFrame but in the tests only
-             -- inits are generated, also it now loops if you use
-             -- runFrame (if you defer to MergeUpdate it doesn't loop).
-             _ <- unSpiderHost . justRunInits $ do
-               liftIO $ do
-                 finalize =<< readIORef ownWeakInvalidatorRef
-                 writeNewWeakInvalidator i
-                 join . readIORef $ eventUnsubscribeRef
-               (unsubscribeE, _parentOcc) <- flip runReaderT evD $ flip subscribeAndRead_ subscriber =<< liftIO getE
-               liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
-             pure ())
-  liftIO $ writeNewWeakInvalidator ownInvalidator
-  (unsubscribeE, parentOcc) <- flip subscribeAndRead_ subscriber =<< liftIO getE
-  liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
+  liftIO $ writeNewWeakInvalidator (pure ())
+  rec let foo = do
+            liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
+            liftIO $ join . readIORef $ eventUnsubscribeRef
+            liftIO $ writeNewWeakInvalidator $ runEventM @x $ defer $ Clear $ do
+                 putStrLn "Running inits inside switch"
+                 -- TODO: this used to be runFrame but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
+                 unSpiderHost . justRunInits $ void $ runReaderT foo evD
+            (unsubscribeE, parentOcc) <- flip subscribeAndRead_ subscriber <=< liftIO $ do
+              wi <- readIORef ownWeakInvalidatorRef
+              initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
+              writeIORef parentsRef []
+              e <- runBehaviorM (readBehaviorTracked switchParent) (Just (wi, parentsRef)) initsRef
+              inits <- readIORef initsRef
+              assert (null inits) $ pure e
+            liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
+            pure parentOcc
+  parentOcc <- foo
   pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
-       , ownInvalidator
+       , foo
        , parentOcc
        )
 
