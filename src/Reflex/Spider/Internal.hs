@@ -823,6 +823,7 @@ fanInt =
      , \a -> sequence_ . IntMap.intersectionWith propagate a
      ))
 
+-- TODO: this currently uses something like "IntMap (WeakBag (Subscriber x a))" for subscribers, but wouldn't it be possible to use "IntMap (Subscriber x a)" paired with a cacheEvent for each selected key?
 {-# INLINE fan #-}
 fan :: forall {a1} {x1} {a2} {a3}
        {a5}.
