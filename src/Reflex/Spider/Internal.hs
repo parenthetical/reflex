@@ -640,7 +640,7 @@ heightUpdater = do
       maybeNewHeight <- do
         subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
         -- TODO: succHeight is not needed for coincidence/switch
-        pure $ if invalidHeight `elem` subs then invalidHeight else succHeight (maximum (zeroHeight:subs))
+        pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
       when (maybeNewHeight /= invalidHeight) $ do
         writeIORef heightRef $! maybeNewHeight
         subscriberRecalculateHeight sub maybeNewHeight
@@ -1091,14 +1091,6 @@ zeroHeight = Height 0
 {-# INLINE invalidHeight #-}
 invalidHeight :: Height
 invalidHeight = Height (-1000)
-
--- Only used in merge
-{-# INLINE succHeight #-}
-succHeight :: Height -> Height
-succHeight h@(Height a) =
-  if h == invalidHeight
-  then invalidHeight
-  else Height $ succ a
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
