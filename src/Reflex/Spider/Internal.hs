@@ -712,7 +712,6 @@ coincidence coincidenceParent = cacheEvent $ toEvent zeroHeight $ do
 switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ toEvent invalidHeight $ do
   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  eventUnsubscribeRef <- liftIO $ newIORef $ pure ()
   evD <- ask
   subscriber <- subscriber_
   let writeNewWeakInvalidator i = do
@@ -720,26 +719,23 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
         writeIORef ownWeakInvalidatorRef $! wi
   liftIO $ writeNewWeakInvalidator (pure ())
   ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
-  let withB :: forall b c. Behavior x b -> (b -> EvM x a c) -> EvM x a c 
-      withB b f = do
+  let withB :: forall s b c. s -> Behavior x b -> (s -> b -> EvM x a (s, c)) -> EvM x a (s, c)
+      withB currentState b f = mfix $ \(~(newState, _)) -> do
        let ownInvalidator = runEventM @x $ defer $ Clear $ do
                     putStrLn "Running inits inside switch"
                     -- TODO: this used to be runFrame but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
-                    unSpiderHost . justRunInits $ void $ runReaderT (withB b f) evD
+                    unSpiderHost . justRunInits $ void $ runReaderT (withB newState b f) evD
        liftIO $ writeIORef ownInvalidatorRef ownInvalidator
        liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
        liftIO $ writeNewWeakInvalidator ownInvalidator
-       f <=< liftIO $ do
+       f currentState <=< liftIO $ do
          wi <- readIORef ownWeakInvalidatorRef
          initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
          parentsRef <- newIORef []
          runBehaviorM (readBehaviorTracked b) (Just (wi, parentsRef)) initsRef
-  let subscribeAndReadE e = do
-        liftIO $ join . readIORef $ eventUnsubscribeRef
-        (unsubscribeE, parentOcc) <- subscribeAndRead_ e subscriber
-        liftIO $ writeIORef eventUnsubscribeRef unsubscribeE
-        pure parentOcc
-  parentOcc <- withB switchParent subscribeAndReadE
+  ~(_, parentOcc) <- withB (pure ()) switchParent $ \unsubscribePrevious e -> do
+        liftIO unsubscribePrevious
+        subscribeAndRead_ e subscriber
   pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
        , ownInvalidatorRef -- TODO: what exactly should go here?
        , parentOcc
