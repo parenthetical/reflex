@@ -167,32 +167,6 @@ terminalSubscriber = Subscriber { subscriberPropagate = const (pure ())
                                 , subscriberRecalculateHeight = \_ -> return ()
                                 }
 
---TODO: Make this lazy in its input event
-headE :: forall x m a. (Defer (SomeInit x) m) => Event x a -> m (Event x a)
-headE originalE = do
-  let -- | Subscribe to an Event only for the duration of one occurrence
-      subscribeAndReadHead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
-      subscribeAndReadHead e sub = do
-        -- TODO: Why does this have "cyclic evaluation in fixIO" but the IORef version below not?
-        -- mfix $ \(~(subscription, _)) ->
-        --   subscribeAndRead (pushCheap (\a -> liftIO $ unsubscribe subscription >> pure (Just a)) e) sub
-        subscriptionRef <- liftIO $ newIORef $ error "subscribeAndReadHead: not initialized"
-        (subscription, occ) <- subscribeAndRead e $ sub
-          { subscriberPropagate = \a -> do
-              liftIO $ unsubscribe =<< readIORef subscriptionRef
-              subscriberPropagate sub a
-          }
-        liftIO $ maybe (writeIORef subscriptionRef $! subscription) (const (unsubscribe subscription)) occ
-        return (subscription, occ)
-  parent <- liftIO $ newIORef $ Just originalE
-  --TODO: Rename SomeInit appropriately
-  defer $ SomeInit $ void
-      $ subscribeAndReadHead
-        (pushCheap (\_ -> liftIO $ writeIORef parent Nothing >> pure Nothing) originalE)
-        terminalSubscriber
-  return $ Event $ \sub ->
-    liftIO (readIORef parent) >>= maybe subscribeAndReadNever (`subscribeAndReadHead` sub)
-
 now :: (Defer Clear m) => m (Event x ())
 now = do
   nowOrNot <- liftIO $ newIORef $ Just ()
@@ -1183,8 +1157,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE buildDynamic #-}
   buildDynamic = buildDynamicSpiderEventM
   {-# INLINABLE headE #-}
---  headE = R.slowHeadE
-  headE (SpiderEvent e) = SpiderEvent <$> headE e
+  headE = R.slowHeadE
   {-# INLINABLE now #-}
   now = SpiderEvent <$> now
 
@@ -1206,8 +1179,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE buildDynamic #-}
   buildDynamic getV0 (SpiderEvent e) = SpiderPushM $ fmap (SpiderDynamic . dynamicDyn) $ buildDynamic (coerce getV0) $ coerce e
   {-# INLINABLE headE #-}
-  -- headE = R.slowHeadE
-  headE (SpiderEvent e) = SpiderPushM $ SpiderEvent <$> headE e
+  headE = R.slowHeadE
   {-# INLINABLE now #-}
   now = SpiderPushM $ SpiderEvent <$> now
 
@@ -1291,8 +1263,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE buildDynamic #-}
   buildDynamic getV0 e = SpiderHostFrame $ fmap (SpiderDynamic . dynamicDyn) $ buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
   {-# INLINABLE headE #-}
-  -- headE = R.slowHeadE
-  headE (SpiderEvent e) = SpiderHostFrame $ SpiderEvent <$> headE e
+  headE = R.slowHeadE
   {-# INLINABLE now #-}
   now = SpiderHostFrame Reflex.Class.now
 
