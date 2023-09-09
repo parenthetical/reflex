@@ -26,6 +26,7 @@
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE TupleSections #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
@@ -105,6 +106,7 @@ import qualified Data.Patch.DMap as PatchDMap
 import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
+import Data.Bool (bool)
 
 whenM :: Monad m => m Bool -> m () -> m ()
 whenM mcond m = mcond >>= flip when m
@@ -574,7 +576,6 @@ heightUpdater = do
       when (maybeNewHeight /= invalidHeight) $ do
         writeIORef heightRef $! maybeNewHeight
         subscriberRecalculateHeight sub maybeNewHeight
-  
 
 subscribeAndRead_ :: forall x res a. Defer (MergeUpdate x) (EventM x) => Event x a -> Subscriber x a -> EvM x res (IO (), Maybe a)
 subscribeAndRead_ e subscriber = do
@@ -649,6 +650,7 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
         writeIORef ownWeakInvalidatorRef $! wi
   liftIO $ writeNewWeakInvalidator (pure ())
   ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
+  -- withB is like "fold over Behavior updates"
   let withB :: forall s b c. s -> Behavior x b -> (s -> b -> EvM x a (s, c)) -> EvM x a (s, c)
       withB currentState b f = mfix $ \(~(newState, _)) -> do
        let ownInvalidator = runEventM @x $ defer $ Clear $ do
@@ -820,7 +822,6 @@ mergeInt =
      ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
      sequence_ $ IntMap.intersection s ip
      pure $ applyAlways (PatchIntMap ip') s)
-  IntMap.null
 
 {-# INLINE mergeG' #-}
 mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q, Patch (patch k q))
@@ -835,7 +836,6 @@ mergeG' doPatch nt =
   merge
   (\tellE ipt -> DMap.traverseWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ipt)
   doPatch
-  DMap.null
 
 mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
   => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMap k q) -> Event x (DMap k v)
@@ -872,66 +872,67 @@ mergeWithMove nt =
 
 type TellE x a = Event x a -> EventM x (EventM x ())
 
+-- TODO: merge scheduling used to check this; useful for debugging but needs special casing so I left it out:
+-- case height `compare` currentHeight of
+--   LT -> error "Somehow a merge's height has been decreased after it was scheduled"
 {-# INLINE merge #-}
 merge :: forall x ip ipt o s.
   ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Patch ip)
   => (TellE x o -> ipt -> EventM x s)
   -> (TellE x o -> ip -> s -> EventM x s)
-  -> (o -> Bool)
   -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHeight $ do
+merge doInitialInput doPatchInput d = cacheEvent $ toEvent zeroHeight $ do
   accumRef :: IORef o <- liftIO $ newIORef mempty
   heightRef <- asks _heightRef
   sub <- asks _sub
   evD <- ask
   recalculateMyHeight <- heightUpdater
   invalidateMyHeight <- heightInvalidator
+  anEventFiredRef <- liftIO $ newIORef False
+  let seenAllEvents = do
+        height <- liftIO $ readIORef heightRef
+        currentHeight <- getCurrentHeight
+        pure (height <= currentHeight)
   let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
       mergeSubscribeAndRead e =
         runReaderT (liftIO . fst <$> subscribeAndRead_ 
           (pushCheap (\a -> do
-               oldAccum <- liftIO (readIORef accumRef)
-               liftIO $ writeIORef accumRef $! a <> oldAccum -- left-biased generally but there shouldn't be dup'd keys
+               didAnEventFire <- liftIO $ atomicModifyIORef anEventFiredRef (True,)
+               liftIO $ modifyIORef accumRef (a <>) -- maps are left-biased generally but there shouldn't be dup'd keys anyway
                liftIO $ do height <- readIORef heightRef
                            when (height == invalidHeight) $
                              throwIO EventLoopException
-               when (outputIsEmpty oldAccum) $ do -- Only schedule the firing once
+               unless didAnEventFire $ do -- Only schedule the firing once
                  let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
-                       height <- liftIO $ readIORef heightRef
-                       currentHeight <- getCurrentHeight
-                       case height `compare` currentHeight of
-                         LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-                         -- The height has been increased (by a coincidence event;
-                         -- TODO: is this the only way?)
-                         GT -> scheduleMerge' height
-                         EQ -> do
-                           vals <- liftIO $ readIORef accumRef
+                       seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
                             -- TODO: "unless (outputIsEmpty vals)" is an unfortunate effect of my
                             -- attempt to use addAccum both at init time and
                             -- update time.
-                           unless (outputIsEmpty vals) $ do
+                           initPhaseDidntReturnOcc <- liftIO (readIORef anEventFiredRef)
+                           when initPhaseDidntReturnOcc $ do
                            -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
                            -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                             liftIO $ writeIORef accumRef $! mempty
-                             subscriberPropagate sub vals
+                             liftIO $ writeIORef anEventFiredRef False
+                             subscriberPropagate sub =<< liftIO (atomicModifyIORef accumRef (mempty,)))
                  scheduleMerge' <=< liftIO $ readIORef heightRef
                pure (Just ()))
            e)
           (Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)))
         evD
-  initialState <- lift $ doInitialInput mergeSubscribeAndRead =<< R.sample (SpiderBehavior (dynamicCurrent d))
-  stateB <- mfix $ \stateB -> R.hold initialState . R.pushCheap (\p -> SpiderPushM $ do
-                                                                  oldState <- R.sample stateB
-                                                                  Just <$> doPatchInput mergeSubscribeAndRead p oldState)
+  initialState <- lift $ doInitialInput mergeSubscribeAndRead
+                         =<< R.sample (SpiderBehavior (dynamicCurrent d))
+  stateB <- mfix $ \stateB -> R.hold initialState
+                              . R.pushCheap (\p -> SpiderPushM $ do
+                                                oldState <- R.sample stateB
+                                                Just <$> doPatchInput mergeSubscribeAndRead p oldState)
                            $ R.updatedIncremental (SpiderIncremental d)
   occ <- runMaybeT $ do
        -- TODO: this is the same logic as in 'scheduleMerge''
-       guard =<< lift ((>=) <$> lift getCurrentHeight <*> liftIO (readIORef heightRef)) -- If we should have fired by now
-       dm <- liftIO $ readIORef accumRef
-       guard (not (outputIsEmpty dm))
-       liftIO $ writeIORef accumRef mempty
-       pure dm
+       guard =<< lift (lift seenAllEvents)
+       guard =<< liftIO (readIORef anEventFiredRef)
+       liftIO $ writeIORef anEventFiredRef False
+       liftIO $ atomicModifyIORef accumRef (mempty,)
   pure ( pure ()
        , stateB -- TODO: without this GC-semantics tests fail, but how can it be automated?
        , occ
@@ -1288,11 +1289,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Refle
   headE e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.headE e
   {-# INLINABLE now #-}
   now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
-
--- TODO: remove deprecated
---------------------------------------------------------------------------------
--- Deprecated items
---------------------------------------------------------------------------------
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
   {-# INLINABLE subscribeEvent #-}
