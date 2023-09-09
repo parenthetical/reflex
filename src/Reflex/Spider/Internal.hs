@@ -106,13 +106,6 @@ import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
 
-whenNothingRef :: MonadIO m => IORef (Maybe a) -> m () -> m ()
-whenNothingRef ref m = do
-  c <- liftIO $ readIORef ref
-  case c of
-    Nothing -> m
-    Just _ -> pure ()
-
 whenM :: Monad m => m Bool -> m () -> m ()
 whenM mcond m = mcond >>= flip when m
 
@@ -375,7 +368,9 @@ hold v0 e = do
   valRef <- liftIO $ newIORef v0
   invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
-  defer $ SomeInit $ whenNothingRef parentRef $ do
+  defer $ SomeInit $ do
+    maybeParent <- liftIO $ readIORef parentRef
+    when (isNothing maybeParent) $ do
           liftIO . writeIORef parentRef . Just
             <=< subscribeWith e (\a -> do
                                     v <- liftIO $ readIORef valRef
