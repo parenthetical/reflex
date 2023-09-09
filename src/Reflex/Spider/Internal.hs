@@ -309,7 +309,7 @@ pull a = unsafePerformIO $ do
         let i = readIORef ref
                 >>= mapM_ (const $ do
                               writeIORef ref Nothing
-                              evaluate =<< invalidate invsRef)
+                              invalidate invsRef)
         wi <- liftIO $ mkWeakPtrWithDebug i
         parentsRef <- liftIO $ newIORef []
         (_, !holdInits) <- ask -- ask behavior hold inits
@@ -729,9 +729,7 @@ newtype Clear = Clear (IO ())
 data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
 
 mkWeakPtrWithDebug :: a -> IO (Weak a)
-mkWeakPtrWithDebug x = do
-  x' <- evaluate x
-  mkWeakPtr x' Nothing
+mkWeakPtrWithDebug x = mkWeakPtr x Nothing
 
 data EventLoopException = EventLoopException
 instance Exception EventLoopException
@@ -968,7 +966,7 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHei
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
   wis <- readIORef wisRef
-  evaluate <=< forM_ wis $ \wi -> do
+  forM_ wis $ \wi -> do
     mi <- deRefWeak wi
     case mi of
       Nothing -> pure () --TODO: Should we clean this up here?
