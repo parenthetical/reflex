@@ -109,29 +109,33 @@ import Control.Monad.Reader
 whenM :: Monad m => m Bool -> m () -> m ()
 whenM mcond m = mcond >>= flip when m
 
---------------------------------------------------------------------------------
--- EventSubscription
---------------------------------------------------------------------------------
-
 --NB: Once you subscribe to an Event, you must always hold on the the WHOLE EventSubscription you get back
 -- If you do not retain the subscription, you may be prematurely unsubscribed from the parent event.
 data EventSubscription x = EventSubscription
-  { _eventSubscription_unsubscribe :: !(IO ())
+  { unsubscribe :: !(IO ())
   , _eventSubscription_subscribed :: {-# UNPACK #-} !(EventSubscribed x)
   }
 
-unsubscribe :: EventSubscription x -> IO ()
-unsubscribe (EventSubscription u _) = u
+newtype Event x a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe a) }
 
---------------------------------------------------------------------------------
--- Event
---------------------------------------------------------------------------------
+data Subscriber x a = Subscriber
+  { subscriberPropagate :: !(a -> EventM x ())
+  , subscriberInvalidateHeight :: !(Height -> IO ())
+  , subscriberRecalculateHeight :: !(Height -> IO ())
+  }
 
-newtype Event x a = Event { unEvent :: Subscriber x a -> EventM x (EventSubscription x, Maybe a) }
+subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
+subscribe e s = fst <$> subscribeAndRead e s
 
-{-# INLINE subscribeAndRead #-}
-subscribeAndRead :: Event x a -> Subscriber x a -> EventM x (EventSubscription x, Maybe a)
-subscribeAndRead = unEvent
+returnSubscription :: Monad m => IO () -> IORef Height -> a -> b -> m (EventSubscription x, b)
+returnSubscription cleanup heightRef retained occ =
+  return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
+
+subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
+subscribeAndReadNever = returnSubscription (pure ()) zeroRef () Nothing
+
+eventNever :: Event x a
+eventNever = Event $ const subscribeAndReadNever
 
 subscribeWith :: Event x a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
 subscribeWith e f = subscribe (pushCheap (\a -> f a >> pure (Just a)) e)
@@ -224,29 +228,6 @@ cacheEvent e = unsafePerformIO $ do
                        (sln, parentSubscriptionRef)
                        <=< liftIO $ readIORef occRef
 
-subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
-subscribe e s = fst <$> subscribeAndRead e s
-
-returnSubscription :: Monad m => IO () -> IORef Height -> a -> b -> m (EventSubscription x, b)
-returnSubscription cleanup heightRef retained occ =
-  return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
-
-subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
-subscribeAndReadNever = returnSubscription (pure ()) zeroRef () Nothing
-
-eventNever :: Event x a
-eventNever = Event $ const subscribeAndReadNever
-
---------------------------------------------------------------------------------
--- Subscriber
---------------------------------------------------------------------------------
-
-data Subscriber x a = Subscriber
-  { subscriberPropagate :: !(a -> EventM x ())
-  , subscriberInvalidateHeight :: !(Height -> IO ())
-  , subscriberRecalculateHeight :: !(Height -> IO ())
-  }
-
 invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
 invalidateSubscriberHeight = flip subscriberInvalidateHeight
 
@@ -260,10 +241,6 @@ propagate a subscribers =
   --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
   WeakBag.traverse_ subscribers $ \s -> subscriberPropagate s a
 
---------------------------------------------------------------------------------
--- EventSubscribed
---------------------------------------------------------------------------------
-
 toAny :: a -> Any
 toAny = unsafeCoerce
 
@@ -276,18 +253,6 @@ data EventSubscribed x = EventSubscribed
   { eventSubscribedHeightRef :: {-# UNPACK #-} !(IORef Height)
   , _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
   }
-
--- TODO: make sure this is used
-getEventSubscribedHeight :: EventSubscribed x -> IO Height
-getEventSubscribedHeight es = readIORef $ eventSubscribedHeightRef es
-
-{-# INLINE subscribeHoldEvent #-}
-subscribeHoldEvent :: Hold x p -> Subscriber x p -> EventM x (EventSubscription x, Maybe p)
-subscribeHoldEvent = subscribeAndRead . holdEvent
-
---------------------------------------------------------------------------------
--- Behavior
---------------------------------------------------------------------------------
 
 newtype Behavior x a = Behavior { readBehaviorTracked :: BehaviorM x a }
 
@@ -375,8 +340,8 @@ hold v0 e = do
             <=< subscribeWith e (\a -> do
                                     v <- liftIO $ readIORef valRef
                                     forM_ (apply a v) $ \v' -> do
-                                      vRef <- liftIO $ evaluate valRef
-                                      iRef <- liftIO $ evaluate invsRef
+                                      vRef <- pure $! valRef
+                                      iRef <- pure $! invsRef
                                       defer $ SomeAssignment @x vRef iRef v')
             $ terminalSubscriber
   return $ Hold
@@ -415,10 +380,6 @@ addParentBAndInvalidator h invsRef = do
       liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
 
---------------------------------------------------------------------------------
--- Dynamic
---------------------------------------------------------------------------------
-
 type DynamicS x p = Dynamic x (PatchTarget p) p
 
 data Dynamic x target p = Dynamic
@@ -427,6 +388,10 @@ data Dynamic x target p = Dynamic
   }
 
 deriving instance (HasSpiderTimeline x) => Functor (Dynamic x target)
+
+{-# INLINE subscribeHoldEvent #-}
+subscribeHoldEvent :: Hold x p -> Subscriber x p -> EventM x (EventSubscription x, Maybe p)
+subscribeHoldEvent = subscribeAndRead . holdEvent
 
 dynamicHold :: Hold x p -> DynamicS x p
 dynamicHold !h = Dynamic
@@ -446,10 +411,6 @@ dynamicDyn (Dyn !d) =
  in  Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
              , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
              }
-
---------------------------------------------------------------------------------
--- Combinators
---------------------------------------------------------------------------------
 
 -- | A statically allocated 'SpiderTimeline'
 data Global
@@ -616,11 +577,11 @@ heightInvalidator = do
   heightRef <- asks _heightRef
   sub <- asks _sub
   pure $ do
-         oldHeight <- readIORef heightRef
-         -- Don't do anything if the height is already invalid
-         when (oldHeight /= invalidHeight) $ do
-           writeIORef heightRef $! invalidHeight
-           subscriberInvalidateHeight sub oldHeight
+    oldHeight <- readIORef heightRef
+    -- Don't do anything if the height is already invalid
+    when (oldHeight /= invalidHeight) $ do
+      writeIORef heightRef $! invalidHeight
+      subscriberInvalidateHeight sub oldHeight
 
 heightUpdater :: EvM x res (IO ())
 heightUpdater = do
@@ -633,7 +594,7 @@ heightUpdater = do
     -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
     when (currentHeight == invalidHeight) $ do
       maybeNewHeight <- do
-        subs <- mapM (getEventSubscribedHeight . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
+        subs <- mapM (readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
         -- TODO: succHeight is not needed for coincidence/switch
         pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
       when (maybeNewHeight /= invalidHeight) $ do
@@ -1004,14 +965,6 @@ merge doInitialInput doPatchInput outputIsEmpty d = cacheEvent $ toEvent zeroHei
        , occ
        )
 
-runInits :: forall x. HasSpiderTimeline x => IORef [SomeInit x] -> EventM x ()
-runInits initRef = do
-  inits <- liftIO $ readIORef initRef
-  unless (null inits) $ do
-    liftIO $ writeIORef initRef []
-    forM_ inits unSomeInit
-    runInits initRef
-
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
   wis <- readIORef wisRef
@@ -1039,7 +992,13 @@ justRunInits a = SpiderHost $ do
   result <- runEventM $ do
         result <- a
         liftIO $ printQL "inits" eventEnvInits
-        runInits (eventEnvInits env) -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events
+        -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
+        fix $ \runInits -> do
+          inits <- liftIO $ readIORef (eventEnvInits env)
+          unless (null inits) $ do
+            liftIO $ writeIORef (eventEnvInits env) []
+            forM_ inits unSomeInit
+            runInits
         return result
   putStrLn "<<< end runInits"
   pure result
