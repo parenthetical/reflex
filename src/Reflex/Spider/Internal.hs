@@ -644,7 +644,6 @@ switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
 switch switchParent = cacheEvent $ toEvent invalidHeight $ do
   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   evD <- ask
-  subscriber <- subscriber_
   let writeNewWeakInvalidator i = do
         wi <- mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
@@ -655,7 +654,7 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
       withB currentState b f = mfix $ \(~(newState, _)) -> do
        let ownInvalidator = runEventM @x $ defer $ Clear $ do
                     putStrLn "Running inits inside switch"
-                    -- TODO: this used to be runFrame but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
+                    -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
                     unSpiderHost . justRunInits $ void $ runReaderT (withB newState b f) evD
        liftIO $ writeIORef ownInvalidatorRef ownInvalidator
        liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
@@ -667,7 +666,7 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
          runBehaviorM (readBehaviorTracked b) (Just (wi, parentsRef)) initsRef
   ~(_, parentOcc) <- withB (pure ()) switchParent $ \unsubscribePrevious e -> do
         liftIO unsubscribePrevious
-        subscribeAndRead_ e subscriber
+        subscribeAndRead_ e =<< subscriber_
   pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
        , ownInvalidatorRef -- TODO: what exactly should go here?
        , parentOcc
