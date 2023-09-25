@@ -509,25 +509,23 @@ newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (EventM x (Hold x p)) }
 newMapDyn :: HasSpiderTimeline x => (a -> b) -> DynamicS x (Identity a) -> DynamicS x (Identity b)
 newMapDyn f d = dynamicDyn $ unsafeBuildDynamic (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
 
+
+fixmeWhatsMyName :: (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => Event x p -> m (PatchTarget p) -> IO (IORef (m (Hold x p)))
+fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
+  v0 <- x
+  h <- hold v0 v'
+  liftIO $ writeIORef ref $ pure h
+  return h
+
 buildDynamic :: forall x m p. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => EventM x (PatchTarget p) -> Event x p -> m (Dyn x p)
 buildDynamic readV0 v' = mdo
-  result <- liftIO $ mfix $ \ref -> newIORef (do
-      v0 <- liftIO $ runEventM readV0
-      h <- hold v0 v'
-      liftIO $ writeIORef ref $ pure h
-      return h)
-  let !d = Dyn result
+  result <- liftIO $ fixmeWhatsMyName v' $ liftIO $ runEventM readV0
   defer $ SomeInit $ void $ join $ liftIO $ readIORef result
-  return d
+  return $! Dyn result
 
 unsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dyn x p
 unsafeBuildDynamic readV0 v' =
-  Dyn $ unsafePerformIO $ mfix $ \ref -> newIORef $ do
-      v0 <- liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue -- holdInits queue
-      -- TODO: repeated in buildDynami
-      h <- hold v0 v'
-      liftIO $ writeIORef ref $ pure h
-      return h
+  Dyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
 instance HasSpiderTimeline x => Functor (Event x) where
   fmap f = push $ return . Just . f
