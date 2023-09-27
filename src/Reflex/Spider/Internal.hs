@@ -240,8 +240,6 @@ data Hold x p
           , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
           }
 
-
-
 behaviorHold :: Hold x p -> Behavior x (PatchTarget p)
 behaviorHold !h = Behavior $ readHoldTracked h
 
@@ -592,8 +590,8 @@ subscribeAndRead_ e subscriber = do
               defer $ MergeUpdate @x (pure [subscription])
                         invalidateMyHeight
                         recalculateMyHeight
-          , occ
-          )
+       , occ
+       )
 
 subscriber_ :: EvM x res (Subscriber x res)
 subscriber_ = do
@@ -1210,12 +1208,9 @@ newJoinDyn d =
   in unsafeBuildDynamic readV0 v'
 
 instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  fmap = mapDynamicSpider
+  {-# INLINE fmap #-}
+  fmap f = SpiderDynamic . newMapDyn f . unSpiderDynamic
   x <$ d = R.unsafeBuildDynamic (return x) $ x <$ R.updated d
-
-mapDynamicSpider :: HasSpiderTimeline x => (a -> b) -> Reflex.Class.Dynamic (SpiderTimeline x) a -> Reflex.Class.Dynamic (SpiderTimeline x) b
-mapDynamicSpider f = SpiderDynamic . newMapDyn f . unSpiderDynamic
-{-# INLINE [1] mapDynamicSpider #-}
 
 instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
   pure = SpiderDynamic . dynamicConst
