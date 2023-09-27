@@ -1055,7 +1055,7 @@ withSpiderTimeline k = do
 
 newtype SpiderPullM (x :: Type) a = SpiderPullM (BehaviorM x a) deriving (Functor, Applicative, Monad, MonadIO, MonadFix)
 
-newtype SpiderPushM (x :: Type) a = SpiderPushM (EventM x a) deriving (Functor, Applicative, Monad, MonadIO, MonadFix)
+newtype SpiderPushM (x :: Type) a = SpiderPushM { unSpiderPushM :: EventM x a } deriving (Functor, Applicative, Monad, MonadIO, MonadFix)
 
 data RootTrigger x a = forall k. GCompare k => RootTrigger (WeakBag (Subscriber x a), IORef (DMap k Identity), k a)
 
@@ -1143,7 +1143,7 @@ type Spider = SpiderTimeline Global
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   {-# INLINABLE sample #-}
-  sample (SpiderBehavior b) = readBehaviorUntracked b
+  sample b = unSpiderPushM $ R.sample b
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# INLINABLE hold #-}
@@ -1159,10 +1159,15 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE now #-}
   now = SpiderEvent <$> now
 
+-- INFO: With PullM you have to use readBehaviorTracked for Behavior's
+-- change update mechanism?
 instance Reflex.Class.MonadSample (SpiderTimeline x) (SpiderPullM x) where
   {-# INLINABLE sample #-}
   sample = coerce . readBehaviorTracked . unSpiderBehavior
 
+-- INFO: The reason you can use readBehaviorUntracked is because
+-- you'll be executing this at an event occurrence time, so you're
+-- safe to use a simple pull-based read of the behavior?
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderPushM x) where
   {-# INLINABLE sample #-}
   sample (SpiderBehavior b) = SpiderPushM $ readBehaviorUntracked b
@@ -1198,7 +1203,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
 newJoinDyn :: HasSpiderTimeline x => DynamicS x (Identity (DynamicS x (Identity a))) -> Dyn x (Identity a)
 newJoinDyn d =
   let readV0 = readBehaviorTracked . dynamicCurrent =<< readBehaviorTracked (dynamicCurrent d)
-      eOuter = push (fmap (Just . Identity) . readBehaviorUntracked . dynamicCurrent . runIdentity) $ dynamicUpdated d
+      eOuter = push (fmap (Just . Identity) . R.sample . SpiderBehavior . dynamicCurrent . runIdentity) $ dynamicUpdated d
       eInner = switch $ dynamicUpdated <$> dynamicCurrent d
       eBoth = coincidence $ dynamicUpdated . runIdentity <$> dynamicUpdated d
       v' = unSpiderEvent $ Reflex.Class.leftmost $ map SpiderEvent [eBoth, eOuter, eInner]
@@ -1237,7 +1242,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHostFrame x) where
-  sample = SpiderHostFrame . readBehaviorUntracked . unSpiderBehavior --TODO: This can cause problems with laziness, so we should get rid of it if we can
+  sample = SpiderHostFrame . R.sample --TODO: This can cause problems with laziness, so we should get rid of it if we can
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHostFrame x) where
   {-# INLINABLE hold #-}
@@ -1255,7 +1260,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHost x) where
   {-# INLINABLE sample #-}
-  sample = runFrame . readBehaviorUntracked . unSpiderBehavior
+  sample = runFrame . R.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
   {-# INLINABLE sample #-}
@@ -1371,9 +1376,13 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE updatedIncremental #-}
   updatedIncremental = SpiderEvent . dynamicUpdated . unSpiderIncremental
   {-# INLINABLE incrementalToDynamic #-}
-  incrementalToDynamic (SpiderIncremental i) = SpiderDynamic $ dynamicDyn $ unsafeBuildDynamic (readBehaviorUntracked $ dynamicCurrent i) $ flip push (dynamicUpdated i) $ \p -> do
-    c <- readBehaviorUntracked $ dynamicCurrent i
-    return $ Identity <$> apply p c --TODO: Avoid the redundant 'apply'
+  incrementalToDynamic (SpiderIncremental i) =
+    SpiderDynamic
+    $ dynamicDyn
+    $ unsafeBuildDynamic (readBehaviorUntracked $ dynamicCurrent i) -- TODO: avoid readBehaviorTracked here to find more patterns/reuse
+    $ flip push (dynamicUpdated i) $ \p -> do
+       c <- R.sample $ SpiderBehavior $ dynamicCurrent i
+       return $ Identity <$> apply p c --TODO: Avoid the redundant 'apply'
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
   dynamicCoercion Coercion = Coercion
