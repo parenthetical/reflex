@@ -31,9 +31,7 @@
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
 
-#if MIN_VERSION_base(4,10,0)
 import Control.Applicative (liftA2)
-#endif
 import Control.Monad hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Identity hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Ref
@@ -41,22 +39,10 @@ import qualified Control.Monad.Fail as MonadFail
 import Data.Align
 import Data.Foldable hiding (concat, elem, sequence_)
 import Data.Maybe hiding (mapMaybe)
-import Data.Witherable (Filterable, mapMaybe)
+import Witherable (Filterable, mapMaybe)
 import GHC.Exts hiding (toList)
-
-#ifdef MIN_VERSION_semialign
-#if MIN_VERSION_these(0,8,0)
 import Data.These.Combinators (justThese)
-#endif
-#if MIN_VERSION_semialign(1,1,0)
 import Data.Zip (Zip (..))
-#endif
-#endif
-
-#ifdef DEBUG_CYCLES
-import Control.Monad.State hiding (forM, forM_, mapM, mapM_, sequence)
-#endif
-
 import Data.Type.Coercion
 import Data.Profunctor.Unsafe ((#.), (.#))
 import qualified Reflex.Class
@@ -64,13 +50,6 @@ import qualified Reflex.Class as R
 import qualified Reflex.Host.Class
 import Reflex.NotReady.Class
 import Reflex.PerformEvent.Base (PerformEventT)
-#ifdef DEBUG_TRACE_EVENTS
-import qualified Data.ByteString.Char8 as BS8
-import System.IO (stderr)
-import Data.List (isPrefixOf)
-#endif
-
-
 import Control.Concurrent
 import Control.Exception
 import Control.Monad.Catch (MonadMask, MonadThrow, MonadCatch)
@@ -1168,10 +1147,6 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
     in dynamicDynUnsafeBuildDynamic readV0 v'
   {-# INLINE (>>) #-}
   (>>) = (*>)
-#if !MIN_VERSION_base(4,13,0)
-  {-# INLINE fail #-}
-  fail _ = error "Dynamic does not support 'fail'"
-#endif
 
 instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)) where
   {-# INLINE fmap #-}
@@ -1268,13 +1243,13 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadReadEvent (SpiderTimeline
     touch h
     return result
 
-instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHost x) where
+instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHost x) where
   newEventWithTrigger = SpiderHost . fmap SpiderEvent . newEventWithTriggerIO
   newFanEventWithTrigger f = SpiderHost $ do
     es <- newFanEventWithTriggerIO f
     return $ Reflex.Class.EventSelector $ SpiderEvent . select es
 
-instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHostFrame x) where
+instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHostFrame x) where
   newEventWithTrigger = SpiderHostFrame . EventM . liftIO . fmap SpiderEvent . newEventWithTriggerIO
   newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ do
     es <- newFanEventWithTriggerIO f
@@ -1384,14 +1359,6 @@ newtype SpiderHostFrame (x :: Type) a = SpiderHostFrame { runSpiderHostFrame :: 
 instance Monad (SpiderHostFrame x) where
   {-# INLINABLE (>>=) #-}
   SpiderHostFrame x >>= f = SpiderHostFrame $ x >>= runSpiderHostFrame . f
-  {-# INLINABLE (>>) #-}
-  SpiderHostFrame x >> SpiderHostFrame y = SpiderHostFrame $ x >> y
-  {-# INLINABLE return #-}
-  return x = SpiderHostFrame $ return x
-#if !MIN_VERSION_base(4,13,0)
-  {-# INLINABLE fail #-}
-  fail s = SpiderHostFrame $ fail s
-#endif
 
 instance NotReady (SpiderTimeline x) (SpiderHostFrame x) where
   notReadyUntil _ = pure ()
