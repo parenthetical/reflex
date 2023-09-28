@@ -133,11 +133,8 @@ returnSubscription :: Monad m => IO () -> IORef Height -> a -> b -> m (EventSubs
 returnSubscription cleanup heightRef retained occ =
   return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
 
-subscribeAndReadNever :: EventM x (EventSubscription x, Maybe a)
-subscribeAndReadNever = returnSubscription (pure ()) zeroRef () Nothing
-
 eventNever :: Event x a
-eventNever = Event $ const subscribeAndReadNever
+eventNever = Event $ const $ returnSubscription (pure ()) zeroRef () Nothing
 
 subscribeWith :: Event x a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
 subscribeWith e f = subscribe (pushCheap (\a -> f a >> pure (Just a)) e)
