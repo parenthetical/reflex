@@ -450,7 +450,6 @@ writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
   defer $ Clear $ writeIORef ref Nothing
 
-
 data MergeUpdate x = MergeUpdate
   { _mergeUpdate_update :: !(EventM x [EventSubscription x])
   , _mergeUpdate_invalidateHeight :: !(IO ())
@@ -463,8 +462,6 @@ newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
 newtype EventM x a = EventM { runEventM :: IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
 
-newtype Dyn (x :: Type) p = Dyn { unDyn :: IORef (EventM x (Hold x p)) }
-
 fixmeWhatsMyName :: (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => Event x p -> m (PatchTarget p) -> IO (IORef (m (Hold x p)))
 fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
   v0 <- x
@@ -472,22 +469,23 @@ fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
   liftIO $ writeIORef ref $ pure h
   return h
 
-buildDynamic :: forall x m a. (HasSpiderTimeline x, Defer (SomeInit x) m) => SpiderPushM x a -> Event x a -> m (R.Dynamic (SpiderTimeline x) a)
-buildDynamic (SpiderPushM readV0) v' = fmap (SpiderDynamic . dynamicDyn) $ mdo
-  result <- liftIO $ fixmeWhatsMyName (fmap Identity v') $ liftIO $ runEventM readV0
-  defer $ SomeInit $ void $ join $ liftIO $ readIORef result
-  return $! Dyn result
-
-dynamicDyn :: Dyn x p -> DynamicS x p
-dynamicDyn (Dyn !d) =
+dynamicDyn :: IORef (EventM x (Hold x p)) -> DynamicS x p
+dynamicDyn !d =
  let dh = join $ liftIO $ readIORef d
- in  Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
-             , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
-             }
+ in Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
+            , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
+            }
+
+buildDynamic :: forall x m a. (HasSpiderTimeline x, Defer (SomeInit x) m) => SpiderPushM x a -> Event x a -> m (R.Dynamic (SpiderTimeline x) a)
+buildDynamic (SpiderPushM readV0) v' =
+  fmap (SpiderDynamic . dynamicDyn) $ mdo
+    result <- liftIO $ fixmeWhatsMyName (fmap Identity v') $ liftIO $ runEventM readV0
+    defer $ SomeInit $ void $ join $ liftIO $ readIORef result
+    return result
 
 dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dynamic x (PatchTarget p) p
 dynamicDynUnsafeBuildDynamic readV0 v' =
-  dynamicDyn $ Dyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
+  dynamicDyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
 instance HasSpiderTimeline x => Functor (Event x) where
   fmap f = push $ return . Just . f
