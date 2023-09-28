@@ -945,16 +945,9 @@ rootClear ref = writeIORef ref $! DMap.empty
 
 justRunInits :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 justRunInits a = SpiderHost $ do
-  let printQL :: forall t a. Foldable t => String -> (EventEnv x -> IORef (t a)) -> IO ()
-      printQL name q = do
-        let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-        putStr $ name <> ": "
-        print . length =<< readIORef (q env)
-  putStrLn ">>> start runInits"
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-  result <- runEventM $ do
+  runEventM $ do
         result <- a
-        liftIO $ printQL "inits" eventEnvInits
         -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
         fix $ \runInits -> do
           inits <- liftIO $ readIORef (eventEnvInits env)
@@ -963,29 +956,17 @@ justRunInits a = SpiderHost $ do
             forM_ inits unSomeInit
             runInits
         return result
-  putStrLn "<<< end runInits"
-  pure result
 
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
-  putStrLn ">> start frame"
-  let printQL :: forall t a. Foldable t => String -> (EventEnv x -> IORef (t a)) -> IO ()
-      printQL name q = do
-        let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-        putStr $ name <> ": "
-        print . length =<< readIORef (q env)
-
   let (EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- unSpiderHost $ justRunInits a
-  printQL "assignments" eventEnvAssignments
   readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                                     writeIORef vRef v
                                                     invalidate iRef)
-  printQL "clears" eventEnvClears
   readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
-  printQL "mergeUpdates" eventEnvMergeUpdates
   mergeUpdates <- readIORef mergeUpdateRef
   do writeIORef toAssignRef []
      writeIORef mergeUpdateRef []
@@ -996,7 +977,6 @@ runFrame a = SpiderHost $ do
   liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _mergeUpdate_update mergeUpdates)
   mapM_ _mergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
   mapM_ _mergeUpdate_recalculateHeight mergeUpdates
-  putStrLn "<< end frame"
   return result
 
 newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
