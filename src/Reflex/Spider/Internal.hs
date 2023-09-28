@@ -345,9 +345,7 @@ runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (mwi, holdInits)
 addParentBAndInvalidator :: BehaviorSubscribed x a -> IORef [Weak Invalidator] -> BehaviorM x ()
 addParentBAndInvalidator h invsRef = do
   (!m, _) <- ask
-  case m of
-    Nothing -> pure ()
-    Just (!wi, !p) -> do
+  forM_ m $ \(!wi, !p) -> do
       liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
 
