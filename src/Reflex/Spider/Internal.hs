@@ -471,11 +471,6 @@ class HasSpiderTimeline x where
 instance HasSpiderTimeline Global where
   spiderTimeline = globalSpiderTimelineEnv
 
-putCurrentHeight :: HasSpiderTimeline x => Height -> EventM x ()
-putCurrentHeight h = do
-  heightRef <- asksEventEnv eventEnvCurrentHeight
-  liftIO $ writeIORef heightRef $! h
-
 instance HasSpiderTimeline x => Defer Clear (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvClears
@@ -682,6 +677,9 @@ run roots after = do
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
       propagate a subscribersRef
     delayedRef <- asksEventEnv eventEnvDelayedMerges
+    let putCurrentHeight h = do
+          heightRef <- asksEventEnv eventEnvCurrentHeight
+          liftIO $ writeIORef heightRef $! h
     fix $ \go -> do
           delayed <- liftIO $ readIORef delayedRef
           forM_ (IntMap.minViewWithKey delayed) $ \((currentHeight, cur), future) -> do
