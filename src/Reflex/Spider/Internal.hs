@@ -1162,23 +1162,20 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
   {-# INLINE return #-}
   return = pure
   {-# INLINE (>>=) #-}
-  x >>= f = SpiderDynamic $ dynamicDyn $ newJoinDyn $ newMapDyn (unSpiderDynamic . f) $ unSpiderDynamic x
+  x >>= f = SpiderDynamic $
+    let d = newMapDyn (unSpiderDynamic . f) $ unSpiderDynamic x
+        readV0 = readBehaviorTracked . dynamicCurrent =<< readBehaviorTracked (dynamicCurrent d)
+        eOuter = push (fmap (Just . Identity) . R.sample . SpiderBehavior . dynamicCurrent . runIdentity) $ dynamicUpdated d
+        eInner = switch $ dynamicUpdated <$> dynamicCurrent d
+        eBoth = coincidence $ dynamicUpdated . runIdentity <$> dynamicUpdated d
+        v' = unSpiderEvent $ Reflex.Class.leftmost $ map SpiderEvent [eBoth, eOuter, eInner]
+    in dynamicDyn $ unsafeBuildDynamic readV0 v'
   {-# INLINE (>>) #-}
   (>>) = (*>)
 #if !MIN_VERSION_base(4,13,0)
   {-# INLINE fail #-}
   fail _ = error "Dynamic does not support 'fail'"
 #endif
-
-{-# INLINABLE newJoinDyn #-}
-newJoinDyn :: HasSpiderTimeline x => DynamicS x (Identity (DynamicS x (Identity a))) -> Dyn x (Identity a)
-newJoinDyn d =
-  let readV0 = readBehaviorTracked . dynamicCurrent =<< readBehaviorTracked (dynamicCurrent d)
-      eOuter = push (fmap (Just . Identity) . R.sample . SpiderBehavior . dynamicCurrent . runIdentity) $ dynamicUpdated d
-      eInner = switch $ dynamicUpdated <$> dynamicCurrent d
-      eBoth = coincidence $ dynamicUpdated . runIdentity <$> dynamicUpdated d
-      v' = unSpiderEvent $ Reflex.Class.leftmost $ map SpiderEvent [eBoth, eOuter, eInner]
-  in unsafeBuildDynamic readV0 v'
 
 instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)) where
   {-# INLINE fmap #-}
