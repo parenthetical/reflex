@@ -269,10 +269,10 @@ data PullSubscribed x a
                     }
 
 {-# INLINABLE pull #-}
-pull :: BehaviorM x a -> Behavior x a
+pull :: forall x a. BehaviorM x a -> Behavior x a
 pull a = unsafePerformIO $ do
-  ref <- newIORef Nothing
-  invsRef <- newIORef []
+  ref :: IORef (Maybe (PullSubscribed x a)) <- newIORef Nothing
+  invsRef :: IORef [Weak Invalidator] <- newIORef []
   pure $ Behavior $ do
     subscribed <- liftIO (readIORef ref) >>= \case
       Just subscribed -> pure subscribed
