@@ -23,6 +23,7 @@ import Data.Type.Equality ((:~:)(Refl))
 import Data.Functor.Misc
 import Data.Patch
 
+import qualified Reflex.Class as R
 import qualified Reflex.Host.Class as Host
 import qualified Reflex.Spider.Internal as S
 
@@ -40,13 +41,11 @@ hostPerf :: IORef (Maybe Int) -> IO ()
 hostPerf ref = S.runSpiderHost $ do
   ---- body
   liftIO $ putStrLn "#creating triggers"
-  (response', responseTrigger) <- Host.newEventWithTriggerRef
-  (eadd', addTriggerRef) <- Host.newEventWithTriggerRef
-  let response = S.unSpiderEvent response'
-      eadd = S.unSpiderEvent eadd'
+  (response, responseTrigger) <- Host.newEventWithTriggerRef
+  (eadd, addTriggerRef) <- Host.newEventWithTriggerRef
   liftIO $ putStrLn "#creating event graph"
   eventToPerform <- Host.runHostFrame $ do
-    (reqMap :: S.Event S.Global (DMap (Const2 Int (DMap Tell (S.SpiderHostFrame S.Global))) Identity))
+    (reqMap :: R.Event (S.SpiderTimeline S.Global) (DMap (Const2 Int (DMap Tell (S.SpiderHostFrame S.Global))) Identity))
       <- S.SpiderHostFrame
        $ fmap ( S.mergeG coerce
               . S.dynamicHold)
@@ -58,16 +57,16 @@ hostPerf ref = S.runSpiderHost $ do
                }
             return (s, o))
        $ runIdentity . runIdentity <$> S.selectG
-          (S.fanG $ S.pushCheap (return . Just . mapKeyValuePairsMonotonic (\(t :=> e) -> WrapArg t :=> Identity e)) response)
+          (S.fanG $ R.pushCheap (return . Just . mapKeyValuePairsMonotonic (\(t :=> e) -> WrapArg t :=> Identity e)) response)
           (WrapArg Request)
     return $ alignWith (mergeThese (<>))
-      (flip S.pushCheap eadd $ \_ -> return $ Just $ DMap.singleton Request $ do
+      (flip R.pushCheap eadd $ \_ -> return $ Just $ DMap.singleton Request $ do
         liftIO $ putStrLn "#eadd fired"
         return $ PatchDMap $ DMap.singleton (Const2 (1 :: Int)) $ ComposeMaybe $ Just
-               $ S.pushCheap (return . Just . DMap.singleton Action . (\_ -> liftIO (writeIORef ref (Just 1)))) $ eadd)
-      (flip S.pushCheap reqMap $ \m -> return $ Just $ mconcat $ (\(Const2 _ :=> Identity reqs) -> reqs) <$> DMap.toList m)
+               $ R.pushCheap (return . Just . DMap.singleton Action . (\_ -> liftIO (writeIORef ref (Just 1)))) $ eadd)
+      (flip R.pushCheap reqMap $ \m -> return $ Just $ mconcat $ (\(Const2 _ :=> Identity reqs) -> reqs) <$> DMap.toList m)
   ---- epilogue
-  eventToPerformHandle <- Host.subscribeEvent (S.SpiderEvent eventToPerform)
+  eventToPerformHandle <- Host.subscribeEvent eventToPerform
   liftIO $ putStrLn "#performing GC" >> performMajorGC
   liftIO $ putStrLn "#attempting to fire eadd"
   mAddTrigger <- readRef addTriggerRef
@@ -87,7 +86,7 @@ hostPerf ref = S.runSpiderHost $ do
 
 data Tell a where
   Action :: Tell ()
-  Request :: Tell (PatchDMap (Const2 Int (DMap Tell (S.SpiderHostFrame S.Global))) (S.Event S.Global))
+  Request :: Tell (PatchDMap (Const2 Int (DMap Tell (S.SpiderHostFrame S.Global))) (R.Event (S.SpiderTimeline S.Global)))
 
 instance GEq Tell where
   geq Action Action = Just Refl
