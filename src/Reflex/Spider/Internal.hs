@@ -472,9 +472,9 @@ fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
   liftIO $ writeIORef ref $ pure h
   return h
 
-buildDynamic :: forall x m a. (HasSpiderTimeline x, Defer (SomeInit x) m) => EventM x a -> Event x (Identity a) -> m (R.Dynamic (SpiderTimeline x) a)
-buildDynamic readV0 v' = fmap (SpiderDynamic . dynamicDyn) $ mdo
-  result <- liftIO $ fixmeWhatsMyName v' $ liftIO $ runEventM readV0
+buildDynamic :: forall x m a. (HasSpiderTimeline x, Defer (SomeInit x) m) => SpiderPushM x a -> Event x a -> m (R.Dynamic (SpiderTimeline x) a)
+buildDynamic (SpiderPushM readV0) v' = fmap (SpiderDynamic . dynamicDyn) $ mdo
+  result <- liftIO $ fixmeWhatsMyName (fmap Identity v') $ liftIO $ runEventM readV0
   defer $ SomeInit $ void $ join $ liftIO $ readIORef result
   return $! Dyn result
 
@@ -1098,7 +1098,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE holdIncremental #-}
   holdIncremental v0 e = fmap (SpiderIncremental . dynamicHold) $ hold v0 $ unSpiderEvent e
   {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 e = buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
+  buildDynamic getV0 e = buildDynamic getV0 $ unSpiderEvent e
   {-# INLINABLE headE #-}
   headE = R.slowHeadE
   {-# INLINABLE now #-}
@@ -1125,7 +1125,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE holdIncremental #-}
   holdIncremental v0 (SpiderEvent e) = SpiderPushM $ SpiderIncremental . dynamicHold <$> hold v0 e
   {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 (SpiderEvent e) = SpiderPushM $ buildDynamic (coerce getV0) $ coerce e
+  buildDynamic getV0 (SpiderEvent e) = SpiderPushM $ buildDynamic getV0 e
   {-# INLINABLE headE #-}
   headE = R.slowHeadE
   {-# INLINABLE now #-}
@@ -1138,7 +1138,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
   {-# INLINE (>>=) #-}
   x >>= f = SpiderDynamic $
     -- TODO: Try to reuse R.* functions as much as possible here:
-    let d = unSpiderDynamic $ fmap (unSpiderDynamic . f) $ x
+    let d = unSpiderDynamic . fmap (unSpiderDynamic . f) $ x
         readV0 = readBehaviorTracked . dynamicCurrent =<< readBehaviorTracked (dynamicCurrent d)
         eOuter = push (fmap (Just . Identity) . R.sample . SpiderBehavior . dynamicCurrent . runIdentity) $ dynamicUpdated d
         eInner = switch $ dynamicUpdated <$> dynamicCurrent d
@@ -1188,7 +1188,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   {-# INLINABLE holdIncremental #-}
   holdIncremental v0 e = SpiderHostFrame $ fmap (SpiderIncremental . dynamicHold) $ hold v0 $ unSpiderEvent e
   {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 e = SpiderHostFrame $ buildDynamic (coerce getV0) $ coerce $ unSpiderEvent e
+  buildDynamic getV0 e = SpiderHostFrame $ buildDynamic getV0 $ unSpiderEvent e
   {-# INLINABLE headE #-}
   headE = R.slowHeadE
   {-# INLINABLE now #-}
