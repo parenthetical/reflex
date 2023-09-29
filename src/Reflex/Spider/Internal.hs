@@ -1229,11 +1229,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE updatedIncremental #-}
   updatedIncremental =  dynamicUpdated . unSpiderIncremental
   {-# INLINABLE incrementalToDynamic #-}
-  incrementalToDynamic (SpiderIncremental i) =
-    SpiderDynamic $ dynamicDynUnsafeBuildDynamic (readBehaviorUntracked $ dynamicCurrent i) -- TODO: avoid readBehaviorTracked here to find more patterns/reuse
-    $ flip R.push (dynamicUpdated i) $ \p -> do
-       c <- R.sample $ dynamicCurrent i
-       return $ Identity <$> apply p c --TODO: Avoid the redundant 'apply'
+  incrementalToDynamic i =
+    let currentI = R.currentIncremental i
+    in R.unsafeBuildDynamic (R.sample currentI)
+       $ R.push (\p -> fmap (apply p) (R.sample currentI)) --TODO: Avoid the redundant 'apply' [Adriaan: avoiding apply would involve turning Behavior into Event?]
+       $ R.updatedIncremental i
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
   dynamicCoercion = unsafeCoerce -- FIXME
