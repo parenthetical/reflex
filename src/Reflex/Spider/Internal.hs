@@ -221,31 +221,6 @@ pull a = unsafePerformIO $ do
     addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
     pure $ pullSubscribedValue subscribed
 
--- Note: hold cannot examine its event until after the phase is over
-{-# INLINE [1] hold #-}
-hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
-hold v0 e = do
-  valRef <- liftIO $ newIORef v0
-  invsRef <- liftIO $ newIORef [] -- invalidators
-  parentRef <- liftIO $ newIORef Nothing
-  defer $ SomeInit $ do
-    maybeParent <- liftIO $ readIORef parentRef
-    when (isNothing maybeParent) $ do
-          liftIO . writeIORef parentRef . Just
-            <=< subscribeWith e (\a -> do
-                                    v <- liftIO $ readIORef valRef
-                                    forM_ (apply a v) $ \v' -> do
-                                      vRef <- pure $! valRef
-                                      iRef <- pure $! invsRef
-                                      defer $ SomeAssignment @x vRef iRef v')
-            $ terminalSubscriber
-  return $ Hold
-        { holdValue = valRef
-        , holdInvalidators = invsRef
-        , holdEvent = e
-        , holdParent = parentRef
-        }
-
 type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeInit x])
 
 -- BehaviorM can sample behaviors
@@ -979,6 +954,31 @@ data Hold x p
           , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
           , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
           }
+
+-- Note: hold cannot examine its event until after the phase is over
+{-# INLINE [1] hold #-}
+hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
+hold v0 e = do
+  valRef <- liftIO $ newIORef v0
+  invsRef <- liftIO $ newIORef [] -- invalidators
+  parentRef <- liftIO $ newIORef Nothing
+  defer $ SomeInit $ do
+    maybeParent <- liftIO $ readIORef parentRef
+    when (isNothing maybeParent) $ do
+          liftIO . writeIORef parentRef . Just
+            <=< subscribeWith e (\a -> do
+                                    v <- liftIO $ readIORef valRef
+                                    forM_ (apply a v) $ \v' -> do
+                                      vRef <- pure $! valRef
+                                      iRef <- pure $! invsRef
+                                      defer $ SomeAssignment @x vRef iRef v')
+            $ terminalSubscriber
+  return $ Hold
+        { holdValue = valRef
+        , holdInvalidators = invsRef
+        , holdEvent = e
+        , holdParent = parentRef
+        }
 
 {-# INLINE readHoldTracked #-}
 readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
