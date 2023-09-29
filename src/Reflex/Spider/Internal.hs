@@ -980,12 +980,6 @@ data Hold x p
           , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
           }
 
-behaviorHold :: Hold x p -> Behavior x (PatchTarget p)
-behaviorHold !h = Behavior $ readHoldTracked h
-
-behaviorHoldIdentity :: Hold x (Identity a) -> Behavior x a
-behaviorHoldIdentity = behaviorHold
-
 {-# INLINE readHoldTracked #-}
 readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
 readHoldTracked h = do
@@ -1008,20 +1002,20 @@ dynamicDyn !d =
             , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
             }
 
-dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dynamic x (PatchTarget p) p
+dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
 dynamicDynUnsafeBuildDynamic readV0 v' =
-  dynamicDyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
+  SpiderIncremental $ dynamicDyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# INLINABLE hold #-}
-  hold v0 e = fmap behaviorHoldIdentity $ hold v0 $ coerce e
+  hold v0 = fmap R.current . R.holdDyn v0
   {-# INLINABLE holdDyn #-}
   holdDyn v0 e = fmap SpiderDynamic . R.holdIncremental v0 $ coerce e
   {-# INLINABLE holdIncremental #-}
   holdIncremental v0 e = do
     !h <- hold v0 e
     pure $ SpiderIncremental $ Dynamic
-      { dynamicCurrent = behaviorHold h
+      { dynamicCurrent = Behavior $ readHoldTracked h
       , dynamicUpdated = Event $ subscribeHoldEvent h
       }
   {-# INLINABLE buildDynamic #-}
@@ -1213,7 +1207,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE unsafeBuildDynamic #-}
   unsafeBuildDynamic readV0 v' = SpiderDynamic $ R.unsafeBuildIncremental readV0 $ fmap Identity v'
   {-# INLINABLE unsafeBuildIncremental #-}
-  unsafeBuildIncremental readV0 dv = SpiderIncremental $ dynamicDynUnsafeBuildDynamic readV0 dv
+  unsafeBuildIncremental readV0 dv = dynamicDynUnsafeBuildDynamic readV0 dv
   {-# INLINABLE mergeIncrementalG #-}
   mergeIncrementalG nt = mergeG nt .# unSpiderIncremental
   {-# INLINABLE mergeIncrementalWithMoveG #-}
