@@ -430,24 +430,6 @@ newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
 newtype EventM x a = EventM { runEventM :: IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
 
-fixmeWhatsMyName :: (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => Event x p -> m (PatchTarget p) -> IO (IORef (m (Hold x p)))
-fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
-  v0 <- x
-  h <- hold v0 v'
-  liftIO $ writeIORef ref $ pure h
-  return h
-
-dynamicDyn :: IORef (EventM x (Hold x p)) -> DynamicS x p
-dynamicDyn !d =
- let dh = join $ liftIO $ readIORef d
- in Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
-            , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
-            }
-
-dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dynamic x (PatchTarget p) p
-dynamicDynUnsafeBuildDynamic readV0 v' =
-  dynamicDyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
-
 data EvD x res =
   EvD { _heightRef :: IORef Height
       , _subscriptionsCtr :: IORef Int
@@ -1017,21 +999,38 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   {-# INLINABLE sample #-}
   sample = readBehaviorUntracked
 
-dynamicHold :: Hold x p -> DynamicS x p
-dynamicHold !h = Dynamic
-  { dynamicCurrent = behaviorHold h
-  , dynamicUpdated = Event $ subscribeHoldEvent h
-  }
+fixmeWhatsMyName :: (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => Event x p -> m (PatchTarget p) -> IO (IORef (m (Hold x p)))
+fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
+  v0 <- x
+  h <- hold v0 v'
+  liftIO $ writeIORef ref $ pure h
+  return h
+
+dynamicDyn :: IORef (EventM x (Hold x p)) -> DynamicS x p
+dynamicDyn !d =
+ let dh = join $ liftIO $ readIORef d
+ in Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
+            , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
+            }
+
+dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> Dynamic x (PatchTarget p) p
+dynamicDynUnsafeBuildDynamic readV0 v' =
+  dynamicDyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# INLINABLE hold #-}
   hold v0 e = fmap behaviorHoldIdentity $ hold v0 $ coerce e
   {-# INLINABLE holdDyn #-}
-  holdDyn v0 e = fmap (SpiderDynamic . dynamicHold) $ hold v0 $ coerce e
+  holdDyn v0 e = fmap SpiderDynamic . R.holdIncremental v0 $ coerce e
   {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 = fmap (SpiderIncremental . dynamicHold) . hold v0
+  holdIncremental v0 e = do
+    !h <- hold v0 e
+    pure $ SpiderIncremental $ Dynamic
+      { dynamicCurrent = behaviorHold h
+      , dynamicUpdated = Event $ subscribeHoldEvent h
+      }
   {-# INLINABLE buildDynamic #-}
-  buildDynamic readV0 v' = fmap (SpiderDynamic . dynamicDyn) $ mdo
+  buildDynamic readV0 v' = fmap (SpiderDynamic . SpiderIncremental . dynamicDyn) $ mdo
     result <- liftIO $ fixmeWhatsMyName (fmap Identity v') $ liftIO $ runEventM readV0
     defer $ SomeInit $ void $ join $ liftIO $ readIORef result
     return result
@@ -1066,7 +1065,7 @@ instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)
   x <$ d = R.unsafeBuildDynamic (return x) $ x <$ R.updated d
 
 instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  pure = SpiderDynamic . dynamicConst
+  pure = SpiderDynamic . SpiderIncremental . dynamicConst
   liftA2 = R.zipDynWith
   a <*> b = R.zipDynWith ($) a b
   a *> b = R.unsafeBuildDynamic (R.sample $ R.current b) $ R.leftmost [R.updated b, R.tag (R.current b) $ R.updated a]
@@ -1178,8 +1177,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
   newtype Behavior (SpiderTimeline x) a = Behavior { readBehaviorTracked :: BehaviorM x a }
   newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe a) }
-  newtype Dynamic (SpiderTimeline x) a = SpiderDynamic { unSpiderDynamic :: DynamicS x (Identity a) } -- deriving (Functor, Applicative, Monad)
   newtype Incremental (SpiderTimeline x) p = SpiderIncremental { unSpiderIncremental :: DynamicS x p }
+  newtype Dynamic (SpiderTimeline x) a = SpiderDynamic { unSpiderDynamic :: R.Incremental (SpiderTimeline x) (Identity a) } -- deriving (Functor, Applicative, Monad)
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
   {-# INLINABLE never #-}
@@ -1213,11 +1212,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE coincidence #-}
   coincidence = coincidence
   {-# INLINABLE current #-}
-  current = dynamicCurrent . unSpiderDynamic
+  current = dynamicCurrent . unSpiderIncremental .# unSpiderDynamic
   {-# INLINABLE updated #-}
-  updated = coerce #. dynamicUpdated .# unSpiderDynamic
+  updated = coerce #. dynamicUpdated .# unSpiderIncremental .# unSpiderDynamic
   {-# INLINABLE unsafeBuildDynamic #-}
-  unsafeBuildDynamic readV0 v' = SpiderDynamic $ dynamicDynUnsafeBuildDynamic readV0 $ coerce v'
+  unsafeBuildDynamic readV0 v' = SpiderDynamic $ R.unsafeBuildIncremental readV0 $ fmap Identity v'
   {-# INLINABLE unsafeBuildIncremental #-}
   unsafeBuildIncremental readV0 dv = SpiderIncremental $ dynamicDynUnsafeBuildDynamic readV0 dv
   {-# INLINABLE mergeIncrementalG #-}

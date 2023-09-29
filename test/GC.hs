@@ -47,9 +47,8 @@ hostPerf ref = S.runSpiderHost $ do
   eventToPerform <- Host.runHostFrame $ do
     (reqMap :: R.Event (S.SpiderTimeline S.Global) (DMap (Const2 Int (DMap Tell (S.SpiderHostFrame S.Global))) Identity))
       <- S.SpiderHostFrame
-       $ fmap ( S.mergeG coerce
-              . S.dynamicHold)
-       $ S.hold DMap.empty
+       $ fmap R.mergeIncremental
+       $ R.holdIncremental DMap.empty
        -- Construct a new heap object for the subscriber, invalidating any weak references to the subscriber if they are not retained
        $ (\e -> S.Event $ \sub -> do
             (s, o) <- S.subscribeAndRead e $ sub
@@ -57,8 +56,8 @@ hostPerf ref = S.runSpiderHost $ do
                }
             return (s, o))
        $ runIdentity . runIdentity <$> S.selectG
-          (S.fanG $ R.pushCheap (return . Just . mapKeyValuePairsMonotonic (\(t :=> e) -> WrapArg t :=> Identity e)) response)
-          (WrapArg Request)
+              (S.fanG $ R.pushCheap (return . Just . mapKeyValuePairsMonotonic (\(t :=> e) -> WrapArg t :=> Identity e)) response)
+              (WrapArg Request)
     return $ alignWith (mergeThese (<>))
       (flip R.pushCheap eadd $ \_ -> return $ Just $ DMap.singleton Request $ do
         liftIO $ putStrLn "#eadd fired"
