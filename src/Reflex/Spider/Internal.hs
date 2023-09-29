@@ -1190,11 +1190,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE fanG #-}
   fanG e = R.EventSelectorG $ selectG (fanG e)
   {-# INLINABLE mergeG #-}
-  mergeG
-    :: forall k2 (k :: k2 -> Type) q (v :: k2 -> Type). GCompare k
-    => (forall a. q a -> R.Event (SpiderTimeline x) (v a))
-    -> DMap k q
-    -> R.Event (SpiderTimeline x) (DMap k v)
   mergeG nt = mergeG nt . dynamicConst
   {-# INLINABLE switch #-}
   switch = switch
