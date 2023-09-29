@@ -210,7 +210,7 @@ readHoldTracked h = do
 readBehaviorUntracked :: Defer (SomeInit x) m => Behavior x a -> m a
 readBehaviorUntracked b = do
   holdInits <- getDeferralQueue
-  liftIO $ runBehaviorM (readBehaviorTracked b) Nothing holdInits --TODO: Specialize readBehaviorTracked to the Nothing and Just cases
+  liftIO $ runBehaviorM (R.sample b) Nothing holdInits --TODO: Specialize readBehaviorTracked to the Nothing and Just cases
 
 -- TODO: what is really needed here?
 data PullSubscribed x a
@@ -572,7 +572,7 @@ switch switchParent = cacheEvent $ toEvent invalidHeight $ do
          wi <- readIORef ownWeakInvalidatorRef
          initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
          parentsRef <- newIORef []
-         runBehaviorM (readBehaviorTracked b) (Just (wi, parentsRef)) initsRef
+         runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
   ~(_, parentOcc) <- withB (pure ()) switchParent $ \unsubscribePrevious e -> do
         liftIO unsubscribePrevious
         subscribeAndRead_ e =<< subscriber_
@@ -1062,7 +1062,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
 
 instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)) where
   {-# INLINE fmap #-}
-  fmap f (SpiderDynamic d) = SpiderDynamic $ dynamicDynUnsafeBuildDynamic (fmap f $ readBehaviorTracked $ dynamicCurrent d) (Identity . f . runIdentity <$> dynamicUpdated d)
+  fmap f d = R.unsafeBuildDynamic (fmap f $ R.sample $ R.current d) (f <$> R.updated d)
   x <$ d = R.unsafeBuildDynamic (return x) $ x <$ R.updated d
 
 instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
@@ -1198,7 +1198,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     occ' <- join <$> mapM f occ
     return (subscription, occ')
   {-# INLINABLE pull #-}
-  pull = pull . coerce
+  pull = pull
   {-# INLINABLE fanG #-}
   fanG e = R.EventSelectorG $ selectG (fanG e)
   {-# INLINABLE mergeG #-}
@@ -1209,21 +1209,21 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     -> R.Event (SpiderTimeline x) (DMap k v)
   mergeG nt = mergeG nt . dynamicConst
   {-# INLINABLE switch #-}
-  switch = switch . (coerce :: Behavior x (R.Event (SpiderTimeline x) a) -> Behavior x (Event x a))
+  switch = switch
   {-# INLINABLE coincidence #-}
-  coincidence = coincidence . (coerce :: Event x (R.Event (SpiderTimeline x) a) -> Event x (Event x a))
+  coincidence = coincidence
   {-# INLINABLE current #-}
   current = dynamicCurrent . unSpiderDynamic
   {-# INLINABLE updated #-}
-  updated = coerce #. dynamicUpdated .# fmap coerce . unSpiderDynamic
+  updated = coerce #. dynamicUpdated .# unSpiderDynamic
   {-# INLINABLE unsafeBuildDynamic #-}
-  unsafeBuildDynamic readV0 v' = SpiderDynamic $ dynamicDynUnsafeBuildDynamic (coerce readV0) $ coerce v'
+  unsafeBuildDynamic readV0 v' = SpiderDynamic $ dynamicDynUnsafeBuildDynamic readV0 $ coerce v'
   {-# INLINABLE unsafeBuildIncremental #-}
-  unsafeBuildIncremental readV0 dv = SpiderIncremental $ dynamicDynUnsafeBuildDynamic (coerce readV0) dv
+  unsafeBuildIncremental readV0 dv = SpiderIncremental $ dynamicDynUnsafeBuildDynamic readV0 dv
   {-# INLINABLE mergeIncrementalG #-}
-  mergeIncrementalG nt = mergeG (coerce #. nt) .# unSpiderIncremental
+  mergeIncrementalG nt = mergeG nt .# unSpiderIncremental
   {-# INLINABLE mergeIncrementalWithMoveG #-}
-  mergeIncrementalWithMoveG nt = mergeWithMove (coerce #. nt) .# unSpiderIncremental
+  mergeIncrementalWithMoveG nt = mergeWithMove nt .# unSpiderIncremental
   {-# INLINABLE currentIncremental #-}
   currentIncremental = dynamicCurrent . unSpiderIncremental
   {-# INLINABLE updatedIncremental #-}
