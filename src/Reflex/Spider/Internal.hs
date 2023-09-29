@@ -1046,19 +1046,17 @@ instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   {-# INLINABLE sample #-}
   sample = readBehaviorTracked
 
+-- TODO: why not define Monad etc. on Dynamic in Reflex.Class?
 instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  {-# INLINE return #-}
-  return = pure
   {-# INLINE (>>=) #-}
-  x >>= f = SpiderDynamic $
-    -- TODO: Try to reuse R.* functions as much as possible here:
-    let d = unSpiderDynamic . fmap (unSpiderDynamic . f) $ x
-        readV0 = readBehaviorTracked . dynamicCurrent =<< readBehaviorTracked (dynamicCurrent d)
-        eOuter = R.push (fmap (Just . Identity) . R.sample . dynamicCurrent . runIdentity) $ dynamicUpdated d
-        eInner = switch $ dynamicUpdated <$> dynamicCurrent d
-        eBoth = coincidence $ dynamicUpdated . runIdentity <$> dynamicUpdated d
-        v' = Reflex.Class.leftmost [eBoth, eOuter, eInner]
-    in dynamicDynUnsafeBuildDynamic readV0 v'
+  x >>= f =
+    let d = fmap f x
+    in R.unsafeBuildDynamic (R.sample (R.current =<< R.current d)) -- FIXME: Originally the following, why? (R.sample . R.current =<< R.sample (R.current d))
+       . R.leftmost
+       $ [ R.coincidence $ R.updated <$> R.updated d -- both
+         , R.push (fmap Just . R.sample . R.current) $ R.updated d -- outer
+         , R.switch $ R.updated <$> R.current d -- eInner
+         ]
   {-# INLINE (>>) #-}
   (>>) = (*>)
 
