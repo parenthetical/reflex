@@ -988,23 +988,27 @@ readHoldTracked h = do
   liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
   return result
 
-fixmeWhatsMyName :: (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => Event x p -> m (PatchTarget p) -> IO (IORef (m (Hold x p)))
-fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
-  v0 <- x
-  h <- hold v0 v'
-  liftIO $ writeIORef ref $ pure h
-  return h
+lazyHold :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m)
+          => m (PatchTarget p) -> Event x p -> IO (m (Hold x p))
+lazyHold getV0 v' = do
+  fmap (join . liftIO . readIORef) . mfix $ \ref ->
+    -- TODO: Is all this code "create the hold on request and cache the result"? Could it be replaced by an unsafePerformIO or something?
+    newIORef $ do
+      v0 <- getV0
+      h <- hold v0 v'
+      liftIO $ writeIORef ref $ pure h
+      return h
 
-dynamicDyn :: IORef (EventM x (Hold x p)) -> DynamicS x p
-dynamicDyn !d =
- let dh = join $ liftIO $ readIORef d
- in Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM dh)
-            , dynamicUpdated = Event $ \sub -> dh >>= \h -> subscribeHoldEvent h sub
+dynamicDyn :: EventM x (Hold x p) -> R.Incremental (SpiderTimeline x) p
+dynamicDyn !forceLazyHold =
+  SpiderIncremental
+  $ Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM forceLazyHold)
+            , dynamicUpdated = Event $ \sub -> forceLazyHold >>= \h -> subscribeHoldEvent h sub
             }
 
 dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
 dynamicDynUnsafeBuildDynamic readV0 v' =
-  SpiderIncremental $ dynamicDyn $ unsafePerformIO $ fixmeWhatsMyName v' $ liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
+  dynamicDyn $ unsafePerformIO $ lazyHold (liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue) v'
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# INLINABLE hold #-}
@@ -1019,10 +1023,10 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       , dynamicUpdated = Event $ subscribeHoldEvent h
       }
   {-# INLINABLE buildDynamic #-}
-  buildDynamic readV0 v' = fmap (SpiderDynamic . SpiderIncremental . dynamicDyn) $ do
-    result <- liftIO $ fixmeWhatsMyName (fmap Identity v') $ liftIO $ runEventM readV0
-    defer $ SomeInit $ void $ join $ liftIO $ readIORef result
-    return result
+  buildDynamic readV0 v' = do
+    forceLazyHold <- liftIO $ lazyHold (liftIO $ runEventM readV0) (fmap Identity v')
+    defer $ SomeInit $ void $ forceLazyHold
+    pure . SpiderDynamic . dynamicDyn $ forceLazyHold
   {-# INLINABLE headE #-}
   headE = R.slowHeadE
   {-# INLINABLE now #-}
