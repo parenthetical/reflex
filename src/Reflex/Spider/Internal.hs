@@ -184,34 +184,6 @@ data EventSubscribed x = EventSubscribed
   , _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
   }
 
---type role Hold representational
-data Hold x p
-   = Hold { holdValue :: !(IORef (PatchTarget p))
-          , holdInvalidators :: !(IORef [Weak Invalidator])
-          , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
-          , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
-          }
-
-behaviorHold :: Hold x p -> Behavior x (PatchTarget p)
-behaviorHold !h = Behavior $ readHoldTracked h
-
-behaviorHoldIdentity :: Hold x (Identity a) -> Behavior x a
-behaviorHoldIdentity = behaviorHold
-
-{-# INLINE readHoldTracked #-}
-readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
-readHoldTracked h = do
-  result <- liftIO $ readIORef $ holdValue h
-  addParentBAndInvalidator (BehaviorSubscribedHold h) (holdInvalidators h)
-  liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
-  return result
-
-{-# INLINABLE readBehaviorUntracked #-}
-readBehaviorUntracked :: Defer (SomeInit x) m => Behavior x a -> m a
-readBehaviorUntracked b = do
-  holdInits <- getDeferralQueue
-  liftIO $ runBehaviorM (R.sample b) Nothing holdInits --TODO: Specialize readBehaviorTracked to the Nothing and Just cases
-
 -- TODO: what is really needed here?
 data PullSubscribed x a
    = PullSubscribed { pullSubscribedValue :: !a
@@ -992,12 +964,35 @@ type role SpiderTimeline nominal
 -- | The default, global Spider environment
 type Spider = SpiderTimeline Global
 
--- INFO: The reason you can use readBehaviorUntracked is because
--- you'll be executing this at an event occurrence time, so you're
--- safe to use a simple pull-based read of the behavior?
+-- INFO: You'll be executing this at an event occurrence time, so
+-- you're safe to use a simple pull-based read of the behavior?
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   {-# INLINABLE sample #-}
-  sample = readBehaviorUntracked
+  sample b = do
+    holdInits <- getDeferralQueue
+    liftIO $ runBehaviorM (R.sample b) Nothing holdInits --TODO: Specialize sample to the Nothing and Just cases
+
+--type role Hold representational
+data Hold x p
+   = Hold { holdValue :: !(IORef (PatchTarget p))
+          , holdInvalidators :: !(IORef [Weak Invalidator])
+          , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
+          , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
+          }
+
+behaviorHold :: Hold x p -> Behavior x (PatchTarget p)
+behaviorHold !h = Behavior $ readHoldTracked h
+
+behaviorHoldIdentity :: Hold x (Identity a) -> Behavior x a
+behaviorHoldIdentity = behaviorHold
+
+{-# INLINE readHoldTracked #-}
+readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
+readHoldTracked h = do
+  result <- liftIO $ readIORef $ holdValue h
+  addParentBAndInvalidator (BehaviorSubscribedHold h) (holdInvalidators h)
+  liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
+  return result
 
 fixmeWhatsMyName :: (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => Event x p -> m (PatchTarget p) -> IO (IORef (m (Hold x p)))
 fixmeWhatsMyName v' x = mfix $ \ref -> newIORef $ do
@@ -1030,7 +1025,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       , dynamicUpdated = Event $ subscribeHoldEvent h
       }
   {-# INLINABLE buildDynamic #-}
-  buildDynamic readV0 v' = fmap (SpiderDynamic . SpiderIncremental . dynamicDyn) $ mdo
+  buildDynamic readV0 v' = fmap (SpiderDynamic . SpiderIncremental . dynamicDyn) $ do
     result <- liftIO $ fixmeWhatsMyName (fmap Identity v') $ liftIO $ runEventM readV0
     defer $ SomeInit $ void $ join $ liftIO $ readIORef result
     return result
