@@ -135,8 +135,8 @@ cacheEvent e = unsafePerformIO $ do
       liftIO . writeIORef parentSubscriptionRef
       <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
           { subscriberPropagate = flip propagate subscribers
-          , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . invalidateSubscriberHeight
-          , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . recalculateSubscriberHeight
+          , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . flip subscriberInvalidateHeight
+          , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
           }
     parentSub <- liftIO $ readIORef parentSubscriptionRef
     sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
@@ -144,12 +144,6 @@ cacheEvent e = unsafePerformIO $ do
                        (eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub)
                        (sln, parentSubscriptionRef)
                        <=< liftIO $ readIORef occRef
-
-invalidateSubscriberHeight :: Height -> Subscriber x a -> IO ()
-invalidateSubscriberHeight = flip subscriberInvalidateHeight
-
-recalculateSubscriberHeight :: Height -> Subscriber x a -> IO ()
-recalculateSubscriberHeight = flip subscriberRecalculateHeight
 
 -- | Propagate everything at the current height
 propagate :: forall x a. a -> WeakBag (Subscriber x a) -> EventM x ()
@@ -586,9 +580,9 @@ fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
         $ Subscriber
         { subscriberPropagate = \a -> doPropagation a <=< liftIO $ readIORef subscribersRef
         , subscriberInvalidateHeight = \old ->
-            traverseWeakBags (invalidateSubscriberHeight old) =<< readIORef subscribersRef
+            traverseWeakBags (`subscriberInvalidateHeight` old) =<< readIORef subscribersRef
         , subscriberRecalculateHeight = \new ->
-            traverseWeakBags (recalculateSubscriberHeight new) =<< readIORef subscribersRef
+            traverseWeakBags (`subscriberRecalculateHeight` new) =<< readIORef subscribersRef
         }
     sln <- liftIO $ do
       subscribers <- readIORef subscribersRef
