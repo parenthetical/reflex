@@ -909,21 +909,13 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   {-# INLINABLE sample #-}
   sample b = fixmeUnifySample (R.sample b) --TODO: Specialize sample to the Nothing and Just cases
 
-makeLazyVal :: MonadIO m => m a -> IO (m a)
-makeLazyVal get = do
-  fmap (join . liftIO . readIORef) . mfix $ \ref ->
-    newIORef $ do
-      a <- get
-      liftIO $ writeIORef ref $ pure a
-      pure a
-
 fixmeUnifySample :: Defer (SomeInit x) m => BehaviorM x b -> m b
 fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
 unsafeBuildIncremental :: forall x p. (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
 unsafeBuildIncremental readV0 v' =
   -- TODO: using buildIncremental is lazier than the original implementation
-  unsafePerformIO . runEventM @x $ buildIncremental (fixmeUnifySample readV0) $ v'
+  unsafePerformIO . runEventM @x $ buildIncremental (fixmeUnifySample readV0) v'
   -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild):
   -- SpiderIncremental $ Dynamic (Behavior readV0) v'
 
@@ -934,30 +926,29 @@ buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit
 buildIncremental readV0 v' = do
   invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
-  forceLazyHold <- liftIO $ makeLazyVal $ do
-    valRef <- liftIO . newIORef =<< readV0
-    defer $ SomeInit $ do
-      maybeParent <- liftIO $ readIORef parentRef
-      when (isNothing maybeParent) $ do
-            liftIO . writeIORef parentRef . Just
-              <=< subscribeWith v' (\a -> do
-                                      v <- liftIO $ readIORef valRef
-                                      forM_ (apply a v) $ \v'1 -> do
-                                        vRef <- pure $! valRef
-                                        iRef <- pure $! invsRef
-                                        defer $ SomeAssignment @x vRef iRef v'1)
-              $ Subscriber { subscriberPropagate = const (pure ())
-                           , subscriberInvalidateHeight = \_ -> return ()
-                           , subscriberRecalculateHeight = \_ -> return ()
-                           }
-    pure valRef
-  defer $ SomeInit @x $ void $ forceLazyHold
+  let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
+       valRef <- liftIO . newIORef =<< readV0
+       defer $ SomeInit $ do
+         maybeParent <- liftIO $ readIORef parentRef
+         when (isNothing maybeParent) $ do
+               liftIO . writeIORef parentRef . Just
+                 <=< subscribeWith v' (\a -> do
+                                         v <- liftIO $ readIORef valRef
+                                         forM_ (apply a v) $ \v'1 -> do
+                                           vRef <- pure $! valRef
+                                           iRef <- pure $! invsRef
+                                           defer $ SomeAssignment @x vRef iRef v'1)
+                 $ Subscriber { subscriberPropagate = const (pure ())
+                              , subscriberInvalidateHeight = \_ -> return ()
+                              , subscriberRecalculateHeight = \_ -> return ()
+                              }
+       pure valRef
+  defer $ SomeInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
   pure $ Incremental
     { incrementalCurrent = Behavior $ do
-                  valRef <- liftIO (runEventM forceLazyHold)
                   addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
 --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
-                  liftIO $ readIORef valRef
+                  liftIO $ readIORef forceLazyHoldReturnValRef
     , incrementalPatches = v'
     }
 
