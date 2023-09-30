@@ -946,8 +946,7 @@ buildIncremental readV0 v' = do
   invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
   forceLazyHold <- liftIO $ makeLazyVal $ do
-    v0 <- liftIO $ runEventM readV0
-    valRef <- liftIO $ newIORef v0
+    valRef <- liftIO . newIORef =<< readV0
     defer $ SomeInit $ do
       maybeParent <- liftIO $ readIORef parentRef
       when (isNothing maybeParent) $ do
