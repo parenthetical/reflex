@@ -83,6 +83,7 @@ import Data.Bool (bool)
 
 type Behavior (x :: Type) a = R.Behavior (SpiderTimeline x) a
 type Event (x :: Type) a = R.Event (SpiderTimeline x) a
+type Incremental x p = R.Incremental (SpiderTimeline x) p
 
 whenM :: Monad m => m Bool -> m () -> m ()
 whenM mcond m = mcond >>= flip when m
@@ -235,20 +236,8 @@ addParentBAndInvalidator h invsRef = do
       liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
 
-type DynamicS x p = Dynamic x (PatchTarget p) p
-
-data Dynamic x target p = Dynamic
-  { dynamicCurrent :: !(Behavior x target)
-  , dynamicUpdated :: Event x p -- This must be lazy; see the comment on buildIncremental
-  }
-
-deriving instance (HasSpiderTimeline x) => Functor (Dynamic x target)
-
-dynamicConst :: HasSpiderTimeline x => PatchTarget p -> DynamicS x p
-dynamicConst !a = Dynamic
-  { dynamicCurrent = R.constant a
-  , dynamicUpdated = R.never
-  }
+dynamicConst :: HasSpiderTimeline x => PatchTarget p -> R.Incremental (SpiderTimeline x) p
+dynamicConst !a = Incremental (R.constant a) R.never
 
 -- | A statically allocated 'SpiderTimeline'
 data Global
@@ -632,7 +621,7 @@ newtype FanSubscribedChildren x k v a = FanSubscribedChildren
 
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
-mergeInt :: forall x a. (HasSpiderTimeline x) => DynamicS x (PatchIntMap (Event x a)) -> Event x (IntMap a)
+mergeInt :: forall x a. (HasSpiderTimeline x) => Incremental x (PatchIntMap (Event x a)) -> Event x (IntMap a)
 mergeInt =
   merge
   (\tellE ipt -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
@@ -648,7 +637,7 @@ mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (
        -> DMap k (Constant (EventM x ()))
        -> EventM x (DMap k (Constant (EventM x ()))))
   -> (forall a. q a -> Event x (v a))
-  -> DynamicS x (patch k q)
+  -> Incremental x (patch k q)
   -> Event x (DMap k v)
 mergeG' doPatch nt =
   merge
@@ -656,7 +645,7 @@ mergeG' doPatch nt =
   doPatch
 
 mergeG :: forall k q x v. (HasSpiderTimeline x, GCompare k)
-  => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMap k q) -> Event x (DMap k v)
+  => (forall a. q a -> Event x (v a)) -> Incremental x (PatchDMap k q) -> Event x (DMap k v)
 mergeG nt =
   mergeG'
   (\tellE ip s -> do
@@ -667,7 +656,7 @@ mergeG nt =
   nt
 
 mergeWithMove :: forall k x v q. (HasSpiderTimeline x, GCompare k)
-  => (forall a. q a -> Event x (v a)) -> DynamicS x (PatchDMapWithMove k q) -> Event x (DMap k v)
+  => (forall a. q a -> Event x (v a)) -> Incremental x (PatchDMapWithMove k q) -> Event x (DMap k v)
 mergeWithMove nt =
   mergeG'
   (\tellE ip s -> do
@@ -698,7 +687,7 @@ merge :: forall x ip ipt o s.
   ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Patch ip)
   => (TellE x o -> ipt -> EventM x s)
   -> (TellE x o -> ip -> s -> EventM x s)
-  -> DynamicS x ip -- p is the type of DMap Patch (i.e. With/Without Move)
+  -> Incremental x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
 merge doInitialInput doPatchInput d = cacheEvent $ toEvent zeroHeight $ do
   accumRef :: IORef o <- liftIO $ newIORef mempty
@@ -736,12 +725,12 @@ merge doInitialInput doPatchInput d = cacheEvent $ toEvent zeroHeight $ do
           (Subscriber (const (pure ())) (const invalidateMyHeight) (const recalculateMyHeight)))
         evD
   initialState <- lift $ doInitialInput mergeSubscribeAndRead
-                         =<< R.sample (dynamicCurrent d)
+                         =<< R.sample (incrementalCurrent d)
   stateB <- mfix $ \stateB -> R.hold initialState
                               . R.pushCheap (\p -> do
                                                 oldState <- R.sample stateB
                                                 Just <$> doPatchInput mergeSubscribeAndRead p oldState)
-                           $ R.updatedIncremental (SpiderIncremental d)
+                           $ R.updatedIncremental d
   occ <- runMaybeT $ do
        -- TODO: this is the same logic as in 'scheduleMerge''
        guard =<< lift (lift seenAllEvents)
@@ -963,14 +952,14 @@ buildIncremental readV0 v' = do
                            }
     pure valRef
   defer $ SomeInit @x $ void $ forceLazyHold
-  pure . SpiderIncremental
-    $ Dynamic { dynamicCurrent = Behavior $ do
+  pure $ Incremental
+    { incrementalCurrent = Behavior $ do
                   valRef <- liftIO (runEventM forceLazyHold)
                   addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
 --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
                   liftIO $ readIORef valRef
-              , dynamicUpdated = v'
-              }
+    , incrementalPatches = v'
+    }
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# INLINABLE hold #-}
@@ -1017,7 +1006,7 @@ instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)
   x <$ d = R.unsafeBuildDynamic (return x) $ x <$ R.updated d
 
 instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  pure = SpiderDynamic . SpiderIncremental . dynamicConst
+  pure = SpiderDynamic . dynamicConst
   liftA2 = R.zipDynWith
   a <*> b = R.zipDynWith ($) a b
   a *> b = R.unsafeBuildDynamic (R.sample $ R.current b) $ R.leftmost [R.updated b, R.tag (R.current b) $ R.updated a]
@@ -1129,7 +1118,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
   newtype Behavior (SpiderTimeline x) a = Behavior { readBehaviorTracked :: BehaviorM x a }
   newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe a) }
-  newtype Incremental (SpiderTimeline x) p = SpiderIncremental { unSpiderIncremental :: DynamicS x p }
+  data Incremental (SpiderTimeline x) p = Incremental { incrementalCurrent :: !(Behavior x (PatchTarget p))
+                                                      , incrementalPatches :: Event x p -- This must be lazy; see the comment on buildIncremental
+                                                      }
   newtype Dynamic (SpiderTimeline x) a = SpiderDynamic { unSpiderDynamic :: R.Incremental (SpiderTimeline x) (Identity a) } -- deriving (Functor, Applicative, Monad)
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
@@ -1159,21 +1150,21 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE coincidence #-}
   coincidence = coincidence
   {-# INLINABLE current #-}
-  current = dynamicCurrent . unSpiderIncremental .# unSpiderDynamic
+  current = coerce #. incrementalCurrent .# unSpiderDynamic
   {-# INLINABLE updated #-}
-  updated = coerce #. dynamicUpdated .# unSpiderIncremental .# unSpiderDynamic
+  updated = coerce #. incrementalPatches .# unSpiderDynamic
   {-# INLINABLE unsafeBuildDynamic #-}
   unsafeBuildDynamic readV0 v' = SpiderDynamic $ R.unsafeBuildIncremental readV0 $ fmap Identity v'
   {-# INLINABLE unsafeBuildIncremental #-}
   unsafeBuildIncremental = unsafeBuildIncremental
   {-# INLINABLE mergeIncrementalG #-}
-  mergeIncrementalG nt = mergeG nt .# unSpiderIncremental
+  mergeIncrementalG nt = mergeG nt
   {-# INLINABLE mergeIncrementalWithMoveG #-}
-  mergeIncrementalWithMoveG nt = mergeWithMove nt .# unSpiderIncremental
+  mergeIncrementalWithMoveG nt = mergeWithMove nt
   {-# INLINABLE currentIncremental #-}
-  currentIncremental = dynamicCurrent . unSpiderIncremental
+  currentIncremental = incrementalCurrent
   {-# INLINABLE updatedIncremental #-}
-  updatedIncremental =  dynamicUpdated . unSpiderIncremental
+  updatedIncremental = incrementalPatches
   {-# INLINABLE incrementalToDynamic #-}
   incrementalToDynamic i =
     let currentI = R.currentIncremental i
