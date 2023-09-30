@@ -239,7 +239,7 @@ type DynamicS x p = Dynamic x (PatchTarget p) p
 
 data Dynamic x target p = Dynamic
   { dynamicCurrent :: !(Behavior x target)
-  , dynamicUpdated :: Event x p -- This must be lazy; see the comment on holdEvent --TODO: Would this let us eliminate `Dyn`?
+  , dynamicUpdated :: Event x p -- This must be lazy; see the comment on buildIncremental
   }
 
 deriving instance (HasSpiderTimeline x) => Functor (Dynamic x target)
@@ -442,11 +442,6 @@ toEvent initHeight evM = Event $ \sub -> do
     (subscriptionsRef, retainExtra)
     occ
 
--- TODO: calculateSwitchHeight and calculateCoincidenceHeight are similar in that they both take the
---     currentParent/outerParent height, and coincidence also the inner height. The result is the maximum
---     of all used heights.
--- TODO: coincidenceSubscribedOuterParent seems to appear in similar places as switchSubscribedCurrentParent
--- FIXME: semantics test-suite uses huge and growing amounts of memory (and possibly doesn't terminate) when coincidence isn't cached
 coincidence :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x), Defer Clear (EventM x)) => Event x (Event x a) -> Event x a
 coincidence coincidenceParent = cacheEvent $ toEvent zeroHeight $ do
   evD <- ask
@@ -729,9 +724,6 @@ merge doInitialInput doPatchInput d = cacheEvent $ toEvent zeroHeight $ do
                unless didAnEventFire $ do -- Only schedule the firing once
                  let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
                        seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
-                            -- TODO: "unless (outputIsEmpty vals)" is an unfortunate effect of my
-                            -- attempt to use addAccum both at init time and
-                            -- update time.
                            initPhaseDidntReturnOcc <- liftIO (readIORef anEventFiredRef)
                            when initPhaseDidntReturnOcc $ do
                            -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
@@ -1048,7 +1040,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Spide
   
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHostFrame x) where
-  sample = SpiderHostFrame . R.sample --TODO: This can cause problems with laziness, so we should get rid of it if we can
+  sample = SpiderHostFrame . R.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHostFrame x) where
   {-# INLINABLE hold #-}
@@ -1187,7 +1179,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   incrementalToDynamic i =
     let currentI = R.currentIncremental i
     in R.unsafeBuildDynamic (R.sample currentI)
-       $ R.push (\p -> fmap (apply p) (R.sample currentI)) --TODO: Avoid the redundant 'apply' [Adriaan: avoiding apply would involve turning Behavior into Event?]
+       $ R.push (\p -> fmap (apply p) (R.sample currentI)) --TODO: Avoid the redundant 'apply'
        $ R.updatedIncremental i
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
