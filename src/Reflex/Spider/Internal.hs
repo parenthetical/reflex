@@ -22,7 +22,6 @@
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE FunctionalDependencies #-}
@@ -212,11 +211,11 @@ pull a = unsafePerformIO $ do
 type BehaviorEnv x = (Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]), IORef [SomeInit x])
 
 -- BehaviorM can sample behaviors
-newtype BehaviorM x a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
+newtype BehaviorM (x :: Type) a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
 
 data BehaviorSubscribed x a
-   = forall p. BehaviorSubscribedHold (Hold x p)
+   = BehaviorSubscribedHold (IORef (Maybe (EventSubscription x)))
    | BehaviorSubscribedPull (PullSubscribed x a)
 
 newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscribed x))
@@ -244,10 +243,6 @@ data Dynamic x target p = Dynamic
   }
 
 deriving instance (HasSpiderTimeline x) => Functor (Dynamic x target)
-
-{-# INLINE subscribeHoldEvent #-}
-subscribeHoldEvent :: Hold x p -> Subscriber x p -> EventM x (EventSubscription x, Maybe p)
-subscribeHoldEvent = subscribeAndRead . holdEvent
 
 dynamicConst :: HasSpiderTimeline x => PatchTarget p -> DynamicS x p
 dynamicConst !a = Dynamic
@@ -933,14 +928,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   {-# INLINABLE sample #-}
   sample b = fixmeUnifySample (R.sample b) --TODO: Specialize sample to the Nothing and Just cases
 
---type role Hold representational
-data Hold x p
-   = Hold { holdValue :: !(IORef (PatchTarget p))
-          , holdInvalidators :: !(IORef [Weak Invalidator])
-          , holdEvent :: Event x p -- This must be lazy, or holds cannot be defined before their input Events
-          , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
-          }
-
 makeLazyVal :: MonadIO m => m a -> IO (m a)
 makeLazyVal get = do
   fmap (join . liftIO . readIORef) . mfix $ \ref ->
@@ -954,20 +941,21 @@ fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< getDeferralQu
 
 unsafeBuildIncremental :: forall x p. (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
 unsafeBuildIncremental readV0 v' =
+  -- TODO: using buildIncremental is lazier than the original implementation
   unsafePerformIO . runEventM @x $ buildIncremental (fixmeUnifySample readV0) $ v'
---  unsafePerformIO . fmap dynamicDyn . lazyHold (runBehaviorM readV0 Nothing =<< runEventM @x getDeferralQueue) $ v'
-  -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild)
+  -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild):
   -- SpiderIncremental $ Dynamic (Behavior readV0) v'
 
+{-# INLINE buildIncremental #-}
 -- Note: cannot examine its event until after the phase is over
 buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m)
   => EventM x (PatchTarget p) -> Event x p -> m (R.Incremental (SpiderTimeline x) p)
 buildIncremental readV0 v' = do
+  invsRef <- liftIO $ newIORef [] -- invalidators
+  parentRef <- liftIO $ newIORef Nothing
   forceLazyHold <- liftIO $ makeLazyVal $ do
     v0 <- liftIO $ runEventM readV0
     valRef <- liftIO $ newIORef v0
-    invsRef <- liftIO $ newIORef [] -- invalidators
-    parentRef <- liftIO $ newIORef Nothing
     defer $ SomeInit $ do
       maybeParent <- liftIO $ readIORef parentRef
       when (isNothing maybeParent) $ do
@@ -982,21 +970,15 @@ buildIncremental readV0 v' = do
                            , subscriberInvalidateHeight = \_ -> return ()
                            , subscriberRecalculateHeight = \_ -> return ()
                            }
-    return $ Hold
-          { holdValue = valRef
-          , holdInvalidators = invsRef
-          , holdEvent = v'
-          , holdParent = parentRef
-          }
-  defer $ SomeInit $ void $ forceLazyHold
+    pure valRef
+  defer $ SomeInit @x $ void $ forceLazyHold
   pure . SpiderIncremental
     $ Dynamic { dynamicCurrent = Behavior $ do
-                  h <- liftIO (runEventM forceLazyHold)
-                  result <- liftIO $ readIORef $ holdValue h
-                  addParentBAndInvalidator (BehaviorSubscribedHold h) (holdInvalidators h)
-                  liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
-                  return result
-              , dynamicUpdated = Event $ \sub -> forceLazyHold >>= \h -> subscribeHoldEvent h sub
+                  valRef <- liftIO (runEventM forceLazyHold)
+                  addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
+--                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
+                  liftIO $ readIORef valRef
+              , dynamicUpdated = v'
               }
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
@@ -1192,7 +1174,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE unsafeBuildDynamic #-}
   unsafeBuildDynamic readV0 v' = SpiderDynamic $ R.unsafeBuildIncremental readV0 $ fmap Identity v'
   {-# INLINABLE unsafeBuildIncremental #-}
-  unsafeBuildIncremental readV0 dv = unsafeBuildIncremental readV0 dv
+  unsafeBuildIncremental = unsafeBuildIncremental
   {-# INLINABLE mergeIncrementalG #-}
   mergeIncrementalG nt = mergeG nt .# unSpiderIncremental
   {-# INLINABLE mergeIncrementalWithMoveG #-}
