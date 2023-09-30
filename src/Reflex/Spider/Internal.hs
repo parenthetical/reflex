@@ -114,8 +114,10 @@ subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 {-# RULES
 "cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
 "cacheEvent/pushCheap" forall f e. R.pushCheap f (cacheEvent e) = cacheEvent (R.pushCheap f e)
-"hold/cacheEvent" forall f e. hold f (cacheEvent e) = hold f e
+"buildIncremental/cacheEvent" forall f e. buildIncremental f (cacheEvent e) = buildIncremental f e
   #-}
+
+
 
 terminalSubscriber :: Subscriber x a
 terminalSubscriber = Subscriber { subscriberPropagate = const (pure ())
@@ -943,9 +945,7 @@ type Spider = SpiderTimeline Global
 -- you're safe to use a simple pull-based read of the behavior?
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   {-# INLINABLE sample #-}
-  sample b = do
-    holdInits <- getDeferralQueue
-    liftIO $ runBehaviorM (R.sample b) Nothing holdInits --TODO: Specialize sample to the Nothing and Just cases
+  sample b = fixmeUnifySample (R.sample b) --TODO: Specialize sample to the Nothing and Just cases
 
 --type role Hold representational
 data Hold x p
@@ -955,60 +955,60 @@ data Hold x p
           , holdParent :: !(IORef (Maybe (EventSubscription x))) -- Keeps its parent alive (will be undefined until the hold is initialized) --TODO: Probably shouldn't be an IORef
           }
 
--- Note: hold cannot examine its event until after the phase is over
-{-# INLINE [1] hold #-}
-hold :: forall p x m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m) => PatchTarget p -> Event x p -> m (Hold x p)
-hold v0 e = do
-  valRef <- liftIO $ newIORef v0
-  invsRef <- liftIO $ newIORef [] -- invalidators
-  parentRef <- liftIO $ newIORef Nothing
-  defer $ SomeInit $ do
-    maybeParent <- liftIO $ readIORef parentRef
-    when (isNothing maybeParent) $ do
-          liftIO . writeIORef parentRef . Just
-            <=< subscribeWith e (\a -> do
-                                    v <- liftIO $ readIORef valRef
-                                    forM_ (apply a v) $ \v' -> do
-                                      vRef <- pure $! valRef
-                                      iRef <- pure $! invsRef
-                                      defer $ SomeAssignment @x vRef iRef v')
-            $ terminalSubscriber
-  return $ Hold
-        { holdValue = valRef
-        , holdInvalidators = invsRef
-        , holdEvent = e
-        , holdParent = parentRef
-        }
-
-{-# INLINE readHoldTracked #-}
-readHoldTracked :: Hold x p -> BehaviorM x (PatchTarget p)
-readHoldTracked h = do
-  result <- liftIO $ readIORef $ holdValue h
-  addParentBAndInvalidator (BehaviorSubscribedHold h) (holdInvalidators h)
-  liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
-  return result
-
-lazyHold :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m)
-          => m (PatchTarget p) -> Event x p -> IO (m (Hold x p))
-lazyHold getV0 v' = do
+makeLazyVal :: MonadIO m => m a -> IO (m a)
+makeLazyVal get = do
   fmap (join . liftIO . readIORef) . mfix $ \ref ->
-    -- TODO: Is all this code "create the hold on request and cache the result"? Could it be replaced by an unsafePerformIO or something?
     newIORef $ do
-      v0 <- getV0
-      h <- hold v0 v'
-      liftIO $ writeIORef ref $ pure h
-      return h
+      a <- get
+      liftIO $ writeIORef ref $ pure a
+      pure a
 
-dynamicDyn :: EventM x (Hold x p) -> R.Incremental (SpiderTimeline x) p
-dynamicDyn !forceLazyHold =
-  SpiderIncremental
-  $ Dynamic { dynamicCurrent = Behavior $ readHoldTracked =<< liftIO (runEventM forceLazyHold)
-            , dynamicUpdated = Event $ \sub -> forceLazyHold >>= \h -> subscribeHoldEvent h sub
-            }
+fixmeUnifySample :: Defer (SomeInit x) m => BehaviorM x b -> m b
+fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
-dynamicDynUnsafeBuildDynamic :: (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
-dynamicDynUnsafeBuildDynamic readV0 v' =
-  dynamicDyn $ unsafePerformIO $ lazyHold (liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue) v'
+unsafeBuildIncremental :: forall x p. (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
+unsafeBuildIncremental readV0 v' =
+  unsafePerformIO . runEventM @x $ buildIncremental (fixmeUnifySample readV0) $ v'
+--  unsafePerformIO . fmap dynamicDyn . lazyHold (runBehaviorM readV0 Nothing =<< runEventM @x getDeferralQueue) $ v'
+  -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild)
+  -- SpiderIncremental $ Dynamic (Behavior readV0) v'
+
+-- Note: cannot examine its event until after the phase is over
+buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m)
+  => EventM x (PatchTarget p) -> Event x p -> m (R.Incremental (SpiderTimeline x) p)
+buildIncremental readV0 v' = do
+  forceLazyHold <- liftIO $ makeLazyVal $ do
+    v0 <- liftIO $ runEventM readV0
+    valRef <- liftIO $ newIORef v0
+    invsRef <- liftIO $ newIORef [] -- invalidators
+    parentRef <- liftIO $ newIORef Nothing
+    defer $ SomeInit $ do
+      maybeParent <- liftIO $ readIORef parentRef
+      when (isNothing maybeParent) $ do
+            liftIO . writeIORef parentRef . Just
+              <=< subscribeWith v' (\a -> do
+                                      v <- liftIO $ readIORef valRef
+                                      forM_ (apply a v) $ \v'1 -> do
+                                        vRef <- pure $! valRef
+                                        iRef <- pure $! invsRef
+                                        defer $ SomeAssignment @x vRef iRef v'1)
+              $ terminalSubscriber
+    return $ Hold
+          { holdValue = valRef
+          , holdInvalidators = invsRef
+          , holdEvent = v'
+          , holdParent = parentRef
+          }
+  defer $ SomeInit $ void $ forceLazyHold
+  pure . SpiderIncremental
+    $ Dynamic { dynamicCurrent = Behavior $ do
+                  h <- liftIO (runEventM forceLazyHold)
+                  result <- liftIO $ readIORef $ holdValue h
+                  addParentBAndInvalidator (BehaviorSubscribedHold h) (holdInvalidators h)
+                  liftIO $ touch h -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected
+                  return result
+              , dynamicUpdated = Event $ \sub -> forceLazyHold >>= \h -> subscribeHoldEvent h sub
+              }
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# INLINABLE hold #-}
@@ -1016,17 +1016,9 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE holdDyn #-}
   holdDyn v0 e = fmap SpiderDynamic . R.holdIncremental v0 $ coerce e
   {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 e = do
-    !h <- hold v0 e
-    pure $ SpiderIncremental $ Dynamic
-      { dynamicCurrent = Behavior $ readHoldTracked h
-      , dynamicUpdated = Event $ subscribeHoldEvent h
-      }
+  holdIncremental v0 = buildIncremental (pure v0)
   {-# INLINABLE buildDynamic #-}
-  buildDynamic readV0 v' = do
-    forceLazyHold <- liftIO $ lazyHold (liftIO $ runEventM readV0) (fmap Identity v')
-    defer $ SomeInit $ void $ forceLazyHold
-    pure . SpiderDynamic . dynamicDyn $ forceLazyHold
+  buildDynamic readV0 = fmap SpiderDynamic . buildIncremental readV0 . coerce
   {-# INLINABLE headE #-}
   headE = R.slowHeadE
   {-# INLINABLE now #-}
@@ -1206,7 +1198,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE unsafeBuildDynamic #-}
   unsafeBuildDynamic readV0 v' = SpiderDynamic $ R.unsafeBuildIncremental readV0 $ fmap Identity v'
   {-# INLINABLE unsafeBuildIncremental #-}
-  unsafeBuildIncremental readV0 dv = dynamicDynUnsafeBuildDynamic readV0 dv
+  unsafeBuildIncremental readV0 dv = unsafeBuildIncremental readV0 dv
   {-# INLINABLE mergeIncrementalG #-}
   mergeIncrementalG nt = mergeG nt .# unSpiderIncremental
   {-# INLINABLE mergeIncrementalWithMoveG #-}
