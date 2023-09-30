@@ -119,20 +119,6 @@ subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 
 
 
-terminalSubscriber :: Subscriber x a
-terminalSubscriber = Subscriber { subscriberPropagate = const (pure ())
-                                , subscriberInvalidateHeight = \_ -> return ()
-                                , subscriberRecalculateHeight = \_ -> return ()
-                                }
-
-now :: (Defer Clear m) => m (Event x ())
-now = do
-  nowOrNot <- liftIO $ newIORef $ Just ()
-  defer $ Clear $ writeIORef nowOrNot Nothing
-  return . Event $ \_ -> do
-    occ <- liftIO . readIORef $ nowOrNot
-    returnSubscription (pure ()) zeroRef () occ
-
 -- | Construct an 'Event' whose value is guaranteed not to be recomputed
 -- repeatedly
 --
@@ -992,7 +978,10 @@ buildIncremental readV0 v' = do
                                         vRef <- pure $! valRef
                                         iRef <- pure $! invsRef
                                         defer $ SomeAssignment @x vRef iRef v'1)
-              $ terminalSubscriber
+              $ Subscriber { subscriberPropagate = const (pure ())
+                           , subscriberInvalidateHeight = \_ -> return ()
+                           , subscriberRecalculateHeight = \_ -> return ()
+                           }
     return $ Hold
           { holdValue = valRef
           , holdInvalidators = invsRef
@@ -1022,7 +1011,12 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE headE #-}
   headE = R.slowHeadE
   {-# INLINABLE now #-}
-  now = now
+  now = do
+    nowOrNot <- liftIO $ newIORef $ Just ()
+    defer $ Clear $ writeIORef nowOrNot Nothing
+    return . Event $ \_ -> do
+      occ <- liftIO . readIORef $ nowOrNot
+      returnSubscription (pure ()) zeroRef () occ
 
 -- INFO: With PullM you have to use readBehaviorTracked for Behavior's
 -- change update mechanism?
