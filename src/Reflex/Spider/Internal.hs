@@ -23,7 +23,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE TupleSections #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
@@ -892,10 +891,6 @@ newFanEventWithTriggerIO f = do
       . coerce . DMap.lookup k
       =<< readIORef occRef
 
---------------------------------------------------------------------------------
--- Reflex integration
---------------------------------------------------------------------------------
-
 -- | Designates the default, global Spider timeline
 data SpiderTimeline x
 type role SpiderTimeline nominal
@@ -1149,9 +1144,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE unsafeBuildIncremental #-}
   unsafeBuildIncremental = unsafeBuildIncremental
   {-# INLINABLE mergeIncrementalG #-}
-  mergeIncrementalG nt = mergeG nt
+  mergeIncrementalG = mergeG
   {-# INLINABLE mergeIncrementalWithMoveG #-}
-  mergeIncrementalWithMoveG nt = mergeWithMove nt
+  mergeIncrementalWithMoveG = mergeWithMove
   {-# INLINABLE currentIncremental #-}
   currentIncremental = incrementalCurrent
   {-# INLINABLE updatedIncremental #-}
