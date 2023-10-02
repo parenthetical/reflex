@@ -712,6 +712,7 @@ justRunInits a = SpiderHost $ do
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
+
   let (EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- unSpiderHost $ justRunInits a
@@ -983,7 +984,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
     in R.unsafeBuildDynamic (R.sample (R.current =<< R.current d)) -- FIXME: Originally the following, why? (R.sample . R.current =<< R.sample (R.current d))
        . R.leftmost
        $ [ R.coincidence $ R.updated <$> R.updated d -- both
-         , R.pushAlways (R.sample . R.current) $ R.updated d -- outer
+         , R.pushAlwaysCheap (R.sample . R.current) $ R.updated d -- outer
          , R.switch $ R.updated <$> R.current d -- eInner
          ]
   {-# INLINE (>>) #-}
