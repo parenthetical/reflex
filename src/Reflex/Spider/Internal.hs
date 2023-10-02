@@ -126,9 +126,7 @@ subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 "cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
 "cacheEvent/pushCheap" forall f e. R.pushCheap f (cacheEvent e) = cacheEvent (R.pushCheap f e)
 "buildIncremental/cacheEvent" forall f e. buildIncremental f (cacheEvent e) = buildIncremental f e
-  #-}
-
-
+#-}
 
 -- | Construct an 'Event' whose value is guaranteed not to be recomputed
 -- repeatedly
@@ -372,8 +370,8 @@ toEvent initHeight evM = Event $ \sub -> do
     (subscriptionsRef, retainExtra)
     occ
 
-coincidence :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x), Defer Clear (EventM x)) => Event x (Event x a) -> Event x a
-coincidence coincidenceParent = cacheEvent $ toEvent zeroHeight $ do
+coincidenceUncached :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x), Defer Clear (EventM x)) => Event x (Event x a) -> Event x a
+coincidenceUncached coincidenceParent = toEvent zeroHeight $ do
   evD <- ask
   (_unsubscribeOuterSubscription, occ) <-
     subscribeAndRead_ (R.pushCheap (\e -> do
@@ -386,8 +384,8 @@ coincidence coincidenceParent = cacheEvent $ toEvent zeroHeight $ do
   pure (pure (), (), occ)
 
 -- TODO: can switch be written using something like unsafeUpdated and tellEvent?
-switch :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switch switchParent = cacheEvent $ toEvent invalidHeight $ do
+switchUncached :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
+switchUncached switchParent = toEvent invalidHeight $ do
   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
   evD <- ask
   let writeNewWeakInvalidator i = do
@@ -980,9 +978,9 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
     let d = fmap f x
     in R.unsafeBuildDynamic (R.sample (R.current =<< R.current d)) -- FIXME: Originally the following, why? (R.sample . R.current =<< R.sample (R.current d))
        . R.leftmost
-       $ [ R.coincidence $ R.updated <$> R.updated d -- both
+       $ [ coincidenceUncached $ R.updated <$> R.updated d -- both
          , R.pushAlwaysCheap (R.sample . R.current) $ R.updated d -- outer
-         , R.switch $ R.updated <$> R.current d -- eInner
+         , switchUncached $ R.updated <$> R.current d -- eInner
          ]
   {-# INLINE (>>) #-}
   (>>) = (*>)
@@ -1129,9 +1127,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE mergeG #-}
   mergeG nt = R.mergeIncrementalG nt . dynamicConst
   {-# INLINABLE switch #-}
-  switch = switch
+  switch = cacheEvent . switchUncached
   {-# INLINABLE coincidence #-}
-  coincidence = coincidence
+  coincidence = cacheEvent . coincidenceUncached
   {-# INLINABLE current #-}
   current = coerce #. incrementalCurrent .# unSpiderDynamic
   {-# INLINABLE updated #-}
