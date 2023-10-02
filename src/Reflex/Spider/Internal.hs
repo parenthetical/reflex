@@ -429,7 +429,7 @@ run roots after = do
         writeIORef occRef $! DMap.insert k a occBefore
         return occBefore
       if DMap.null occBefore
-        then do defer $ Clear $ rootClear occRef
+        then do defer $ Clear $ writeIORef occRef $! DMap.empty
                 return $ Just r
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
@@ -691,9 +691,6 @@ invalidate wisRef = do
         finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
         i
   writeIORef wisRef []
-
-rootClear :: IORef (DMap k v) -> IO ()
-rootClear ref = writeIORef ref $! DMap.empty
 
 justRunInits :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 justRunInits a = SpiderHost $ do
