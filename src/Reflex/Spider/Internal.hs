@@ -14,7 +14,7 @@
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE InstanceSigs #-}
-
+{-# LANGUAGE PatternSynonyms #-}
 #ifdef USE_REFLEX_OPTIMIZER
 {-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
 #endif
@@ -27,7 +27,19 @@
 {-# LANGUAGE TupleSections #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
-module Reflex.Spider.Internal (module Reflex.Spider.Internal) where
+module Reflex.Spider.Internal
+  ( pattern Event,
+    subscribeAndRead,
+    SpiderHostFrame(SpiderHostFrame),
+    SpiderTimeline,
+    Global,
+    Subscriber(subscriberPropagate),
+    runSpiderHost,
+    Spider,
+    SpiderHost,
+    runSpiderHostForTimeline,
+    newSpiderTimeline,
+    withSpiderTimeline ) where
 
 import Control.Applicative (liftA2)
 import Control.Monad hiding (forM, forM_, mapM, mapM_)

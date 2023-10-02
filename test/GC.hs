@@ -4,6 +4,7 @@
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE PatternSynonyms #-}
 module Main where
 
 import Control.Monad
@@ -25,8 +26,15 @@ import Data.Patch
 
 import qualified Reflex.Class as R
 import qualified Reflex.Host.Class as Host
-import qualified Reflex.Spider.Internal as S
-
+import Reflex.Spider.Internal as S
+    ( pattern Event,
+      subscribeAndRead,
+      SpiderHostFrame(SpiderHostFrame),
+      SpiderTimeline,
+      Global,
+      Subscriber(subscriberPropagate),
+      runSpiderHost
+    )
 import System.Exit
 import System.Mem
 import Data.Coerce
@@ -55,14 +63,14 @@ hostPerf ref = S.runSpiderHost $ do
                { S.subscriberPropagate = S.subscriberPropagate sub
                }
             return (s, o))
-       $ runIdentity . runIdentity <$> S.selectG
-              (S.fanG $ R.pushCheap (return . Just . mapKeyValuePairsMonotonic (\(t :=> e) -> WrapArg t :=> Identity e)) response)
+       $ runIdentity . runIdentity <$> R.selectG
+              (R.fanG $ R.pushCheap (return . Just . mapKeyValuePairsMonotonic (\(t :=> e) -> WrapArg t :=> Identity e)) response)
               (WrapArg Request)
     return $ alignWith (mergeThese (<>))
       (flip R.pushCheap eadd $ \_ -> return $ Just $ DMap.singleton Request $ do
         liftIO $ putStrLn "#eadd fired"
         return $ PatchDMap $ DMap.singleton (Const2 (1 :: Int)) $ ComposeMaybe $ Just
-               $ R.pushCheap (return . Just . DMap.singleton Action . (\_ -> liftIO (writeIORef ref (Just 1)))) $ eadd)
+               $ R.pushCheap (return . Just . DMap.singleton Action . (\_ -> liftIO (writeIORef ref (Just 1)))) eadd)
       (flip R.pushCheap reqMap $ \m -> return $ Just $ mconcat $ (\(Const2 _ :=> Identity reqs) -> reqs) <$> DMap.toList m)
   ---- epilogue
   eventToPerformHandle <- Host.subscribeEvent eventToPerform

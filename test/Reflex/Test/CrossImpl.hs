@@ -20,7 +20,7 @@ import Reflex.Class
 import Reflex.Dynamic
 import Reflex.Host.Class
 import qualified Reflex.Pure as P
-import qualified Reflex.Spider.Internal as S
+import Reflex.Spider.Internal as S (runSpiderHost)
 import qualified Reflex.Profiled as Prof
 
 import Control.Arrow (second, (&&&))
