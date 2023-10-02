@@ -179,26 +179,25 @@ pull a = unsafePerformIO $ do
   ref :: IORef (Maybe (PullSubscribed x a)) <- newIORef Nothing
   invsRef :: IORef [Weak Invalidator] <- newIORef []
   pure $ Behavior $ do
-    subscribed <- liftIO (readIORef ref) >>= \case
-      Just subscribed -> pure subscribed
-      Nothing -> do
-        let i = readIORef ref
-                >>= mapM_ (const $ do
-                              writeIORef ref Nothing
-                              invalidate invsRef)
-        wi <- liftIO $ mkWeakPtrWithDebug i
-        parentsRef <- liftIO $ newIORef []
-        (_, !holdInits) <- ask -- ask behavior hold inits
-        aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
-        parents <- liftIO $ readIORef parentsRef
-        let subscribed = PullSubscribed
-              { pullSubscribedValue = aVal
-              , pullSubscribedInvalidators = invsRef
-              , pullSubscribedOwnInvalidator = i
-              , pullSubscribedParents = parents
-              }
-        liftIO $ writeIORef ref $ Just subscribed
-        return subscribed
+    subscribed <- liftIO (readIORef ref) >>= maybe (do
+                    let i = readIORef ref
+                            >>= mapM_ (const $ do
+                                          writeIORef ref Nothing
+                                          invalidate invsRef)
+                    wi <- liftIO $ mkWeakPtrWithDebug i
+                    parentsRef <- liftIO $ newIORef []
+                    !holdInits <- getDeferralQueue -- ask behavior hold inits
+                    aVal <- liftIO $ runReaderIO (unBehaviorM a) (Just (wi, parentsRef), holdInits)
+                    parents <- liftIO $ readIORef parentsRef
+                    let subscribed = PullSubscribed
+                          { pullSubscribedValue = aVal
+                          , pullSubscribedInvalidators = invsRef
+                          , pullSubscribedOwnInvalidator = i
+                          , pullSubscribedParents = parents
+                          }
+                    liftIO $ writeIORef ref $ Just subscribed
+                    return subscribed)
+                  pure
     addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
     pure $ pullSubscribedValue subscribed
 
