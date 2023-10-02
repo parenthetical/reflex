@@ -467,13 +467,13 @@ instance Show EventLoopException where
 zeroRef :: IORef Height
 zeroRef = unsafePerformIO $ newIORef zeroHeight
 
-fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> EventSelectorG x k v
+fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> R.EventSelectorG (SpiderTimeline x) k v
 fanG =
   fan
   (DMap.null :: (DMap k (FanSubscribedChildren x k v) -> Bool))
   (\f subscribers -> forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
               WeakBag.traverse_ (_fanSubscribedChildren v) f)
-  (\f -> EventSelectorG $ \(!k) -> unsafeCoerce f
+  (\f -> R.EventSelectorG $ \(!k) -> unsafeCoerce f
     ( fmap _fanSubscribedChildren . DMap.lookup k
     , DMap.lookup k
     , DMap.insert k . FanSubscribedChildren
@@ -552,9 +552,6 @@ fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
              (sln, parentSubscriptionRef)
        . (lookup2 =<<)
        =<< liftIO (readIORef occRef)
-
-newtype EventSelector x k = EventSelector { select :: forall a. k a -> Event x a }
-newtype EventSelectorG x k v = EventSelectorG { selectG :: forall a. k a -> Event x (v a) }
 
 newtype FanSubscribedChildren x k v a = FanSubscribedChildren
   { _fanSubscribedChildren :: WeakBag (Subscriber x (v a))
@@ -801,11 +798,11 @@ data NewFanSubscribedChildren x a = NewFanSubscribedChildren
   }
 
 -- TODO: anything in common with Fan?
-newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (EventSelector x k)
+newFanEventWithTriggerIO :: forall (x :: Type) k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
 newFanEventWithTriggerIO f = do
   occRef <- newIORef DMap.empty
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
-  return $ EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
+  return $ R.EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
     (NewFanSubscribedChildren subscribers uninit) <- readIORef subscribedRef >>= (\case
       Just res -> {-# SCC "hitRoot" #-} pure res
       Nothing -> {-# SCC "missRoot" #-} do
@@ -1087,15 +1084,11 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadReadEvent (SpiderTimeline
 
 instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHost x) where
   newEventWithTrigger = SpiderHost . newEventWithTriggerIO
-  newFanEventWithTrigger f = SpiderHost $ do
-    es <- newFanEventWithTriggerIO f
-    return $ Reflex.Class.EventSelector $ select es
+  newFanEventWithTrigger f = SpiderHost $ newFanEventWithTriggerIO f
 
 instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHostFrame x) where
   newEventWithTrigger = SpiderHostFrame . EventM . liftIO . newEventWithTriggerIO
-  newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ do
-    es <- newFanEventWithTriggerIO f
-    return $ Reflex.Class.EventSelector $ select es
+  newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ newFanEventWithTriggerIO f
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHost x) where
   {-# INLINABLE subscribeEvent #-}
@@ -1134,7 +1127,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE pull #-}
   pull = pull
   {-# INLINABLE fanG #-}
-  fanG e = R.EventSelectorG $ selectG (fanG e)
+  fanG = fanG
   {-# INLINABLE mergeG #-}
   mergeG nt = mergeG nt . dynamicConst
   {-# INLINABLE switch #-}
@@ -1213,7 +1206,7 @@ instance NotReady (SpiderTimeline x) (SpiderHostFrame x) where
 newEventWithTriggerIO :: forall x a. (RootTrigger x a -> IO (IO ())) -> IO (Event x a)
 newEventWithTriggerIO f = do
   es <- newFanEventWithTriggerIO $ \Refl -> f
-  return $ select es Refl
+  return $ R.select es Refl
 
 newtype ReadPhase x a = ReadPhase (EventM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
