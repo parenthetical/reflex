@@ -983,7 +983,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
     in R.unsafeBuildDynamic (R.sample (R.current =<< R.current d)) -- FIXME: Originally the following, why? (R.sample . R.current =<< R.sample (R.current d))
        . R.leftmost
        $ [ R.coincidence $ R.updated <$> R.updated d -- both
-         , R.push (fmap Just . R.sample . R.current) $ R.updated d -- outer
+         , R.pushAlways (R.sample . R.current) $ R.updated d -- outer
          , R.switch $ R.updated <$> R.current d -- eInner
          ]
   {-# INLINE (>>) #-}
