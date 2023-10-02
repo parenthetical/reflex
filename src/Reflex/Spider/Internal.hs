@@ -1129,7 +1129,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE fanG #-}
   fanG = fanG
   {-# INLINABLE mergeG #-}
-  mergeG nt = mergeG nt . dynamicConst
+  mergeG nt = R.mergeIncrementalG nt . dynamicConst
   {-# INLINABLE switch #-}
   switch = switch
   {-# INLINABLE coincidence #-}
