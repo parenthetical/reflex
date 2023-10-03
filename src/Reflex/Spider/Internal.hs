@@ -975,7 +975,7 @@ instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) 
   {-# INLINE (>>=) #-}
   x >>= f =
     let d = fmap f x
-    in R.unsafeBuildDynamic (R.sample (R.current =<< R.current d)) -- FIXME: Originally the following, why? (R.sample . R.current =<< R.sample (R.current d))
+    in R.unsafeBuildDynamic (R.sample . R.current =<< R.sample (R.current d))
        . R.leftmost
        $ [ coincidenceUncached $ R.updated <$> R.updated d -- both
          , R.pushAlwaysCheap (R.sample . R.current) $ R.updated d -- outer
