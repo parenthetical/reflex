@@ -140,7 +140,7 @@ cacheEvent e = unsafePerformIO $ do
   subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
   parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
   occRef :: IORef (Maybe a) <- newIORef Nothing
-  pure $ Event $ \sub -> {-# SCC "cacheEvent" #-} do
+  pure $ Event $ \sub -> do
     whenM (liftIO (WeakBag.null subscribers)) $
       liftIO . writeIORef parentSubscriptionRef
       <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
@@ -370,7 +370,7 @@ toEvent initHeight evM = Event $ \sub -> do
     (subscriptionsRef, retainExtra)
     occ
 
-coincidenceUncached :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x), Defer Clear (EventM x)) => Event x (Event x a) -> Event x a
+coincidenceUncached :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x)) => Event x (Event x a) -> Event x a
 coincidenceUncached coincidenceParent = toEvent zeroHeight $ do
   evD <- ask
   (_unsubscribeOuterSubscription, occ) <-
@@ -799,8 +799,8 @@ newFanEventWithTriggerIO f = do
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
   return $ R.EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
     (NewFanSubscribedChildren subscribers uninit) <- readIORef subscribedRef >>= (\case
-      Just res -> {-# SCC "hitRoot" #-} pure res
-      Nothing -> {-# SCC "missRoot" #-} do
+      Just res -> pure res
+      Nothing -> do
         subscribers <- WeakBag.empty
         uninit <- f k $ RootTrigger (subscribers, occRef, k)
         let res = NewFanSubscribedChildren subscribers uninit
