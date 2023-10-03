@@ -912,7 +912,7 @@ pull a = unsafePerformIO $ do
     addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
     pure $ pullSubscribedValue subscribed
 
-{-# INLINE buildIncremental #-}
+{-# NOINLINE buildIncremental #-}
 -- Note: cannot examine its event until after the phase is over
 buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m)
   => EventM x (PatchTarget p) -> Event x p -> m (R.Incremental (SpiderTimeline x) p)
