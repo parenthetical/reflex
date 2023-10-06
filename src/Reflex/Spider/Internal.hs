@@ -308,6 +308,24 @@ heightInvalidator = do
       writeIORef heightRef $! invalidHeight
       subscriberInvalidateHeight sub oldHeight
 
+invalidateHeight :: forall {k} {x :: k} {a}. IORef Height -> Subscriber x a -> IO ()
+invalidateHeight heightRef sub =  do
+    oldHeight <- readIORef heightRef
+    -- Don't do anything if the height is already invalid
+    when (oldHeight /= invalidHeight) $ do
+      writeIORef heightRef $! invalidHeight
+      subscriberInvalidateHeight sub oldHeight
+
+recalculateHeight :: forall {k} {x :: k} {a}. IORef Height -> Subscriber x a -> Height -> IO ()
+recalculateHeight heightRef sub maybeNewHeight = do
+    currentHeight <- readIORef heightRef
+    -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
+    -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
+    when (currentHeight == invalidHeight) $ do
+      when (maybeNewHeight /= invalidHeight) $ do
+        writeIORef heightRef $! maybeNewHeight
+        subscriberRecalculateHeight sub maybeNewHeight
+
 heightUpdater :: EvM x res (IO ())
 heightUpdater = do
   heightRef <- asks _heightRef
@@ -370,18 +388,33 @@ toEvent initHeight evM = Event $ \sub -> do
     (subscriptionsRef, retainExtra)
     occ
 
+getSubscriptionHeight :: forall {k} {x :: k}. EventSubscription x -> IO Height
+getSubscriptionHeight = readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed
+
 coincidenceUncached :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x)) => Event x (Event x a) -> Event x a
-coincidenceUncached coincidenceParent = toEvent zeroHeight $ do
-  evD <- ask
-  (_unsubscribeOuterSubscription, occ) <-
-    subscribeAndRead_ (R.pushCheap (\e -> do
-                                     -- This is: "subscribe for one frame"
-                                     (doUnsubscribe, occ) <- runReaderT (subscribeAndRead_ e =<< subscriber_) evD
-                                     liftIO doUnsubscribe
-                                     return occ)
-                       coincidenceParent)
-      =<< subscriber_
-  pure (pure (), (), occ)
+coincidenceUncached coincidenceParent = Event $ \sub -> do
+  heightRef <- liftIO $ newIORef invalidHeight
+  let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
+  (subscription, occ) <-
+    subscribeAndRead (R.pushCheap (\e -> do
+                                    (subscription, mocc) <- subscribeAndRead e subscriber
+                                    innerHeight <- liftIO $ getSubscriptionHeight subscription
+                                    currentHeight <- liftIO $ readIORef heightRef
+                                    defer $ MergeUpdate @x (pure [subscription])
+                                            (invalidateHeight heightRef sub)
+                                            (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
+                                    when (innerHeight > currentHeight) $ liftIO $ do
+                                      invalidateHeight heightRef sub
+                                      recalculateHeight heightRef sub innerHeight
+                                    pure mocc)
+                     coincidenceParent)
+    subscriber
+  liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
+  returnSubscription
+    (unsubscribe subscription)
+    heightRef
+    subscription
+    occ
 
 -- TODO: can switch be written using something like unsafeUpdated and tellEvent?
 switchUncached :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
