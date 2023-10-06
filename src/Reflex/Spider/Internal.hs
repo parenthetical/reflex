@@ -1,3 +1,4 @@
+{-# LANGUAGE ApplicativeDo #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE EmptyDataDecls #-}
@@ -393,7 +394,7 @@ getSubscriptionHeight = readIORef . eventSubscribedHeightRef . _eventSubscriptio
 
 coincidenceUncached :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x)) => Event x (Event x a) -> Event x a
 coincidenceUncached coincidenceParent = Event $ \sub -> do
-  heightRef <- liftIO $ newIORef invalidHeight
+  heightRef <- liftIO $ newIORef zeroHeight
   let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
   (subscription, occ) <-
     subscribeAndRead (R.pushCheap (\e -> do
@@ -403,18 +404,17 @@ coincidenceUncached coincidenceParent = Event $ \sub -> do
                                     defer $ MergeUpdate @x (pure [subscription])
                                             (invalidateHeight heightRef sub)
                                             (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
-                                    when (innerHeight > currentHeight) $ liftIO $ do
-                                      invalidateHeight heightRef sub
-                                      recalculateHeight heightRef sub innerHeight
+                                    when (innerHeight > currentHeight) $ liftIO $ do 
+                                      writeIORef heightRef innerHeight
+                                      subscriberInvalidateHeight sub currentHeight
+                                      subscriberRecalculateHeight sub innerHeight
                                     pure mocc)
                      coincidenceParent)
     subscriber
-  liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
-  returnSubscription
-    (unsubscribe subscription)
-    heightRef
-    subscription
-    occ
+  liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
+  returnSubscription (unsubscribe subscription) heightRef subscription occ
+
+
 
 -- TODO: can switch be written using something like unsafeUpdated and tellEvent?
 switchUncached :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
