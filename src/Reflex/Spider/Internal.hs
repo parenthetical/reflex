@@ -177,8 +177,8 @@ data EventSubscribed x = EventSubscribed
   , _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
   }
 
-dynamicConst :: HasSpiderTimeline x => PatchTarget p -> R.Incremental (SpiderTimeline x) p
-dynamicConst !a = Incremental (R.constant a) R.never
+incrementalConst :: HasSpiderTimeline x => PatchTarget p -> R.Incremental (SpiderTimeline x) p
+incrementalConst !a = Incremental (R.constant a) R.never
 
 -- | A statically allocated 'SpiderTimeline'
 data Global
@@ -934,7 +934,7 @@ instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)
   x <$ d = R.unsafeBuildDynamic (return x) $ x <$ R.updated d
 
 instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  pure = SpiderDynamic . dynamicConst
+  pure = SpiderDynamic . incrementalConst
   liftA2 = R.zipDynWith
   a <*> b = R.zipDynWith ($) a b
   a *> b = R.unsafeBuildDynamic (R.sample $ R.current b) $ R.leftmost [R.updated b, R.tag (R.current b) $ R.updated a]
@@ -1092,7 +1092,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# INLINABLE fanG #-}
   fanG = fanG
   {-# INLINABLE mergeG #-}
-  mergeG nt = R.mergeIncrementalG nt . dynamicConst
+  mergeG nt = R.mergeIncrementalG nt . incrementalConst
   {-# INLINABLE switch #-}
   switch = cacheEvent . switchUncached
   {-# INLINABLE coincidence #-}
