@@ -414,25 +414,23 @@ coincidenceUncached coincidenceParent = Event $ \sub -> do
   liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
   returnSubscription (unsubscribe subscription) heightRef subscription occ
 
-
-
--- TODO: can switch be written using something like unsafeUpdated and tellEvent?
 switchUncached :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switchUncached switchParent = toEvent invalidHeight $ do
+switchUncached switchParent = Event $ \sub -> do
+  heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  evD <- ask
+  let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
   let writeNewWeakInvalidator i = do
         wi <- mkWeakPtrWithDebug i
         writeIORef ownWeakInvalidatorRef $! wi
   liftIO $ writeNewWeakInvalidator (pure ())
   ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
   -- withB is like "fold over Behavior updates"
-  let withB :: forall s b c. s -> Behavior x b -> (s -> b -> EvM x a (s, c)) -> EvM x a (s, c)
-      withB currentState b f = mfix $ \(~(newState, _)) -> do
+  let withB :: forall s b c. s -> Behavior x b -> (s -> b -> EventM x s) -> EventM x s
+      withB currentState b f = mfix $ \newState -> do
        let ownInvalidator = runEventM @x $ defer $ Clear $ do
                     putStrLn "Running inits inside switch"
                     -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
-                    unSpiderHost . justRunInits $ void $ runReaderT (withB newState b f) evD
+                    unSpiderHost . justRunInits $ void $ withB newState b f
        liftIO $ writeIORef ownInvalidatorRef ownInvalidator
        liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
        liftIO $ writeNewWeakInvalidator ownInvalidator
@@ -441,13 +439,17 @@ switchUncached switchParent = toEvent invalidHeight $ do
          initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
          parentsRef <- newIORef []
          runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
-  ~(_, parentOcc) <- withB (pure ()) switchParent $ \unsubscribePrevious e -> do
+  ~(unsubscribeSubscription :: IO (), parentOcc) <- withB (pure (), Nothing) switchParent $ \(unsubscribePrevious,_) e -> do
         liftIO unsubscribePrevious
-        subscribeAndRead_ e =<< subscriber_
-  pure ( finalize =<< readIORef ownWeakInvalidatorRef -- We don't need to get invalidated if we're dead
-       , ownInvalidatorRef -- TODO: what exactly should go here?
-       , parentOcc
-       )
+        (subscription, occ) <- subscribeAndRead e subscriber
+        liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
+        pure (runEventM @x $ defer $ MergeUpdate @x (pure [subscription])
+                        (invalidateHeight heightRef sub)
+                        (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
+             , occ)
+  returnSubscription (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef)) heightRef
+            ownInvalidatorRef
+            parentOcc
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
