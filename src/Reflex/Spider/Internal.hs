@@ -127,6 +127,7 @@ subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 "cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
 "cacheEvent/pushCheap" forall f e. R.pushCheap f (cacheEvent e) = cacheEvent (R.pushCheap f e)
 "buildIncremental/cacheEvent" forall f e. buildIncremental f (cacheEvent e) = buildIncremental f e
+"cacheEvent/f/cacheEvent" forall f e. cacheEvent (f (cacheEvent e)) = cacheEvent (f e)
 #-}
 
 -- | Construct an 'Event' whose value is guaranteed not to be recomputed
