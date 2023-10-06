@@ -579,7 +579,7 @@ mergeUncached :: forall x ip ipt o s.
   -> Incremental x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
 mergeUncached doInitialInput doPatchInput d = Event $ \sub -> do
-  heightRef <- liftIO $ newIORef zeroHeight -- TODO: why is this messed up? (switch fails with zeroHeight)
+  heightRef <- liftIO $ newIORef zeroHeight
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
   accumRef :: IORef o <- liftIO $ newIORef mempty
