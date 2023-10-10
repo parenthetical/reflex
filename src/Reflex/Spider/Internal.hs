@@ -549,9 +549,7 @@ mergeWithMoveUncached :: forall k x v q. (HasSpiderTimeline x, GCompare k)
 mergeWithMoveUncached nt =
   mergeG'
   (\tellE ip s -> do
-     ip' <- traversePatchDMapWithMoveWithKey (\k v ->
-                               Constant <$> tellE (DMap.singleton k <$> nt v))
-            ip
+     ip' <- traversePatchDMapWithMoveWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ip
      sequence_ $ mapMaybe (\(_ :=> v) -> getConstant v)
           $ DMap.toList
           $ DMap.intersectionWithKey
@@ -568,9 +566,6 @@ mergeWithMoveUncached nt =
 
 type TellE x a = Event x a -> EventM x (EventM x ())
 
--- TODO: merge scheduling used to check this; useful for debugging but needs special casing so I left it out:
--- case height `compare` currentHeight of
---   LT -> error "Somehow a merge's height has been decreased after it was scheduled"
 {-# INLINE mergeUncached #-}
 mergeUncached :: forall x ip ipt o s.
   ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Patch ip)
@@ -578,7 +573,23 @@ mergeUncached :: forall x ip ipt o s.
   -> (TellE x o -> ip -> s -> EventM x s)
   -> Incremental x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-mergeUncached doInitialInput doPatchInput d = Event $ \sub -> do
+mergeUncached doInitialInput doPatchInput i = mergeUncached' $ \tellE -> do
+  initialState <- doInitialInput tellE =<< R.sample (incrementalCurrent i)
+  mfix $ \stateB -> R.hold initialState
+                              . R.pushAlwaysCheap (\ip -> do
+                                                s <- R.sample stateB
+                                                doPatchInput tellE ip s)
+                           $ R.updatedIncremental i
+
+-- TODO: merge scheduling used to check this; useful for debugging but needs special casing so I left it out:
+-- case height `compare` currentHeight of
+--   LT -> error "Somehow a merge's height has been decreased after it was scheduled"
+{-# INLINE mergeUncached' #-}
+mergeUncached' :: forall x o b.
+  ( HasSpiderTimeline x, Monoid o)
+  => (TellE x o -> EventM x b)
+  -> Event x o
+mergeUncached' m = Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
@@ -631,13 +642,7 @@ mergeUncached doInitialInput doPatchInput d = Event $ \sub -> do
           defer $ MergeUpdate @x (pure [subscription])
             (invalidateHeight heightRef sub)
             (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
-  initialState <- doInitialInput mergeSubscribeAndRead
-                         =<< R.sample (incrementalCurrent d)
-  stateB <- mfix $ \stateB -> R.hold initialState
-                              . R.pushCheap (\p -> do
-                                                oldState <- R.sample stateB
-                                                Just <$> doPatchInput mergeSubscribeAndRead p oldState)
-                           $ R.updatedIncremental d
+  retain <- m mergeSubscribeAndRead
   occ <- runMaybeT $ do
        -- TODO: this is the same logic as in 'scheduleMerge''
        guard =<< lift seenAllEvents
@@ -647,8 +652,9 @@ mergeUncached doInitialInput doPatchInput d = Event $ \sub -> do
   returnSubscription
     (mapM_ unsubscribe =<< readIORef subscriptionsRef)
     heightRef
-    (subscriptionsRef, stateB) -- TODO: without stateB GC-semantics tests fail, but how can it be automated?
+    (subscriptionsRef, retain) -- TODO: without 'retain' GC-semantics tests fail, but how can it be automated?
     occ
+
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
