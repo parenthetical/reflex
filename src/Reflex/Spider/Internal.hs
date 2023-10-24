@@ -817,7 +817,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   {-# INLINABLE sample #-}
   sample b = fixmeUnifySample (R.sample b) --TODO: Specialize sample to the Nothing and Just cases
 
-fixmeUnifySample :: Defer (SomeInit x) m => BehaviorM x b -> m b
+fixmeUnifySample :: HasSpiderTimeline x => BehaviorM x b -> EventM x b
 fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
 
 unsafeBuildIncremental :: forall x p. (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
