@@ -246,21 +246,6 @@ instance HasSpiderTimeline x => Defer (SomeInit x) (EventM x) where
   {-# INLINE getDeferralQueue #-}
   getDeferralQueue = asksEventEnv eventEnvInits
 
--- TODO: this is only used in the 'merge' function thus obfuscates what's going on?
-class HasSpiderTimeline x => HasCurrentHeight x m | m -> x where
-  getCurrentHeight :: m Height
-  scheduleMerge :: Height -> EventM x () -> m ()
-
-instance HasSpiderTimeline x => HasCurrentHeight x (EventM x) where
-  {-# INLINE getCurrentHeight #-}
-  getCurrentHeight = do
-    heightRef <- asksEventEnv eventEnvCurrentHeight
-    liftIO $ readIORef heightRef
-  {-# INLINE scheduleMerge #-}
-  scheduleMerge height subscribed = do
-    delayedRef <- asksEventEnv eventEnvDelayedMerges
-    liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) (unHeight height) [subscribed]
-
 class HasSpiderTimeline x where
   -- | Retrieve the current SpiderTimelineEnv
   spiderTimeline :: SpiderTimelineEnv x
@@ -609,8 +594,12 @@ mergeUncached' m = Event $ \sub -> do
             subscriberRecalculateHeight sub maybeNewHeight
   let seenAllEvents = do
         height <- liftIO $ readIORef heightRef
-        currentHeight <- getCurrentHeight
+        algorithmHeightRef <- asksEventEnv eventEnvCurrentHeight
+        currentHeight <- liftIO $ readIORef algorithmHeightRef
         pure (height <= currentHeight)
+  let scheduleMerge height subscribed = do
+        delayedRef <- asksEventEnv eventEnvDelayedMerges
+        liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) (unHeight height) [subscribed]
   let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
       mergeSubscribeAndRead e = do
         (subscription, _) <- subscribeAndRead
