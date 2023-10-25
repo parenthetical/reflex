@@ -137,7 +137,7 @@ subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 --there's only one subscriber, and then build our own FastWeakBag only when a second
 --subscriber joins
 {-# NOINLINE [0] cacheEvent #-}
-cacheEvent :: forall x a. (HasSpiderTimeline x, Defer Clear (EventM x)) => Event x a -> Event x a
+cacheEvent :: forall x a. (HasSpiderTimeline x) => Event x a -> Event x a
 cacheEvent e = unsafePerformIO $ do
   subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
   parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
@@ -221,30 +221,8 @@ data EventEnv x
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
 asksEventEnv f = return $ f $ _spiderTimeline_eventEnv (unSTE (spiderTimeline :: SpiderTimelineEnv x))
 
-class MonadIO m => Defer a m where
-  getDeferralQueue :: m (IORef [a])
-
-{-# INLINE defer #-}
-defer :: Defer a m => a -> m ()
-defer a = do
-  q <- getDeferralQueue
-  liftIO $ modifyIORef' q (a:)
-
-instance Defer (SomeInit x) (BehaviorM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = BehaviorM $ asks behaviorEnvInitsRef
-
-instance HasSpiderTimeline x => Defer (SomeAssignment x) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvAssignments
-
-instance HasSpiderTimeline x => Defer (MergeUpdate x) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvMergeUpdates
-
-instance HasSpiderTimeline x => Defer (SomeInit x) (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvInits
+addToQueue :: MonadIO m => a -> IORef [a] -> m ()
+addToQueue a q = liftIO $ modifyIORef' q (a:)
 
 class HasSpiderTimeline x where
   -- | Retrieve the current SpiderTimelineEnv
@@ -253,15 +231,14 @@ class HasSpiderTimeline x where
 instance HasSpiderTimeline Global where
   spiderTimeline = globalSpiderTimelineEnv
 
-instance HasSpiderTimeline x => Defer Clear (EventM x) where
-  {-# INLINE getDeferralQueue #-}
-  getDeferralQueue = asksEventEnv eventEnvClears
+deferClear :: forall (x :: Type). HasSpiderTimeline x => IO () -> EventM x ()
+deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 
 {-# INLINE writeAndScheduleClear #-}
-writeAndScheduleClear :: Defer Clear m => IORef (Maybe a) -> a -> m ()
+writeAndScheduleClear :: forall (x :: Type) a. HasSpiderTimeline x => IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
-  defer $ Clear $ writeIORef ref Nothing
+  deferClear $ writeIORef ref Nothing
 
 data MergeUpdate x = MergeUpdate
   { _mergeUpdate_update :: !(EventM x [EventSubscription x])
@@ -296,7 +273,7 @@ recalculateHeight heightRef sub maybeNewHeight = do
 getSubscriptionHeight :: forall {k} {x :: k}. EventSubscription x -> IO Height
 getSubscriptionHeight = readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed
 
-coincidenceUncached :: forall x a. (HasSpiderTimeline x, Defer (MergeUpdate x) (EventM x)) => Event x (Event x a) -> Event x a
+coincidenceUncached :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
 coincidenceUncached coincidenceParent = Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight
   let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
@@ -305,9 +282,10 @@ coincidenceUncached coincidenceParent = Event $ \sub -> do
                                     (subscription, mocc) <- subscribeAndRead e subscriber
                                     innerHeight <- liftIO $ getSubscriptionHeight subscription
                                     currentHeight <- liftIO $ readIORef heightRef
-                                    defer $ MergeUpdate @x (pure [subscription])
+                                    addToQueue (MergeUpdate @x (pure [subscription])
                                             (invalidateHeight heightRef sub)
-                                            (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
+                                            (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
+                                      =<< asksEventEnv eventEnvMergeUpdates
                                     when (innerHeight > currentHeight) $ liftIO $ do 
                                       writeIORef heightRef innerHeight
                                       subscriberInvalidateHeight sub currentHeight
@@ -331,7 +309,7 @@ switchUncached switchParent = Event $ \sub -> do
   -- withB is like "fold over Behavior updates"
   let withB :: forall s b. s -> Behavior x b -> (s -> b -> EventM x s) -> EventM x s
       withB currentState b f = mfix $ \newState -> do
-       let ownInvalidator = runEventM @x $ defer $ Clear $ do
+       let ownInvalidator = runEventM @x $ deferClear $ do
                     putStrLn "Running inits inside switch"
                     -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
                     unSpiderHost . justRunInits $ void $ withB newState b f
@@ -347,9 +325,11 @@ switchUncached switchParent = Event $ \sub -> do
         liftIO unsubscribePrevious
         (subscription, occ) <- subscribeAndRead e subscriber
         liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
-        pure (runEventM @x $ defer $ MergeUpdate @x (pure [subscription])
+        pure (runEventM @x $ addToQueue
+              (MergeUpdate @x (pure [subscription])
                         (invalidateHeight heightRef sub)
-                        (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
+                        (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
+               =<< asksEventEnv eventEnvMergeUpdates
              , occ)
   returnSubscription (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef)) heightRef
             ownInvalidatorRef
@@ -366,7 +346,7 @@ run roots after = do
         writeIORef occRef $! DMap.insert k a occBefore
         return occBefore
       if DMap.null occBefore
-        then do defer $ Clear $ writeIORef occRef $! DMap.empty
+        then do deferClear $ writeIORef occRef $! DMap.empty
                 return $ Just r
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
@@ -628,9 +608,10 @@ mergeUncached' m = Event $ \sub -> do
         liftIO recalculateMyHeight
         pure $ do
           liftIO $ modifyIORef subscriptionsRef (IntMap.delete i)
-          defer $ MergeUpdate @x (pure [subscription])
-            (invalidateHeight heightRef sub)
-            (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
+          addToQueue (MergeUpdate @x (pure [subscription])
+                  (invalidateHeight heightRef sub)
+                  (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
+            =<< asksEventEnv eventEnvMergeUpdates
   retain <- m mergeSubscribeAndRead
   occ <- runMaybeT $ do
        -- TODO: this is the same logic as in 'scheduleMerge''
@@ -807,7 +788,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   sample b = fixmeUnifySample (R.sample b) --TODO: Specialize sample to the Nothing and Just cases
 
 fixmeUnifySample :: HasSpiderTimeline x => BehaviorM x b -> EventM x b
-fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< getDeferralQueue
+fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< asksEventEnv eventEnvInits
 
 unsafeBuildIncremental :: forall x p. (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
 unsafeBuildIncremental readV0 v' =
@@ -854,16 +835,21 @@ data PullSubscribed x a
                     , pullSubscribedOwnInvalidator :: !Invalidator
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
+
+
+deferInit :: forall x. HasSpiderTimeline x => EventM x () -> EventM x ()
+deferInit i = addToQueue (SomeInit i) =<< asksEventEnv eventEnvInits
+
 {-# NOINLINE buildIncremental #-}
 -- Note: cannot examine its event until after the phase is over
-buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p, Defer (SomeInit x) m)
-  => EventM x (PatchTarget p) -> Event x p -> m (R.Incremental (SpiderTimeline x) p)
+buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p)
+  => EventM x (PatchTarget p) -> Event x p -> EventM x (R.Incremental (SpiderTimeline x) p)
 buildIncremental readV0 v' = do
   invsRef <- liftIO $ newIORef [] -- invalidators
   parentRef <- liftIO $ newIORef Nothing
   let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
        valRef <- liftIO . newIORef =<< readV0
-       defer $ SomeInit $ do
+       deferInit $ do
          maybeParent <- liftIO $ readIORef parentRef
          when (isNothing maybeParent) $ do
                liftIO . writeIORef parentRef . Just
@@ -872,13 +858,13 @@ buildIncremental readV0 v' = do
                                          forM_ (apply a v) $ \v'1 -> do
                                            vRef <- pure $! valRef
                                            iRef <- pure $! invsRef
-                                           defer $ SomeAssignment @x vRef iRef v'1)
+                                           addToQueue (SomeAssignment @x vRef iRef v'1) =<< asksEventEnv eventEnvAssignments)
                  $ Subscriber { subscriberPropagate = const (pure ())
                               , subscriberInvalidateHeight = \_ -> return ()
                               , subscriberRecalculateHeight = \_ -> return ()
                               }
        pure valRef
-  defer $ SomeInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
+  deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
   pure $ Incremental
     { incrementalCurrent = Behavior $ do
                   addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
@@ -901,7 +887,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# INLINABLE now #-}
   now = do
     nowOrNot <- liftIO $ newIORef $ Just ()
-    defer $ Clear $ writeIORef nowOrNot Nothing
+    deferClear $ writeIORef nowOrNot Nothing
     return . Event $ \_ -> do
       occ <- liftIO . readIORef $ nowOrNot
       returnSubscription (pure ()) zeroRef () occ
@@ -1073,7 +1059,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                                             invalidate invsRef)
                       wi <- liftIO $ mkWeakPtrWithDebug i
                       parentsRef <- liftIO $ newIORef []
-                      !holdInits <- getDeferralQueue -- ask behavior hold inits
+                      !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
                       aVal <- liftIO $ runReaderIO (unBehaviorM a) (BehaviorEnv (Just (wi, parentsRef)) holdInits)
                       parents <- liftIO $ readIORef parentsRef
                       let subscribed = PullSubscribed
