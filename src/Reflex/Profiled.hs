@@ -149,14 +149,11 @@ instance Reflex t => Reflex (ProfiledTimeline t) where
   switchUncached (Behavior_Profiled b) = coerce $ profileEvent $ switchUncached (coerceBehavior b)
   coincidenceUncached (Event_Profiled e) = coerce $ profileEvent $ coincidenceUncached (coerceEvent e)
   unsafeBuildIncremental (ProfiledM a0) (Event_Profiled a') = unsafeCoerce $ unsafeBuildIncremental a0 a'
-  mergeIncrementalGUncached nt res = Event_Profiled $ mergeIncrementalGUncached (unsafeCoerce nt) (unsafeCoerce res)
-  mergeIncrementalWithMoveGUncached nt res = Event_Profiled $ mergeIncrementalWithMoveGUncached (unsafeCoerce nt) (unsafeCoerce res)
+  mergeListUncached = Event_Profiled . mergeListUncached . fmap unEvent_Profiled
   behaviorCoercion c =
     Coercion `trans` behaviorCoercion @t c `trans` Coercion
   eventCoercion c =
     Coercion `trans` eventCoercion @t c `trans` Coercion
-  mergeIntIncrementalUncached = Event_Profiled . mergeIntIncrementalUncached .
-    unsafeCoerce -- FIXME: coerceWith (Coercion `trans` incrementalCoercion Coercion Coercion `trans` Coercion)
   fanInt (Event_Profiled e) = coerce $ fanInt $ profileEvent e
 
 instance MonadHold t m => MonadHold (ProfiledTimeline t) (ProfiledM m) where

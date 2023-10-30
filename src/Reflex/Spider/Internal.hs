@@ -45,10 +45,8 @@ module Reflex.Spider.Internal
 import Control.Monad hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Identity hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Ref
-import qualified Control.Monad.Fail as MonadFail
 import Data.Foldable hiding (concat, elem, sequence_)
 import Data.Maybe hiding (mapMaybe)
-import Witherable (mapMaybe)
 import GHC.Exts hiding (toList)
 import Data.Type.Coercion
 import qualified Reflex.Class
@@ -66,8 +64,6 @@ import Control.Monad.ReaderIO
 import Data.Dependent.Map (DMap)
 import qualified Data.Dependent.Map as DMap
 import Data.Dependent.Sum (DSum (..))
-import Data.Functor.Constant
-import Data.Functor.Misc
 import Data.GADT.Compare
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -84,18 +80,9 @@ import Data.Some (Some(Some))
 import Data.WeakBag (WeakBag)
 import qualified Data.WeakBag as WeakBag
 import Data.Patch
-import qualified Data.Patch.DMap as PatchDMap
-import qualified Data.Patch.DMapWithMove as PatchDMapWithMove
 import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
 import Data.Bool (bool)
-
-type Behavior (x :: Type) a = R.Behavior (SpiderTimeline x) a
-type Event (x :: Type) a = R.Event (SpiderTimeline x) a
-type Incremental x p = R.Incremental (SpiderTimeline x) p
-
-whenM :: Monad m => m Bool -> m () -> m ()
-whenM mcond m = mcond >>= flip when m
 
 --NB: Once you subscribe to an Event, you must always hold on the the WHOLE EventSubscription you get back
 -- If you do not retain the subscription, you may be prematurely unsubscribed from the parent event.
@@ -110,14 +97,14 @@ data Subscriber x a = Subscriber
   , subscriberRecalculateHeight :: !(Height -> IO ())
   }
 
-subscribe :: Event x a -> Subscriber x a -> EventM x (EventSubscription x)
+subscribe :: R.Event (SpiderTimeline x) a -> Subscriber x a -> EventM x (EventSubscription x)
 subscribe e s = fst <$> subscribeAndRead e s
 
 returnSubscription :: Monad m => IO () -> IORef Height -> a -> b -> m (EventSubscription x, b)
 returnSubscription cleanup heightRef retained occ =
   return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
 
-subscribeWith :: HasSpiderTimeline x => Event x a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
+subscribeWith :: HasSpiderTimeline x => R.Event (SpiderTimeline x) a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
 subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 
 -- | Propagate everything at the current height
@@ -152,14 +139,11 @@ globalSpiderTimelineEnv = unsafePerformIO unsafeNewSpiderTimelineEnv
 newtype SpiderTimelineEnv (x :: Type) = STE {unSTE :: SpiderTimelineEnv' x}
 -- We implement SpiderTimelineEnv with a newtype wrapper so
 -- we can get the coercions we want safely.
-type role SpiderTimelineEnv nominal
 
 data SpiderTimelineEnv' x = SpiderTimelineEnv
   { _spiderTimeline_lock :: {-# UNPACK #-} !(MVar ())
   , _spiderTimeline_eventEnv :: {-# UNPACK #-} !(EventEnv x)
   }
-
--- type role SpiderTimelineEnv' nominal
 
 instance Eq (SpiderTimelineEnv x) where
   _ == _ = True -- Since only one exists of each type
@@ -191,11 +175,14 @@ class HasSpiderTimeline x where
 instance HasSpiderTimeline Global where
   spiderTimeline = globalSpiderTimelineEnv
 
-deferClear :: forall (x :: Type). HasSpiderTimeline x => IO () -> EventM x ()
+deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 
+deferMergeUpdate :: HasSpiderTimeline x => EventM x [EventSubscription x] -> IO () -> IO () -> EventM x ()
+deferMergeUpdate update invHeight recalcHeight = addToQueue (MergeUpdate update invHeight recalcHeight) =<< asksEventEnv eventEnvMergeUpdates
+
 {-# INLINE writeAndScheduleClear #-}
-writeAndScheduleClear :: forall (x :: Type) a. HasSpiderTimeline x => IORef (Maybe a) -> a -> EventM x ()
+writeAndScheduleClear :: forall x a. HasSpiderTimeline x => IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
   deferClear $ writeIORef ref Nothing
@@ -281,118 +268,6 @@ instance Show EventLoopException where
 {-# NOINLINE zeroRef #-}
 zeroRef :: IORef Height
 zeroRef = unsafePerformIO $ newIORef zeroHeight
-
-mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
-  => ( TellE x (DMap k v)
-       -> patch k q
-       -> DMap k (Constant (EventM x ()))
-       -> EventM x (DMap k (Constant (EventM x ()))))
-  -> (forall a. q a -> Event x (v a))
-  -> Incremental x (patch k q)
-  -> Event x (DMap k v)
-mergeG' doPatch nt =
-  mergeUncached
-  (\tellE ipt -> DMap.traverseWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ipt)
-  doPatch
-
-type TellE x a = Event x a -> EventM x (EventM x ())
-
-
-{-# INLINE mergeUncached #-}
--- | Generic merge function.
-mergeUncached :: forall x ip ipt o s.
-  ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o)
-  => (TellE x o -> ipt -> EventM x s)
-  -> (TellE x o -> ip -> s -> EventM x s)
-  -> Incremental x ip -- p is the type of DMap Patch (i.e. With/Without Move)
-  -> Event x o
-mergeUncached doInitialInput doPatchInput i = withTellEvent $ \tellE -> do
-  initialState <- doInitialInput tellE =<< R.sample (R.currentIncremental i)
-  mfix $ \stateB -> R.hold initialState
-                              . R.pushAlwaysCheap (\ip -> do
-                                                s <- R.sample stateB
-                                                doPatchInput tellE ip s)
-                           $ R.updatedIncremental i
-
--- TODO: merge scheduling used to check this; useful for debugging but needs special casing so I left it out:
--- case height `compare` currentHeight of
---   LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-{-# INLINE withTellEvent #-}
-withTellEvent :: forall x o b.
-  ( HasSpiderTimeline x, Monoid o)
-  => (TellE x o -> EventM x b)
-  -> Event x o
-withTellEvent m = Event $ \sub -> do
-  heightRef <- liftIO $ newIORef zeroHeight
-  subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
-  subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
-  accumRef :: IORef o <- liftIO $ newIORef mempty
-  anEventFiredRef <- liftIO $ newIORef False
-  let recalculateMyHeight = do
-        currentHeight <- readIORef heightRef
-        -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
-        -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-        when (currentHeight == invalidHeight) $ do
-          maybeNewHeight <- do
-            subs <- mapM (readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed) . IntMap.elems =<< readIORef subscriptionsRef
-            -- TODO: succHeight is not needed for coincidence/switch
-            pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
-          when (maybeNewHeight /= invalidHeight) $ do
-            writeIORef heightRef $! maybeNewHeight
-            subscriberRecalculateHeight sub maybeNewHeight
-  let seenAllEvents = do
-        height <- liftIO $ readIORef heightRef
-        algorithmHeightRef <- asksEventEnv eventEnvCurrentHeight
-        currentHeight <- liftIO $ readIORef algorithmHeightRef
-        pure (height <= currentHeight)
-  let scheduleMerge height subscribed = do
-        delayedRef <- asksEventEnv eventEnvDelayedMerges
-        liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) (unHeight height) [subscribed]
-  let mergeSubscribeAndRead :: Event x o -> EventM x (EventM x ())
-      mergeSubscribeAndRead e = do
-        (subscription, _) <- subscribeAndRead
-          (R.pushCheap (\a -> do
-               didAnEventFire <- liftIO $ atomicModifyIORef anEventFiredRef (True,)
-               liftIO $ modifyIORef accumRef (a <>) -- maps are left-biased generally but there shouldn't be dup'd keys anyway
-               liftIO $ do height <- readIORef heightRef
-                           when (height == invalidHeight) $
-                             throwIO EventLoopException
-               unless didAnEventFire $ do -- Only schedule the firing once
-                 let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
-                       seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
-                           initPhaseDidntReturnOcc <- liftIO (readIORef anEventFiredRef)
-                           when initPhaseDidntReturnOcc $ do
-                           -- Once we're done with this, we can clear it immediately, because if there's a cacheEvent in front of us,
-                           -- it'll handle subsequent subscribers, and if not, we won't get subsequent subscribers
-                             liftIO $ writeIORef anEventFiredRef False
-                             subscriberPropagate sub =<< liftIO (atomicModifyIORef accumRef (mempty,)))
-                 scheduleMerge' <=< liftIO $ readIORef heightRef
-               pure (Just ()))
-           e)
-          (Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) (const recalculateMyHeight))
-        i <- liftIO $ atomicModifyIORef subscriptionsCtr (\i -> (succ i, i))
-        liftIO $ modifyIORef subscriptionsRef (IntMap.insert i subscription)
-        liftIO $ writeIORef heightRef invalidHeight
-        liftIO recalculateMyHeight
-        pure $ do
-          liftIO $ modifyIORef subscriptionsRef (IntMap.delete i)
-          addToQueue (MergeUpdate @x (pure [subscription])
-                  (invalidateHeight heightRef sub)
-                  (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
-            =<< asksEventEnv eventEnvMergeUpdates
-  retain <- m mergeSubscribeAndRead
-  occ <- runMaybeT $ do
-       -- TODO: this is the same logic as in 'scheduleMerge''
-       guard =<< lift seenAllEvents
-       guard =<< liftIO (readIORef anEventFiredRef)
-       liftIO $ writeIORef anEventFiredRef False
-       liftIO $ atomicModifyIORef accumRef (mempty,)
-  returnSubscription
-    (mapM_ unsubscribe =<< readIORef subscriptionsRef)
-    heightRef
-    (subscriptionsRef, retain) -- TODO: without 'retain' GC-semantics tests fail, but how can it be automated?
-    occ
-
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
@@ -497,7 +372,7 @@ data SpiderEventHandle x a = SpiderEventHandle
   }
 
 -- | The monad for actions that manipulate a Spider timeline identified by @x@
-newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, MonadFix, MonadIO, MonadException, MonadAsyncException)
+newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
 
 instance Monad (SpiderHost x) where
   {-# INLINABLE (>>=) #-}
@@ -509,7 +384,7 @@ data NewFanSubscribedChildren x a = NewFanSubscribedChildren
   }
 
 -- TODO: anything in common with Fan?
-newFanEventWithTriggerIO :: forall (x :: Type) k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
+newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
 newFanEventWithTriggerIO f = do
   occRef <- newIORef DMap.empty
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
@@ -542,8 +417,7 @@ newFanEventWithTriggerIO f = do
       =<< readIORef occRef
 
 -- | Designates the default, global Spider timeline
-data SpiderTimeline x
-type role SpiderTimeline nominal
+data SpiderTimeline (x :: Type)
 
 -- | The default, global Spider environment
 type Spider = SpiderTimeline Global
@@ -571,8 +445,6 @@ data BehaviorSubscribed x a
    | BehaviorSubscribedPull (PullSubscribed x a)
 
 newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscribed x))
-
--- type role PullSubscribed representational nominal
 
 type Invalidator = IO ()
 
@@ -602,7 +474,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# NOINLINE buildIncremental #-}
   -- Note: cannot examine its event until after the phase is over
   buildIncremental :: forall p. (Patch p)
-    => EventM x (PatchTarget p) -> Event x p -> EventM x (R.Incremental (SpiderTimeline x) p)
+    => EventM x (PatchTarget p) -> R.Event (SpiderTimeline x) p -> EventM x (R.Incremental (SpiderTimeline x) p)
   buildIncremental readV0 v' = do
     invsRef <- liftIO $ newIORef [] -- invalidators
     parentRef <- liftIO $ newIORef Nothing
@@ -708,6 +580,7 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexHost (SpiderTimelin
   fireEventsAndRead es (Reflex.Spider.Internal.ReadPhase a) = run es a
   runHostFrame = runFrame . runSpiderHostFrame
 
+
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
   newtype Behavior (SpiderTimeline x) a = Behavior { readBehaviorTracked :: BehaviorM x a }
@@ -720,19 +593,19 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   --there's only one subscriber, and then build our own FastWeakBag only when a second
   --subscriber joins
   {-# NOINLINE [0] cacheEvent #-}
-  cacheEvent :: forall a. Event x a -> Event x a
+  cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
     subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
     parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
     occRef :: IORef (Maybe a) <- newIORef Nothing
     pure $ Event $ \sub -> do
-      whenM (liftIO (WeakBag.null subscribers)) $
+      liftIO (WeakBag.null subscribers) >>= flip when (
         liftIO . writeIORef parentSubscriptionRef
         <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
             { subscriberPropagate = flip propagate subscribers
             , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . flip subscriberInvalidateHeight
             , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
-            }
+            })
       parentSub <- liftIO $ readIORef parentSubscriptionRef
       sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
       returnSubscription (WeakBag.remove sln >> touch sln)
@@ -784,12 +657,12 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     liftIO $ writeNewWeakInvalidator (pure ())
     ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
     -- withB is like "fold over Behavior updates"
-    let withB :: forall s b. s -> Behavior x b -> (s -> b -> EventM x s) -> EventM x s
+    let withB :: forall s b. s -> R.Behavior (SpiderTimeline x) b -> (s -> b -> EventM x s) -> EventM x s
         withB currentState b f = mfix $ \newState -> do
          let ownInvalidator = runEventM @x $ deferClear $ do
-                      putStrLn "Running inits inside switch"
-                      -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
-                      unSpiderHost . justRunInits $ void $ withB newState b f
+               putStrLn "Running inits inside switch"
+               -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
+               unSpiderHost . justRunInits $ void $ withB newState b f
          liftIO $ writeIORef ownInvalidatorRef ownInvalidator
          liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
          liftIO $ writeNewWeakInvalidator ownInvalidator
@@ -802,15 +675,16 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           liftIO unsubscribePrevious
           (subscription, occ) <- subscribeAndRead e subscriber
           liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
-          pure (runEventM @x $ addToQueue
-                (MergeUpdate @x (pure [subscription])
+          pure (runEventM @x $ deferMergeUpdate
+                          (pure [subscription])
                           (invalidateHeight heightRef sub)
-                          (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
-                 =<< asksEventEnv eventEnvMergeUpdates
+                          (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
                , occ)
-    returnSubscription (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef)) heightRef
-              ownInvalidatorRef
-              parentOcc
+    returnSubscription
+      (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef))
+      heightRef
+      ownInvalidatorRef
+      parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef zeroHeight
     let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
@@ -819,10 +693,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                                       (subscription, mocc) <- subscribeAndRead e subscriber
                                       innerHeight <- liftIO $ getSubscriptionHeight subscription
                                       currentHeight <- liftIO $ readIORef heightRef
-                                      addToQueue (MergeUpdate @x (pure [subscription])
+                                      deferMergeUpdate (pure [subscription])
                                               (invalidateHeight heightRef sub)
-                                              (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
-                                        =<< asksEventEnv eventEnvMergeUpdates
+                                              (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
                                       when (innerHeight > currentHeight) $ liftIO $ do 
                                         writeIORef heightRef innerHeight
                                         subscriberInvalidateHeight sub currentHeight
@@ -837,39 +710,52 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     unsafePerformIO . runEventM @x $ R.buildIncremental (fixmeUnifySample readV0) v'
     -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild):
     -- SpiderIncremental $ Dynamic (Behavior readV0) v'
-  mergeIncrementalGUncached  nt =
-    mergeG'
-    (\tellE ip s -> do
-       ip' <- traversePatchDMapWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v))
-              ip
-       mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
-       pure $ applyAlways ip' s)
-    nt
-  mergeIncrementalWithMoveGUncached nt =
-    mergeG'
-    (\tellE ip s -> do
-       ip' <- traversePatchDMapWithMoveWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ip
-       sequence_ $ mapMaybe (\(_ :=> v) -> getConstant v)
-            $ DMap.toList
-            $ DMap.intersectionWithKey
-              (\_ to (Constant unsub) ->
-                  Constant $ case getComposeMaybe to of
-                    Nothing -> -- We are deleting/replacing
-                      Just unsub
-                    Just _toKey -> do -- We are moving
-                      Nothing)
-              (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
-              s
-       pure $ applyAlways ip' s)
-    nt
-  mergeIntIncrementalUncached =
-    mergeUncached
-    (\tellE ipt -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
-    (\tellE (PatchIntMap ip) s -> do
-       ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
-       sequence_ $ IntMap.intersection s ip
-       pure $ applyAlways (PatchIntMap ip') s)
-   . coerce
+  mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
+  mergeListUncached es = Event $ \sub -> do
+    heightRef <- liftIO $ newIORef zeroHeight
+    accumRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
+    subscriptionsRef <- liftIO $ newIORef []
+    let getMaybeHeight = do
+          subs <- mapM (readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed) =<< readIORef subscriptionsRef
+          pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
+    let recalculateMyHeight = do
+          currentHeight <- readIORef heightRef
+          when (currentHeight == invalidHeight) $ do
+            maybeNewHeight <- getMaybeHeight
+            when (maybeNewHeight /= invalidHeight) $ do
+              writeIORef heightRef $! maybeNewHeight
+              subscriberRecalculateHeight sub maybeNewHeight
+    let seenAllEvents = (<=) <$> liftIO (readIORef heightRef) <*> (liftIO . readIORef =<< asksEventEnv eventEnvCurrentHeight)
+    let scheduleMerge height subscribed = do
+          delayedRef <- asksEventEnv eventEnvDelayedMerges
+          liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) (unHeight height) [subscribed]
+    let mergeSubscribeAndRead :: R.Event (SpiderTimeline x) a -> EventM x (EventSubscription x)
+        mergeSubscribeAndRead e = do
+          (subscription, _) <- subscribeAndRead
+            (R.pushCheap (\a -> do
+                 maybePrevAccumVal <- liftIO $ readIORef accumRef
+                 liftIO $ writeIORef accumRef (Just a <> maybePrevAccumVal)
+                 liftIO $ do height <- readIORef heightRef
+                             when (height == invalidHeight) $
+                               throwIO EventLoopException
+                 when (isNothing maybePrevAccumVal) $ do -- Only schedule the firing once
+                   let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
+                         seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
+                             maybeCurrentAccumVal <- liftIO $ readIORef accumRef
+                             when (isJust maybeCurrentAccumVal) $ do
+                               mapM_ (subscriberPropagate sub) maybeCurrentAccumVal
+                               liftIO $ writeIORef accumRef Nothing)
+                   scheduleMerge' <=< liftIO $ readIORef heightRef
+                 pure (Just ()))
+             e)
+            (Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) (const recalculateMyHeight))
+          pure subscription
+    liftIO . writeIORef subscriptionsRef =<< mapM mergeSubscribeAndRead es
+    liftIO $ writeIORef heightRef =<< getMaybeHeight
+    occ <- runMaybeT $ do
+      guard =<< lift seenAllEvents
+      liftIO $ atomicModifyIORef accumRef (Nothing,)
+    returnSubscription (mapM_ unsubscribe =<< readIORef subscriptionsRef) heightRef subscriptionsRef (join occ)
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
 
@@ -885,10 +771,6 @@ instance MonadRef (EventM x) where
 instance MonadAtomicRef (EventM x) where
   {-# INLINABLE atomicModifyRef #-}
   atomicModifyRef r f = liftIO $ atomicModifyRef r f
-
-instance MonadFail (SpiderHost x) where
-  {-# INLINABLE fail #-}
-  fail s = SpiderHost $ MonadFail.fail s
 
 -- | Run an action affecting the global Spider timeline; this will be guarded by
 -- a mutex for that timeline
@@ -907,11 +789,7 @@ instance Monad (SpiderHostFrame x) where
   {-# INLINABLE (>>=) #-}
   SpiderHostFrame x >>= f = SpiderHostFrame $ x >>= runSpiderHostFrame . f
 
-instance NotReady (SpiderTimeline x) (SpiderHostFrame x) where
-  notReadyUntil _ = pure ()
-  notReady = pure ()
-
-newEventWithTriggerIO :: forall x a. (RootTrigger x a -> IO (IO ())) -> IO (Event x a)
+newEventWithTriggerIO :: forall (x :: Type) a. (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
 newEventWithTriggerIO f = do
   es <- newFanEventWithTriggerIO $ \Refl -> f
   return $ R.select es Refl
@@ -939,10 +817,6 @@ instance MonadAtomicRef (SpiderHostFrame x) where
 instance PrimMonad (SpiderHostFrame x) where
   type PrimState (SpiderHostFrame x) = PrimState IO
   primitive = SpiderHostFrame . EventM . primitive
-
-instance NotReady (SpiderTimeline x) (SpiderHost x) where
-  notReadyUntil _ = return ()
-  notReady = return ()
 
 instance HasSpiderTimeline x => NotReady (SpiderTimeline x) (PerformEventT (SpiderTimeline x) (SpiderHost x)) where
   notReadyUntil _ = return ()

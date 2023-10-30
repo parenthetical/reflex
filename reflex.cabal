@@ -221,7 +221,8 @@ test-suite semantics
     ref-tf,
     reflex,
     split,
-    transformers
+    transformers,
+    patch
   other-modules:
     Reflex.Bench.Focused
     Reflex.Plan.Pure

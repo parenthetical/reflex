@@ -289,22 +289,25 @@ class ( MonadHold t (PushM t)
   -- occurrence type
   eventCoercion :: Coercion a b -> Coercion (Event t a) (Event t b)
   mergeListUncached :: (Semigroup a) => [Event t a] -> Event t a
-  -- | Create a merge whose parents can change over time
-  mergeIncrementalGUncached :: GCompare k
-    => (forall a. q a -> Event t (v a))
-    -> Incremental t (PatchDMap k q)
-    -> Event t (DMap k v)
-  -- | Experimental: Create a merge whose parents can change over time; changing the key of an Event is more efficient than with mergeIncremental
-  mergeIncrementalGUncached f =
-    switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
-  mergeIncrementalWithMoveGUncached :: GCompare k
-    => (forall a. q a -> Event t (v a))
-    -> Incremental t (PatchDMapWithMove k q) -> Event t (DMap k v)
-  mergeIncrementalWithMoveGUncached f =
-    switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
-  mergeIntIncrementalUncached :: Incremental t (PatchIntMap (Event t a)) -> Event t (IntMap a)
-  mergeIntIncrementalUncached =
-    switch . fmap (mergeListUncached . fmap ((\(k,e) -> IntMap.singleton k <$> e)) . IntMap.toList) . current . incrementalToDynamic
+
+-- | Create a merge whose parents can change over time
+mergeIncrementalGUncached :: (GCompare k, Reflex t)
+  => (forall a. q a -> Event t (v a))
+  -> Incremental t (PatchDMap k q)
+  -> Event t (DMap k v)
+-- | Experimental: Create a merge whose parents can change over time; changing the key of an Event is more efficient than with mergeIncremental
+mergeIncrementalGUncached f =
+  switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
+
+mergeIncrementalWithMoveGUncached :: (GCompare k, Reflex t)
+  => (forall a. q a -> Event t (v a))
+  -> Incremental t (PatchDMapWithMove k q) -> Event t (DMap k v)
+mergeIncrementalWithMoveGUncached f =
+  switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
+
+mergeIntIncrementalUncached :: (Reflex t) => Incremental t (PatchIntMap (Event t a)) -> Event t (IntMap a)
+mergeIntIncrementalUncached =
+  switch . fmap (mergeListUncached . fmap ((\(k,e) -> IntMap.singleton k <$> e)) . IntMap.toList) . current . incrementalToDynamic
 
 mergeDMapViaList :: (Reflex t, GCompare k)
   => DMap k (Compose (Event t) q)
