@@ -44,6 +44,8 @@ import Data.Type.Coercion
 import Reflex.Class
 import Data.Kind (Type)
 import Control.Monad.Trans.Maybe
+import qualified Data.List.NonEmpty as NonEmpty
+import Data.Semigroup (sconcat)
 
 -- | A completely pure-functional 'Reflex' timeline, identifying moments in time
 -- with the type @/t/@.
@@ -95,11 +97,9 @@ instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
   -- warning because the GCompare instance is not used; however, removing the
   -- GCompare instance produces a different warning, due to that constraint
   -- being present in the original class definition.
-
-  mergeIncrementalGUncached = mergeIncrementalImpl
-  mergeIncrementalWithMoveGUncached = mergeIncrementalImpl
-  mergeIntIncrementalUncached = mergeIntIncrementalImpl
-
+  mergeListUncached es = Event $ \t ->
+    fmap sconcat . NonEmpty.nonEmpty . mapMaybe (($ t) . unEvent) $ es
+  
 mergeIncrementalImpl :: (PatchTarget p ~ DMap k q, GCompare k)
   => (forall a. q a -> Event (Pure t) (v a))
   -> Incremental (Pure t) p -> Event (Pure t) (DMap k v)

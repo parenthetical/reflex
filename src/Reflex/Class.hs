@@ -288,16 +288,29 @@ class ( MonadHold t (PushM t)
   -- | Construct a 'Coercion' for an 'Event' given an 'Coercion' for its
   -- occurrence type
   eventCoercion :: Coercion a b -> Coercion (Event t a) (Event t b)
+  mergeListUncached :: (Semigroup a) => [Event t a] -> Event t a
   -- | Create a merge whose parents can change over time
   mergeIncrementalGUncached :: GCompare k
     => (forall a. q a -> Event t (v a))
     -> Incremental t (PatchDMap k q)
     -> Event t (DMap k v)
   -- | Experimental: Create a merge whose parents can change over time; changing the key of an Event is more efficient than with mergeIncremental
+  mergeIncrementalGUncached f =
+    switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
   mergeIncrementalWithMoveGUncached :: GCompare k
     => (forall a. q a -> Event t (v a))
     -> Incremental t (PatchDMapWithMove k q) -> Event t (DMap k v)
+  mergeIncrementalWithMoveGUncached f =
+    switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
   mergeIntIncrementalUncached :: Incremental t (PatchIntMap (Event t a)) -> Event t (IntMap a)
+  mergeIntIncrementalUncached =
+    switch . fmap (mergeListUncached . fmap ((\(k,e) -> IntMap.singleton k <$> e)) . IntMap.toList) . current . incrementalToDynamic
+
+mergeDMapViaList :: (Reflex t, GCompare k)
+  => DMap k (Compose (Event t) q)
+  -> Event t (DMap k q)
+mergeDMapViaList dm =
+  mergeListUncached . fmap (\(k :=> (Compose e)) -> DMap.singleton k <$> e) $ DMap.toList dm
 
 -- -- | Construct a 'Coercion' for a 'Dynamic' given an 'Coercion' for its
 -- -- occurrence type
@@ -719,10 +732,6 @@ instance (Reflex t, IsString a) => IsString (Behavior t a) where
 instance Reflex t => Monad (Behavior t) where
   a >>= f = pull $ sample a >>= sample . f
   -- Note: it is tempting to write (_ >> b = b); however, this would result in (fail x >> return y) succeeding (returning y), which violates the law that (a >> b = a >>= \_ -> b), since the implementation of (>>=) above actually will fail.  Since we can't examine 'Behavior's other than by using sample, I don't think it's possible to write (>>) to be more efficient than the (>>=) above.
-  return = constant
-#if !MIN_VERSION_base(4,13,0)
-  fail = error "Monad (Behavior t) does not support fail"
-#endif
 
 instance (Reflex t, Monoid a) => Monoid (Behavior t a) where
   mempty = constant mempty
