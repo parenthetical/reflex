@@ -13,6 +13,7 @@
 #ifdef USE_REFLEX_OPTIMIZER
 {-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
 #endif
+{-# LANGUAGE StandaloneDeriving #-}
 module Reflex.PostBuild.Base
   ( PostBuildT (..)
   , runPostBuildT
@@ -58,6 +59,8 @@ newtype PostBuildT t m a = PostBuildT { unPostBuildT :: ReaderT (Event t ()) m a
     , MonadMask
     , MonadThrow
     , MonadCatch
+    , MonadSample t
+    , MonadHold t
     )
 
 -- | Run a 'PostBuildT' action.  An 'Event' should be provided that fires
@@ -82,24 +85,6 @@ instance PrimMonad m => PrimMonad (PostBuildT x m) where
 instance (Reflex t, Monad m) => PostBuild t (PostBuildT t m) where
   {-# INLINABLE getPostBuild #-}
   getPostBuild = PostBuildT ask
-
-instance MonadSample t m => MonadSample t (PostBuildT t m) where
-  {-# INLINABLE sample #-}
-  sample = lift . sample
-
-instance MonadHold t m => MonadHold t (PostBuildT t m) where
-  {-# INLINABLE hold #-}
-  hold v0 = lift . hold v0
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 = lift . holdDyn v0
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 = lift . holdIncremental v0
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic a0 = lift . buildDynamic a0
-  {-# INLINABLE headE #-}
-  headE = lift . headE
-  {-# INLINABLE now #-}
-  now = lift now
 
 instance PerformEvent t m => PerformEvent t (PostBuildT t m) where
   type Performable (PostBuildT t m) = Performable m

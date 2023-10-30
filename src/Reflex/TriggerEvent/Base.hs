@@ -42,7 +42,8 @@ newtype EventTriggerRef t a = EventTriggerRef { unEventTriggerRef :: IORef (Mayb
 
 -- | A basic implementation of 'TriggerEvent'.
 newtype TriggerEventT t m a = TriggerEventT { unTriggerEventT :: ReaderT (Chan [DSum (EventTriggerRef t) TriggerInvocation]) m a }
-  deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
+  deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask
+           , MonadSample t, MonadHold t)
 
 -- | Run a 'TriggerEventT' action.  The argument should be a 'Chan' into which
 -- 'TriggerInvocation's can be passed; it is expected that some other thread
@@ -108,24 +109,6 @@ instance MonadRef m => MonadRef (TriggerEventT t m) where
 instance MonadAtomicRef m => MonadAtomicRef (TriggerEventT t m) where
   {-# INLINABLE atomicModifyRef #-}
   atomicModifyRef r = lift . atomicModifyRef r
-
-instance MonadSample t m => MonadSample t (TriggerEventT t m) where
-  {-# INLINABLE sample #-}
-  sample = lift . sample
-
-instance MonadHold t m => MonadHold t (TriggerEventT t m) where
-  {-# INLINABLE hold #-}
-  hold v0 v' = lift $ hold v0 v'
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 v' = lift $ holdDyn v0 v'
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 v' = lift $ holdIncremental v0 v'
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic a0 = lift . buildDynamic a0
-  {-# INLINABLE headE #-}
-  headE = lift . headE
-  {-# INLINABLE now #-}
-  now = lift now
 
 instance Adjustable t m => Adjustable t (TriggerEventT t m) where
   {-# INLINABLE runWithReplace #-}

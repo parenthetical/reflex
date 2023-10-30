@@ -68,6 +68,8 @@ deriving instance (ReflexHost t, S.Semigroup a) => S.Semigroup (PerformEventT t 
 deriving instance (ReflexHost t, MonadCatch (HostFrame t)) => MonadCatch (PerformEventT t m)
 deriving instance (ReflexHost t, MonadThrow (HostFrame t)) => MonadThrow (PerformEventT t m)
 deriving instance (ReflexHost t, MonadMask (HostFrame t)) => MonadMask (PerformEventT t m)
+deriving instance ReflexHost t => MonadSample t (PerformEventT t m)
+deriving instance (ReflexHost t, MonadHold t m) => MonadHold t (PerformEventT t m)
 
 instance (PrimMonad (HostFrame t), ReflexHost t) => PrimMonad (PerformEventT t m) where
   type PrimState (PerformEventT t m) = PrimState (HostFrame t)
@@ -153,24 +155,6 @@ hostPerformEventT a = do
                     Nothing -> []
               (result':) <$> go followupEventTriggers
     go triggers
-
-instance ReflexHost t => MonadSample t (PerformEventT t m) where
-  {-# INLINABLE sample #-}
-  sample = PerformEventT . lift . sample
-
-instance (ReflexHost t, MonadHold t m) => MonadHold t (PerformEventT t m) where
-  {-# INLINABLE hold #-}
-  hold v0 v' = PerformEventT $ lift $ hold v0 v'
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 v' = PerformEventT $ lift $ holdDyn v0 v'
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 v' = PerformEventT $ lift $ holdIncremental v0 v'
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 v' = PerformEventT $ lift $ buildDynamic getV0 v'
-  {-# INLINABLE headE #-}
-  headE = PerformEventT . lift . headE
-  {-# INLINABLE now #-}
-  now = PerformEventT . lift $ now
 
 instance (MonadRef (HostFrame t), ReflexHost t) => MonadRef (PerformEventT t m) where
   type Ref (PerformEventT t m) = Ref (HostFrame t)

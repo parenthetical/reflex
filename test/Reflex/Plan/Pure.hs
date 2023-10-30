@@ -36,11 +36,7 @@ liftPlan :: TimeM a -> PurePlan a
 liftPlan = PurePlan . lift
 
 instance MonadHold (Pure Int) PurePlan where
-  hold initial  = liftPlan . hold initial
-  holdDyn initial = liftPlan . holdDyn initial
-  holdIncremental initial = liftPlan . holdIncremental initial
-  buildDynamic getInitial = liftPlan . buildDynamic getInitial
-  headE = liftPlan . headE
+  buildIncremental getInitial = liftPlan . buildIncremental getInitial
   now = liftPlan now
 
 instance MonadSample (Pure Int) PurePlan where
@@ -65,9 +61,3 @@ testBehavior (b, occs) = IntMap.fromSet (sample b) (relevantTimes occs)
 
 testEvent :: (Event (Pure Int) a, IntSet) -> IntMap (Maybe a)
 testEvent (Event readEvent, occs) = IntMap.fromSet readEvent (relevantTimes occs)
-
-
-
-
-
-

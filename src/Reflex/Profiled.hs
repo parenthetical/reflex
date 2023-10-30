@@ -59,6 +59,7 @@ import Reflex.Requester.Class
 import Reflex.TriggerEvent.Class
 
 import System.IO.Unsafe
+import Unsafe.Coerce (unsafeCoerce)
 
 data ProfiledTimeline t
 
@@ -138,53 +139,30 @@ profileEvent e = unsafePerformIO $ do
 instance Reflex t => Reflex (ProfiledTimeline t) where
   newtype Behavior (ProfiledTimeline t) a = Behavior_Profiled { unBehavior_Profiled :: Behavior t a }
   newtype Event (ProfiledTimeline t) a = Event_Profiled { unEvent_Profiled :: Event t a }
-  newtype Dynamic (ProfiledTimeline t) a = Dynamic_Profiled { unDynamic_Profiled :: Dynamic t a }
-  newtype Incremental (ProfiledTimeline t) p = Incremental_Profiled { unIncremental_Profiled :: Incremental t p }
   type PushM (ProfiledTimeline t) = ProfiledM (PushM t)
   type PullM (ProfiledTimeline t) = ProfiledM (PullM t)
   never = Event_Profiled never
-  constant = Behavior_Profiled . constant
-  push f (Event_Profiled e) = coerce $ push (coerce f) $ profileEvent e -- Profile before rather than after; this way fanout won't count against us
+  cacheEvent (Event_Profiled e) = Event_Profiled (cacheEvent e)
   pushCheap f (Event_Profiled e) = coerce $ pushCheap (coerce f) $ profileEvent e
   pull = Behavior_Profiled . pull . coerce
   fanG (Event_Profiled e) = EventSelectorG $ coerce $ selectG (fanG $ profileEvent e)
-  mergeG :: forall z (k :: z -> Type) q v. GCompare k
-    => (forall a. q a -> Event (ProfiledTimeline t) (v a))
-    -> DMap k q -> Event (ProfiledTimeline t) (DMap k v)
-  mergeG nt = Event_Profiled #. mergeG (coerce nt)
-  switch (Behavior_Profiled b) = coerce $ profileEvent $ switch (coerceBehavior b)
-  coincidence (Event_Profiled e) = coerce $ profileEvent $ coincidence (coerceEvent e)
-  current (Dynamic_Profiled d) = coerce $ current d
-  updated (Dynamic_Profiled d) = coerce $ profileEvent $ updated d
-  unsafeBuildDynamic (ProfiledM a0) (Event_Profiled a') = coerce $ unsafeBuildDynamic a0 a'
-  unsafeBuildIncremental (ProfiledM a0) (Event_Profiled a') = coerce $ unsafeBuildIncremental a0 a'
-  mergeIncrementalG nt res = Event_Profiled $ mergeIncrementalG (coerce nt) (coerce res)
-  mergeIncrementalWithMoveG nt res = Event_Profiled $ mergeIncrementalWithMoveG (coerce nt) (coerce res)
-  currentIncremental (Incremental_Profiled i) = coerce $ currentIncremental i
-  updatedIncremental (Incremental_Profiled i) = coerce $ profileEvent $ updatedIncremental i
-  incrementalToDynamic (Incremental_Profiled i) = coerce $ incrementalToDynamic i
+  switchUncached (Behavior_Profiled b) = coerce $ profileEvent $ switchUncached (coerceBehavior b)
+  coincidenceUncached (Event_Profiled e) = coerce $ profileEvent $ coincidenceUncached (coerceEvent e)
+  unsafeBuildIncremental (ProfiledM a0) (Event_Profiled a') = unsafeCoerce $ unsafeBuildIncremental a0 a'
+  mergeIncrementalGUncached nt res = Event_Profiled $ mergeIncrementalGUncached (unsafeCoerce nt) (unsafeCoerce res)
+  mergeIncrementalWithMoveGUncached nt res = Event_Profiled $ mergeIncrementalWithMoveGUncached (unsafeCoerce nt) (unsafeCoerce res)
   behaviorCoercion c =
     Coercion `trans` behaviorCoercion @t c `trans` Coercion
   eventCoercion c =
     Coercion `trans` eventCoercion @t c `trans` Coercion
-  dynamicCoercion c =
-    Coercion `trans` dynamicCoercion @t c `trans` Coercion
-  incrementalCoercion c d =
-    Coercion `trans` incrementalCoercion @t c d `trans` Coercion
-  mergeIntIncremental = Event_Profiled . mergeIntIncremental .
-    coerceWith (Coercion `trans` incrementalCoercion Coercion Coercion `trans` Coercion)
+  mergeIntIncrementalUncached = Event_Profiled . mergeIntIncrementalUncached .
+    unsafeCoerce -- FIXME: coerceWith (Coercion `trans` incrementalCoercion Coercion Coercion `trans` Coercion)
   fanInt (Event_Profiled e) = coerce $ fanInt $ profileEvent e
 
-deriving instance Functor (Dynamic t) => Functor (Dynamic (ProfiledTimeline t))
-deriving instance Applicative (Dynamic t) => Applicative (Dynamic (ProfiledTimeline t))
-deriving instance Monad (Dynamic t) => Monad (Dynamic (ProfiledTimeline t))
-
 instance MonadHold t m => MonadHold (ProfiledTimeline t) (ProfiledM m) where
-  hold v0 (Event_Profiled v') = ProfiledM $ Behavior_Profiled <$> hold v0 v'
-  holdDyn v0 (Event_Profiled v') = ProfiledM $ Dynamic_Profiled <$> holdDyn v0 v'
-  holdIncremental v0 (Event_Profiled v') = ProfiledM $ Incremental_Profiled <$> holdIncremental v0 v'
-  buildDynamic (ProfiledM v0) (Event_Profiled v') = ProfiledM $ Dynamic_Profiled <$> buildDynamic v0 v'
-  headE (Event_Profiled e) = ProfiledM $ Event_Profiled <$> headE e
+  buildIncremental (ProfiledM v0) (Event_Profiled v') = ProfiledM $ do
+    (Incremental b e) <- buildIncremental v0 v'
+    pure $ Incremental (Behavior_Profiled b) (Event_Profiled e)
   now = ProfiledM $ Event_Profiled <$> now
 
 instance MonadSample t m => MonadSample (ProfiledTimeline t) (ProfiledM m) where
@@ -227,15 +205,15 @@ instance BehaviorWriter t w m => BehaviorWriter (ProfiledTimeline t) w (Profiled
   tellBehavior = lift . tellBehavior . coerce
 
 instance DynamicWriter t w m => DynamicWriter (ProfiledTimeline t) w (ProfiledM m) where
-  tellDyn = lift . tellDyn . coerce
+  tellDyn = lift . tellDyn . unsafeCoerce
 
 instance EventWriter t w m => EventWriter (ProfiledTimeline t) w (ProfiledM m) where
-  tellEvent = lift . tellEvent . coerce
+  tellEvent = lift . tellEvent . unsafeCoerce
 
 instance MonadQuery t q m => MonadQuery (ProfiledTimeline t) q (ProfiledM m) where
-  tellQueryIncremental = lift . tellQueryIncremental . coerce
-  askQueryResult = coerce <$> lift askQueryResult
-  queryIncremental = fmap coerce . lift . queryIncremental . coerce
+  tellQueryIncremental = lift . tellQueryIncremental . unsafeCoerce
+  askQueryResult = unsafeCoerce <$> lift askQueryResult
+  queryIncremental = fmap unsafeCoerce . lift . queryIncremental . unsafeCoerce
 
 instance Requester t m => Requester (ProfiledTimeline t) (ProfiledM m) where
   type Request (ProfiledM m) = Request m

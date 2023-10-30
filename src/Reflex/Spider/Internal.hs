@@ -24,8 +24,8 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
-{-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
 -- | This module is the implementation of the 'Spider' 'Reflex' engine.  It uses
 -- a graph traversal algorithm to propagate 'Event's and 'Behavior's.
 module Reflex.Spider.Internal
@@ -42,7 +42,6 @@ module Reflex.Spider.Internal
     newSpiderTimeline,
     withSpiderTimeline ) where
 
-import Control.Applicative (liftA2)
 import Control.Monad hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Identity hiding (forM, forM_, mapM, mapM_)
 import Control.Monad.Ref
@@ -52,7 +51,6 @@ import Data.Maybe hiding (mapMaybe)
 import Witherable (mapMaybe)
 import GHC.Exts hiding (toList)
 import Data.Type.Coercion
-import Data.Profunctor.Unsafe ((#.), (.#))
 import qualified Reflex.Class
 import qualified Reflex.Class as R
 import qualified Reflex.Host.Class
@@ -123,40 +121,6 @@ returnSubscription cleanup heightRef retained occ =
 subscribeWith :: HasSpiderTimeline x => Event x a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
 subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
 
-{-# RULES
-"cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
-"cacheEvent/pushCheap" forall f e. R.pushCheap f (cacheEvent e) = cacheEvent (R.pushCheap f e)
-"buildIncremental/cacheEvent" forall f e. buildIncremental f (cacheEvent e) = buildIncremental f e
-"cacheEvent/f/cacheEvent" forall f e. cacheEvent (f (cacheEvent e)) = cacheEvent (f e)
-#-}
-
--- | Construct an 'Event' whose value is guaranteed not to be recomputed
--- repeatedly
---
---TODO: Try a caching strategy where we subscribe directly to the parent when
---there's only one subscriber, and then build our own FastWeakBag only when a second
---subscriber joins
-{-# NOINLINE [0] cacheEvent #-}
-cacheEvent :: forall x a. (HasSpiderTimeline x) => Event x a -> Event x a
-cacheEvent e = unsafePerformIO $ do
-  subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
-  parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
-  occRef :: IORef (Maybe a) <- newIORef Nothing
-  pure $ Event $ \sub -> do
-    whenM (liftIO (WeakBag.null subscribers)) $
-      liftIO . writeIORef parentSubscriptionRef
-      <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
-          { subscriberPropagate = flip propagate subscribers
-          , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . flip subscriberInvalidateHeight
-          , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
-          }
-    parentSub <- liftIO $ readIORef parentSubscriptionRef
-    sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
-    returnSubscription (WeakBag.remove sln >> touch sln)
-                       (eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub)
-                       (sln, parentSubscriptionRef)
-                       <=< liftIO $ readIORef occRef
-
 -- | Propagate everything at the current height
 propagate :: forall x a. a -> WeakBag (Subscriber x a) -> EventM x ()
 propagate a subscribers =
@@ -176,9 +140,6 @@ data EventSubscribed x = EventSubscribed
   { eventSubscribedHeightRef :: {-# UNPACK #-} !(IORef Height)
   , _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
   }
-
-incrementalConst :: HasSpiderTimeline x => PatchTarget p -> R.Incremental (SpiderTimeline x) p
-incrementalConst !a = Incremental (R.constant a) R.never
 
 -- | A statically allocated 'SpiderTimeline'
 data Global
@@ -272,68 +233,6 @@ recalculateHeight heightRef sub maybeNewHeight = do
 
 getSubscriptionHeight :: forall {k} {x :: k}. EventSubscription x -> IO Height
 getSubscriptionHeight = readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed
-
-coincidenceUncached :: forall x a. (HasSpiderTimeline x) => Event x (Event x a) -> Event x a
-coincidenceUncached coincidenceParent = Event $ \sub -> do
-  heightRef <- liftIO $ newIORef zeroHeight
-  let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
-  (subscription, occ) <-
-    subscribeAndRead (R.pushCheap (\e -> do
-                                    (subscription, mocc) <- subscribeAndRead e subscriber
-                                    innerHeight <- liftIO $ getSubscriptionHeight subscription
-                                    currentHeight <- liftIO $ readIORef heightRef
-                                    addToQueue (MergeUpdate @x (pure [subscription])
-                                            (invalidateHeight heightRef sub)
-                                            (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
-                                      =<< asksEventEnv eventEnvMergeUpdates
-                                    when (innerHeight > currentHeight) $ liftIO $ do 
-                                      writeIORef heightRef innerHeight
-                                      subscriberInvalidateHeight sub currentHeight
-                                      subscriberRecalculateHeight sub innerHeight
-                                    pure mocc)
-                     coincidenceParent)
-    subscriber
-  liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
-  returnSubscription (unsubscribe subscription) heightRef subscription occ
-
-switchUncached :: forall x a. HasSpiderTimeline x => Behavior x (Event x a) -> Event x a
-switchUncached switchParent = Event $ \sub -> do
-  heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
-  ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
-  let writeNewWeakInvalidator i = do
-        wi <- mkWeakPtrWithDebug i
-        writeIORef ownWeakInvalidatorRef $! wi
-  liftIO $ writeNewWeakInvalidator (pure ())
-  ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
-  -- withB is like "fold over Behavior updates"
-  let withB :: forall s b. s -> Behavior x b -> (s -> b -> EventM x s) -> EventM x s
-      withB currentState b f = mfix $ \newState -> do
-       let ownInvalidator = runEventM @x $ deferClear $ do
-                    putStrLn "Running inits inside switch"
-                    -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
-                    unSpiderHost . justRunInits $ void $ withB newState b f
-       liftIO $ writeIORef ownInvalidatorRef ownInvalidator
-       liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
-       liftIO $ writeNewWeakInvalidator ownInvalidator
-       f currentState <=< liftIO $ do
-         wi <- readIORef ownWeakInvalidatorRef
-         initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
-         parentsRef <- newIORef []
-         runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
-  (unsubscribeSubscription :: IO (), parentOcc) <- withB (pure (), Nothing) switchParent $ \(unsubscribePrevious,_) e -> do
-        liftIO unsubscribePrevious
-        (subscription, occ) <- subscribeAndRead e subscriber
-        liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
-        pure (runEventM @x $ addToQueue
-              (MergeUpdate @x (pure [subscription])
-                        (invalidateHeight heightRef sub)
-                        (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
-               =<< asksEventEnv eventEnvMergeUpdates
-             , occ)
-  returnSubscription (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef)) heightRef
-            ownInvalidatorRef
-            parentOcc
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
@@ -475,16 +374,7 @@ newtype FanSubscribedChildren x k v a = FanSubscribedChildren
 
 newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
-mergeInt :: forall x a. (HasSpiderTimeline x) => Incremental x (PatchIntMap (Event x a)) -> Event x (IntMap a)
-mergeInt =
-  mergeUncached
-  (\tellE ipt -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
-  (\tellE (PatchIntMap ip) s -> do
-     ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
-     sequence_ $ IntMap.intersection s ip
-     pure $ applyAlways (PatchIntMap ip') s)
-
-mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q, Patch (patch k q))
+mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
   => ( TellE x (DMap k v)
        -> patch k q
        -> DMap k (Constant (EventM x ()))
@@ -497,49 +387,19 @@ mergeG' doPatch nt =
   (\tellE ipt -> DMap.traverseWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ipt)
   doPatch
 
-mergeGUncached :: forall k q x v. (HasSpiderTimeline x, GCompare k)
-  => (forall a. q a -> Event x (v a)) -> Incremental x (PatchDMap k q) -> Event x (DMap k v)
-mergeGUncached nt =
-  mergeG'
-  (\tellE ip s -> do
-     ip' <- traversePatchDMapWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v))
-            ip
-     mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
-     pure $ applyAlways ip' s)
-  nt
-
-
-mergeWithMoveUncached :: forall k x v q. (HasSpiderTimeline x, GCompare k)
-  => (forall a. q a -> Event x (v a)) -> Incremental x (PatchDMapWithMove k q) -> Event x (DMap k v)
-mergeWithMoveUncached nt =
-  mergeG'
-  (\tellE ip s -> do
-     ip' <- traversePatchDMapWithMoveWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ip
-     sequence_ $ mapMaybe (\(_ :=> v) -> getConstant v)
-          $ DMap.toList
-          $ DMap.intersectionWithKey
-            (\_ to (Constant unsub) ->
-                Constant $ case getComposeMaybe to of
-                  Nothing -> -- We are deleting/replacing
-                    Just unsub
-                  Just _toKey -> do -- We are moving
-                    Nothing)
-            (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
-            s
-     pure $ applyAlways ip' s)
-  nt
-
 type TellE x a = Event x a -> EventM x (EventM x ())
 
+
 {-# INLINE mergeUncached #-}
+-- | Generic merge function.
 mergeUncached :: forall x ip ipt o s.
-  ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o, Patch ip)
+  ( HasSpiderTimeline x, PatchTarget ip ~ ipt, Monoid o)
   => (TellE x o -> ipt -> EventM x s)
   -> (TellE x o -> ip -> s -> EventM x s)
   -> Incremental x ip -- p is the type of DMap Patch (i.e. With/Without Move)
   -> Event x o
-mergeUncached doInitialInput doPatchInput i = mergeUncached' $ \tellE -> do
-  initialState <- doInitialInput tellE =<< R.sample (incrementalCurrent i)
+mergeUncached doInitialInput doPatchInput i = withTellEvent $ \tellE -> do
+  initialState <- doInitialInput tellE =<< R.sample (R.currentIncremental i)
   mfix $ \stateB -> R.hold initialState
                               . R.pushAlwaysCheap (\ip -> do
                                                 s <- R.sample stateB
@@ -549,12 +409,12 @@ mergeUncached doInitialInput doPatchInput i = mergeUncached' $ \tellE -> do
 -- TODO: merge scheduling used to check this; useful for debugging but needs special casing so I left it out:
 -- case height `compare` currentHeight of
 --   LT -> error "Somehow a merge's height has been decreased after it was scheduled"
-{-# INLINE mergeUncached' #-}
-mergeUncached' :: forall x o b.
+{-# INLINE withTellEvent #-}
+withTellEvent :: forall x o b.
   ( HasSpiderTimeline x, Monoid o)
   => (TellE x o -> EventM x b)
   -> Event x o
-mergeUncached' m = Event $ \sub -> do
+withTellEvent m = Event $ \sub -> do
   heightRef <- liftIO $ newIORef zeroHeight
   subscriptionsCtr :: IORef Int <- liftIO $ newIORef 0
   subscriptionsRef :: IORef (IntMap (EventSubscription x)) <- liftIO $ newIORef IntMap.empty
@@ -655,7 +515,6 @@ justRunInits a = SpiderHost $ do
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
-
   let (EventEnv toAssignRef mergeUpdateRef initRef toClearRef heightRef delayedRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- unSpiderHost $ justRunInits a
@@ -790,14 +649,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
 fixmeUnifySample :: HasSpiderTimeline x => BehaviorM x b -> EventM x b
 fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< asksEventEnv eventEnvInits
 
-unsafeBuildIncremental :: forall x p. (HasSpiderTimeline x, Patch p) => BehaviorM x (PatchTarget p) -> Event x p -> R.Incremental (SpiderTimeline x) p
-unsafeBuildIncremental readV0 v' =
-  -- TODO: using buildIncremental is lazier than the original implementation (because of the double Init scheduling)
-  unsafePerformIO . runEventM @x $ buildIncremental (fixmeUnifySample readV0) v'
-  -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild):
-  -- SpiderIncremental $ Dynamic (Behavior readV0) v'
-
-
 data BehaviorEnv x = BehaviorEnv
   { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x])
   , behaviorEnvInitsRef :: IORef [SomeInit x]
@@ -836,54 +687,42 @@ data PullSubscribed x a
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
 
-
 deferInit :: forall x. HasSpiderTimeline x => EventM x () -> EventM x ()
 deferInit i = addToQueue (SomeInit i) =<< asksEventEnv eventEnvInits
 
-{-# NOINLINE buildIncremental #-}
--- Note: cannot examine its event until after the phase is over
-buildIncremental :: forall x p m. (HasSpiderTimeline x, Patch p)
-  => EventM x (PatchTarget p) -> Event x p -> EventM x (R.Incremental (SpiderTimeline x) p)
-buildIncremental readV0 v' = do
-  invsRef <- liftIO $ newIORef [] -- invalidators
-  parentRef <- liftIO $ newIORef Nothing
-  let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
-       valRef <- liftIO . newIORef =<< readV0
-       deferInit $ do
-         maybeParent <- liftIO $ readIORef parentRef
-         when (isNothing maybeParent) $ do
-               liftIO . writeIORef parentRef . Just
-                 <=< subscribeWith v' (\a -> do
-                                         v <- liftIO $ readIORef valRef
-                                         forM_ (apply a v) $ \v'1 -> do
-                                           vRef <- pure $! valRef
-                                           iRef <- pure $! invsRef
-                                           addToQueue (SomeAssignment @x vRef iRef v'1) =<< asksEventEnv eventEnvAssignments)
-                 $ Subscriber { subscriberPropagate = const (pure ())
-                              , subscriberInvalidateHeight = \_ -> return ()
-                              , subscriberRecalculateHeight = \_ -> return ()
-                              }
-       pure valRef
-  deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
-  pure $ Incremental
-    { incrementalCurrent = Behavior $ do
-                  addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
---                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
-                  liftIO $ readIORef forceLazyHoldReturnValRef
-    , incrementalPatches = v'
-    }
-
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
-  {-# INLINABLE hold #-}
-  hold v0 = fmap R.current . R.holdDyn v0
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 e = fmap SpiderDynamic . R.holdIncremental v0 $ coerce e
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 = buildIncremental (pure v0)
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic readV0 = fmap SpiderDynamic . buildIncremental readV0 . coerce
-  {-# INLINABLE headE #-}
-  headE = R.slowHeadE
+  {-# NOINLINE buildIncremental #-}
+  -- Note: cannot examine its event until after the phase is over
+  buildIncremental :: forall p. (Patch p)
+    => EventM x (PatchTarget p) -> Event x p -> EventM x (R.Incremental (SpiderTimeline x) p)
+  buildIncremental readV0 v' = do
+    invsRef <- liftIO $ newIORef [] -- invalidators
+    parentRef <- liftIO $ newIORef Nothing
+    let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
+         valRef <- liftIO . newIORef =<< readV0
+         deferInit $ do
+           maybeParent <- liftIO $ readIORef parentRef
+           when (isNothing maybeParent) $ do
+                 liftIO . writeIORef parentRef . Just
+                   <=< subscribeWith v' (\a -> do
+                                           v <- liftIO $ readIORef valRef
+                                           forM_ (apply a v) $ \v'1 -> do
+                                             vRef <- pure $! valRef
+                                             iRef <- pure $! invsRef
+                                             addToQueue (SomeAssignment @x vRef iRef v'1) =<< asksEventEnv eventEnvAssignments)
+                   $ Subscriber { subscriberPropagate = const (pure ())
+                                , subscriberInvalidateHeight = \_ -> return ()
+                                , subscriberRecalculateHeight = \_ -> return ()
+                                }
+         pure valRef
+    deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
+    pure $ R.Incremental
+      { R.currentIncremental = Behavior $ do
+                    addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
+  --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
+                    liftIO $ readIORef forceLazyHoldReturnValRef
+      , R.updatedIncremental = v'
+      }
   {-# INLINABLE now #-}
   now = do
     nowOrNot <- liftIO $ newIORef $ Just ()
@@ -898,61 +737,18 @@ instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   {-# INLINABLE sample #-}
   sample = readBehaviorTracked
 
--- TODO: why not define Monad etc. on Dynamic in Reflex.Class?
-instance HasSpiderTimeline x => Monad (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  {-# INLINE (>>=) #-}
-  x >>= f =
-    let d = fmap f x
-    in R.unsafeBuildDynamic (R.sample . R.current =<< R.sample (R.current d))
-       . R.leftmost
-       $ [ coincidenceUncached $ R.updated <$> R.updated d -- both
-         , R.pushAlwaysCheap (R.sample . R.current) $ R.updated d -- outer
-         , switchUncached $ R.updated <$> R.current d -- eInner
-         ]
-  {-# INLINE (>>) #-}
-  (>>) = (*>)
-
-instance HasSpiderTimeline x => Functor (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  {-# INLINE fmap #-}
-  fmap f d = R.unsafeBuildDynamic (fmap f $ R.sample $ R.current d) (f <$> R.updated d)
-  x <$ d = R.unsafeBuildDynamic (return x) $ x <$ R.updated d
-
-instance HasSpiderTimeline x => Applicative (Reflex.Class.Dynamic (SpiderTimeline x)) where
-  pure = SpiderDynamic . incrementalConst
-  liftA2 = R.zipDynWith
-  a <*> b = R.zipDynWith ($) a b
-  a *> b = R.unsafeBuildDynamic (R.sample $ R.current b) $ R.leftmost [R.updated b, R.tag (R.current b) $ R.updated a]
-  (<*) = flip (*>) -- There are no effects, so order doesn't matter
-
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE hold #-}
-  hold v0 e = runFrame . runSpiderHostFrame $ Reflex.Class.hold v0 e
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 e = runFrame . runSpiderHostFrame $ Reflex.Class.holdDyn v0 e
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 e = runFrame . runSpiderHostFrame $ Reflex.Class.holdIncremental v0 e
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildDynamic getV0 e
-  {-# INLINABLE headE #-}
-  headE e = runFrame . runSpiderHostFrame $ Reflex.Class.headE e
+  {-# INLINABLE buildIncremental #-}
+  buildIncremental getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildIncremental getV0 e
   {-# INLINABLE now #-}
   now = runFrame . runSpiderHostFrame $ Reflex.Class.now
-  
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHostFrame x) where
   sample = SpiderHostFrame . R.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHostFrame x) where
-  {-# INLINABLE hold #-}
-  hold v0 e = SpiderHostFrame $ R.hold v0 e
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 e = SpiderHostFrame $ R.holdDyn v0 e
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 e = SpiderHostFrame $ R.holdIncremental v0 e
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 e = SpiderHostFrame $ R.buildDynamic getV0 e
-  {-# INLINABLE headE #-}
-  headE = R.slowHeadE
+  {-# INLINABLE buildIncremental #-}
+  buildIncremental getV0 e = SpiderHostFrame $ R.buildIncremental getV0 e
   {-# INLINABLE now #-}
   now = SpiderHostFrame R.now
 
@@ -965,16 +761,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Ref
   sample = Reflex.Spider.Internal.ReadPhase . Reflex.Class.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  {-# INLINABLE hold #-}
-  hold v0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.hold v0 e
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.holdDyn v0 e
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.holdIncremental v0 e
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildDynamic getV0 e
-  {-# INLINABLE headE #-}
-  headE e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.headE e
+  buildIncremental getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildIncremental getV0 e
   {-# INLINABLE now #-}
   now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
 
@@ -1026,18 +813,33 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
   newtype Behavior (SpiderTimeline x) a = Behavior { readBehaviorTracked :: BehaviorM x a }
   newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe a) }
-  data Incremental (SpiderTimeline x) p = Incremental { incrementalCurrent :: !(Behavior x (PatchTarget p))
-                                                      , incrementalPatches :: Event x p -- This must be lazy; see the comment on buildIncremental
-                                                      }
-  newtype Dynamic (SpiderTimeline x) a = SpiderDynamic { unSpiderDynamic :: R.Incremental (SpiderTimeline x) (Identity a) } -- deriving (Functor, Applicative, Monad)
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
   {-# INLINABLE never #-}
   never = Event $ const $ returnSubscription (pure ()) zeroRef () Nothing
-  {-# INLINABLE constant #-}
-  constant = Behavior . pure
-  {-# INLINE push #-}
-  push f e = cacheEvent (R.pushCheap f e)
+  --TODO: Try a caching strategy where we subscribe directly to the parent when
+  --there's only one subscriber, and then build our own FastWeakBag only when a second
+  --subscriber joins
+  {-# NOINLINE [0] cacheEvent #-}
+  cacheEvent :: forall a. Event x a -> Event x a
+  cacheEvent e = unsafePerformIO $ do
+    subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
+    parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
+    occRef :: IORef (Maybe a) <- newIORef Nothing
+    pure $ Event $ \sub -> do
+      whenM (liftIO (WeakBag.null subscribers)) $
+        liftIO . writeIORef parentSubscriptionRef
+        <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
+            { subscriberPropagate = flip propagate subscribers
+            , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . flip subscriberInvalidateHeight
+            , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
+            }
+      parentSub <- liftIO $ readIORef parentSubscriptionRef
+      sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
+      returnSubscription (WeakBag.remove sln >> touch sln)
+                         (eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub)
+                         (sln, parentSubscriptionRef)
+                         <=< liftIO $ readIORef occRef
   {-# INLINE [1] pushCheap #-}
   pushCheap !f e = Event $ \sub -> do
     (subscription, occ) <- subscribeAndRead e $ sub
@@ -1075,42 +877,106 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       pure $ pullSubscribedValue subscribed
   {-# INLINABLE fanG #-}
   fanG = fanG
-  {-# INLINABLE mergeG #-}
-  mergeG nt = R.mergeIncrementalG nt . incrementalConst
-  {-# INLINABLE switch #-}
-  switch = cacheEvent . switchUncached
-  {-# INLINABLE coincidence #-}
-  coincidence = cacheEvent . coincidenceUncached
-  {-# INLINABLE current #-}
-  current = coerce #. incrementalCurrent .# unSpiderDynamic
-  {-# INLINABLE updated #-}
-  updated = coerce #. incrementalPatches .# unSpiderDynamic
-  {-# INLINABLE unsafeBuildDynamic #-}
-  unsafeBuildDynamic readV0 v' = SpiderDynamic $ R.unsafeBuildIncremental readV0 $ fmap Identity v'
-  {-# INLINABLE unsafeBuildIncremental #-}
-  unsafeBuildIncremental = unsafeBuildIncremental
-  {-# INLINABLE mergeIncrementalG #-}
-  mergeIncrementalG x = cacheEvent . mergeGUncached x
-  {-# INLINABLE mergeIncrementalWithMoveG #-}
-  mergeIncrementalWithMoveG x = cacheEvent . mergeWithMoveUncached x
-  {-# INLINABLE currentIncremental #-}
-  currentIncremental = incrementalCurrent
-  {-# INLINABLE updatedIncremental #-}
-  updatedIncremental = incrementalPatches
-  {-# INLINABLE incrementalToDynamic #-}
-  incrementalToDynamic i =
-    let currentI = R.currentIncremental i
-    in R.unsafeBuildDynamic (R.sample currentI)
-       $ R.push (\p -> fmap (apply p) (R.sample currentI)) --TODO: Avoid the redundant 'apply'
-       $ R.updatedIncremental i
-  eventCoercion Coercion = Coercion
-  behaviorCoercion Coercion = Coercion
-  dynamicCoercion = unsafeCoerce -- FIXME
-  incrementalCoercion Coercion = unsafeCoerce -- FIXME
-  {-# INLINABLE mergeIntIncremental #-}
-  mergeIntIncremental = cacheEvent . mergeInt . coerce
   {-# INLINABLE fanInt #-}
   fanInt e = R.EventSelectorInt $ selectInt (fanInt e)
+  switchUncached switchParent = Event $ \sub -> do
+    heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
+    ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+    let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
+    let writeNewWeakInvalidator i = do
+          wi <- mkWeakPtrWithDebug i
+          writeIORef ownWeakInvalidatorRef $! wi
+    liftIO $ writeNewWeakInvalidator (pure ())
+    ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
+    -- withB is like "fold over Behavior updates"
+    let withB :: forall s b. s -> Behavior x b -> (s -> b -> EventM x s) -> EventM x s
+        withB currentState b f = mfix $ \newState -> do
+         let ownInvalidator = runEventM @x $ deferClear $ do
+                      putStrLn "Running inits inside switch"
+                      -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to MergeUpdate it doesn't loop).
+                      unSpiderHost . justRunInits $ void $ withB newState b f
+         liftIO $ writeIORef ownInvalidatorRef ownInvalidator
+         liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
+         liftIO $ writeNewWeakInvalidator ownInvalidator
+         f currentState <=< liftIO $ do
+           wi <- readIORef ownWeakInvalidatorRef
+           initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
+           parentsRef <- newIORef []
+           runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
+    (unsubscribeSubscription :: IO (), parentOcc) <- withB (pure (), Nothing) switchParent $ \(unsubscribePrevious,_) e -> do
+          liftIO unsubscribePrevious
+          (subscription, occ) <- subscribeAndRead e subscriber
+          liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
+          pure (runEventM @x $ addToQueue
+                (MergeUpdate @x (pure [subscription])
+                          (invalidateHeight heightRef sub)
+                          (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
+                 =<< asksEventEnv eventEnvMergeUpdates
+               , occ)
+    returnSubscription (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef)) heightRef
+              ownInvalidatorRef
+              parentOcc
+  coincidenceUncached coincidenceParent = Event $ \sub -> do
+    heightRef <- liftIO $ newIORef zeroHeight
+    let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
+    (subscription, occ) <-
+      subscribeAndRead (R.pushCheap (\e -> do
+                                      (subscription, mocc) <- subscribeAndRead e subscriber
+                                      innerHeight <- liftIO $ getSubscriptionHeight subscription
+                                      currentHeight <- liftIO $ readIORef heightRef
+                                      addToQueue (MergeUpdate @x (pure [subscription])
+                                              (invalidateHeight heightRef sub)
+                                              (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription))
+                                        =<< asksEventEnv eventEnvMergeUpdates
+                                      when (innerHeight > currentHeight) $ liftIO $ do 
+                                        writeIORef heightRef innerHeight
+                                        subscriberInvalidateHeight sub currentHeight
+                                        subscriberRecalculateHeight sub innerHeight
+                                      pure mocc)
+                       coincidenceParent)
+      subscriber
+    liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
+    returnSubscription (unsubscribe subscription) heightRef subscription occ
+  unsafeBuildIncremental readV0 v' =
+    -- TODO: using buildIncremental is lazier than the original implementation (because of the double Init scheduling)
+    unsafePerformIO . runEventM @x $ R.buildIncremental (fixmeUnifySample readV0) v'
+    -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild):
+    -- SpiderIncremental $ Dynamic (Behavior readV0) v'
+  mergeIncrementalGUncached  nt =
+    mergeG'
+    (\tellE ip s -> do
+       ip' <- traversePatchDMapWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v))
+              ip
+       mapM_ (\(_ :=> v) -> getConstant v) . DMap.toList $ PatchDMap.getDeletions ip s
+       pure $ applyAlways ip' s)
+    nt
+  mergeIncrementalWithMoveGUncached nt =
+    mergeG'
+    (\tellE ip s -> do
+       ip' <- traversePatchDMapWithMoveWithKey (\k v -> Constant <$> tellE (DMap.singleton k <$> nt v)) ip
+       sequence_ $ mapMaybe (\(_ :=> v) -> getConstant v)
+            $ DMap.toList
+            $ DMap.intersectionWithKey
+              (\_ to (Constant unsub) ->
+                  Constant $ case getComposeMaybe to of
+                    Nothing -> -- We are deleting/replacing
+                      Just unsub
+                    Just _toKey -> do -- We are moving
+                      Nothing)
+              (DMap.map PatchDMapWithMove._nodeInfo_to . unPatchDMapWithMove $ ip')
+              s
+       pure $ applyAlways ip' s)
+    nt
+  mergeIntIncrementalUncached =
+    mergeUncached
+    (\tellE ipt -> IntMap.traverseWithKey (\k v -> tellE (IntMap.singleton k <$> v)) ipt)
+    (\tellE (PatchIntMap ip) s -> do
+       ip' <- IntMap.traverseWithKey (\k ->mapM (tellE . fmap (IntMap.singleton k))) ip
+       sequence_ $ IntMap.intersection s ip
+       pure $ applyAlways (PatchIntMap ip') s)
+   . coerce
+  eventCoercion Coercion = Coercion
+  behaviorCoercion Coercion = Coercion
 
 instance MonadRef (EventM x) where
   type Ref (EventM x) = Ref IO

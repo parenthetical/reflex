@@ -65,8 +65,6 @@ instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
 
   newtype Behavior (Pure t) a = Behavior { unBehavior :: t -> a }
   newtype Event (Pure t) a = Event { unEvent :: t -> Maybe a }
-  newtype Dynamic (Pure t) a = Dynamic { unDynamic :: t -> (a, Maybe a) }
-  newtype Incremental (Pure t) p = Incremental { unIncremental :: t -> (PatchTarget p, Maybe p) }
 
   type PushM (Pure t) = (->) t
   type PullM (Pure t) = (->) t
@@ -74,112 +72,49 @@ instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
   never :: Event (Pure t) a
   never = toEvent (pure Nothing)
 
-  constant :: a -> Behavior (Pure t) a
-  constant = pull . pure
-
-  push :: (a -> PushM (Pure t) (Maybe b)) -> Event (Pure t) a -> Event (Pure t) b
-  push f = toEvent . runMaybeT . (MaybeT . f <=< MaybeT . occurs)
-
   pushCheap :: (a -> PushM (Pure t) (Maybe b)) -> Event (Pure t) a -> Event (Pure t) b
-  pushCheap = push
+  pushCheap f = toEvent . runMaybeT . (MaybeT . f <=< MaybeT . occurs)
 
   pull :: PullM (Pure t) a -> Behavior (Pure t) a
   pull = Behavior . memo
-
+--  The instance signature doeesn't compile, leave commented for documentation
+--  fanG :: GCompare k => Event (Pure t) (DMap k v) -> EventSelectorG (Pure t) k v
+  fanG e = EventSelectorG $ \k -> Event $ unEvent e >=> DMap.lookup k
+  cacheEvent = id
+  switchUncached :: Behavior (Pure t) (Event (Pure t) a) -> Event (Pure t) a
+  switchUncached = toEvent . (occurs <=< sample)
+  coincidenceUncached :: Event (Pure t) (Event (Pure t) a) -> Event (Pure t) a
+  coincidenceUncached = push occurs
+  unsafeBuildIncremental readV = Incremental (pull readV)
+  behaviorCoercion Coercion = Coercion
+  eventCoercion Coercion = Coercion
+  -- dynamicCoercion Coercion = Coercion
+  -- incrementalCoercion Coercion Coercion = Coercion
+  fanInt e = EventSelectorInt $ \k -> Event $ unEvent e >=> IntMap.lookup k
   -- [UNUSED_CONSTRAINT]: The following type signature for merge will produce a
   -- warning because the GCompare instance is not used; however, removing the
   -- GCompare instance produces a different warning, due to that constraint
   -- being present in the original class definition.
 
-  --mergeG :: GCompare k => (forall a. q a -> Event (Pure t) (v a))
-  --   -> DMap k q -> Event (Pure t) (DMap k v)
-  mergeG nt events = Event $ memo $ \t ->
-    let currentOccurrences = DMap.mapMaybeWithKey (\_ q -> case nt q of Event a -> a t) events
-    in if DMap.null currentOccurrences
-       then Nothing
-       else Just currentOccurrences
-
---  The instance signature doeesn't compile, leave commented for documentation
---  fanG :: GCompare k => Event (Pure t) (DMap k v) -> EventSelectorG (Pure t) k v
-  fanG e = EventSelectorG $ \k -> Event $ \t -> unEvent e t >>= DMap.lookup k
-
-  switch :: Behavior (Pure t) (Event (Pure t) a) -> Event (Pure t) a
-  switch = toEvent . (occurs <=< sample)
-
-  coincidence :: Event (Pure t) (Event (Pure t) a) -> Event (Pure t) a
-  coincidence = push occurs
-
-  current :: Dynamic (Pure t) a -> Behavior (Pure t) a
-  current d = Behavior $ \t -> fst $ unDynamic d t
-
-  updated :: Dynamic (Pure t) a -> Event (Pure t) a
-  updated d = Event $ \t -> snd $ unDynamic d t
-
-  unsafeBuildDynamic :: PullM (Pure t) a -> Event (Pure t) a -> Dynamic (Pure t) a
-  unsafeBuildDynamic readV0 v' = Dynamic $ \t -> (readV0 t, unEvent v' t)
-
-  -- See UNUSED_CONSTRAINT, above.
-
-  --unsafeBuildIncremental :: Patch p => PullM (Pure t) a -> Event (Pure t) (p
-  --a) -> Incremental (Pure t) p a
-  unsafeBuildIncremental readV0 p = Incremental $ \t -> (readV0 t, unEvent p t)
-
-  mergeIncrementalG = mergeIncrementalImpl
-  mergeIncrementalWithMoveG = mergeIncrementalImpl
-
-  currentIncremental i = Behavior $ \t -> fst $ unIncremental i t
-
-  updatedIncremental i = Event $ \t -> snd $ unIncremental i t
-
-  incrementalToDynamic i = Dynamic $ \t ->
-    let (old, mPatch) = unIncremental i t
-        e = case mPatch of
-          Nothing -> Nothing
-          Just patch -> apply patch old
-    in (old, e)
-  behaviorCoercion Coercion = Coercion
-  eventCoercion Coercion = Coercion
-  dynamicCoercion Coercion = Coercion
-  incrementalCoercion Coercion Coercion = Coercion
-
-  fanInt e = EventSelectorInt $ \k -> Event $ \t -> unEvent e t >>= IntMap.lookup k
-
-  mergeIntIncremental = mergeIntIncrementalImpl
+  mergeIncrementalGUncached = mergeIncrementalImpl
+  mergeIncrementalWithMoveGUncached = mergeIncrementalImpl
+  mergeIntIncrementalUncached = mergeIntIncrementalImpl
 
 mergeIncrementalImpl :: (PatchTarget p ~ DMap k q, GCompare k)
   => (forall a. q a -> Event (Pure t) (v a))
   -> Incremental (Pure t) p -> Event (Pure t) (DMap k v)
 mergeIncrementalImpl nt i = Event $ \t ->
-  let results = DMap.mapMaybeWithKey (\_ q -> case nt q of Event e -> e t) $ fst $ unIncremental i t
+  let results = DMap.mapMaybeWithKey (\_ q -> case nt q of Event e -> e t) $ unBehavior (currentIncremental i) t
   in if DMap.null results
      then Nothing
      else Just results
 
 mergeIntIncrementalImpl :: (PatchTarget p ~ IntMap (Event (Pure t) a)) => Incremental (Pure t) p -> Event (Pure t) (IntMap a)
 mergeIntIncrementalImpl i = Event $ \t ->
-  let results = IntMap.mapMaybeWithKey (\_ (Event e) -> e t) $ fst $ unIncremental i t
+  let results = IntMap.mapMaybeWithKey (\_ (Event e) -> e t) $ unBehavior (currentIncremental i) t
   in if IntMap.null results
      then Nothing
      else Just results
-
-instance Functor (Dynamic (Pure t)) where
-  fmap f d = Dynamic $ \t -> let (cur, upd) = unDynamic d t
-                             in (f cur, fmap f upd)
-
-instance Applicative (Dynamic (Pure t)) where
-  pure a = Dynamic $ \_ -> (a, Nothing)
-  (<*>) = ap
-
-instance Monad (Dynamic (Pure t)) where
-  return = pure
-  (x :: Dynamic (Pure t) a) >>= (f :: a -> Dynamic (Pure t) b) = Dynamic $ \t ->
-    let (curX :: a, updX :: Maybe a) = unDynamic x t
-        (cur :: b, updOuter :: Maybe b) = unDynamic (f curX) t
-        (updInner :: Maybe b, updBoth :: Maybe b) = case updX of
-          Nothing -> (Nothing, Nothing)
-          Just nextX -> let (c, u) = unDynamic (f nextX) t
-                        in (Just c, u)
-    in (cur, getFirst $ mconcat $ map First [updBoth, updOuter, updInner])
 
 instance MonadSample (Pure t) ((->) t) where
 
@@ -187,41 +122,24 @@ instance MonadSample (Pure t) ((->) t) where
   sample = unBehavior
 
 instance (Enum t, HasTrie t, Ord t) => MonadHold (Pure t) ((->) t) where
-
-  hold :: a -> Event (Pure t) a -> t -> Behavior (Pure t) a
-  hold initialValue e initialTime = Behavior f
-    where f = memo $ \sampleTime ->
-            -- Really, the sampleTime should never be prior to the initialTime,
-            -- because that would mean the Behavior is being sampled before
-            -- being created.
-            if sampleTime <= initialTime
-            then initialValue
-            else let lastTime = pred sampleTime
-                 in fromMaybe (f lastTime) $ unEvent e lastTime
-
-  holdDyn v0 = buildDynamic (return v0)
-
-  buildDynamic :: (t -> a) -> Event (Pure t) a -> t -> Dynamic (Pure t) a
-  buildDynamic initialValue e initialTime =
-    let Behavior f = hold (initialValue initialTime) e initialTime
-    in Dynamic $ \t -> (f t, unEvent e t)
-
-  holdIncremental :: Patch p => PatchTarget p -> Event (Pure t) p -> t -> Incremental (Pure t) p
-  holdIncremental initialValue e initialTime = Incremental $ \t -> (f t, unEvent e t)
-    where f = memo $ \sampleTime ->
-            -- Really, the sampleTime should never be prior to the initialTime,
-            -- because that would mean the Behavior is being sampled before
-            -- being created.
-            if sampleTime <= initialTime
-            then initialValue
-            else let lastTime = pred sampleTime
-                     lastValue = f lastTime
-                 in case unEvent e lastTime of
-                   Nothing -> lastValue
-                   Just x -> fromMaybe lastValue $ apply x lastValue
-
-  headE = slowHeadE
+  buildIncremental getInitialValue e initialTime =
+    holdIncremental' (getInitialValue initialTime) e initialTime
   now t = Event $ guard . (t ==)
+
+holdIncremental' :: (Ord t, Enum t, HasTrie t, Patch p) => PatchTarget p -> Event (Pure t) p -> t -> Incremental (Pure t) p
+holdIncremental' initialValue e initialTime = Incremental (Behavior f) e
+  where f = memo $ \sampleTime ->
+          -- Really, the sampleTime should never be prior to the initialTime,
+          -- because that would mean the Behavior is being sampled before
+          -- being created.
+          if sampleTime <= initialTime
+          then initialValue
+          else let lastTime = pred sampleTime
+                   lastValue = f lastTime
+               in case unEvent e lastTime of
+                 Nothing -> lastValue
+                 Just x -> fromMaybe lastValue $ apply x lastValue
+
 
   
 

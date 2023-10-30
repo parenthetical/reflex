@@ -13,6 +13,7 @@
 #ifdef USE_REFLEX_OPTIMIZER
 {-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
 #endif
+{-# LANGUAGE StandaloneDeriving #-}
 module Reflex.EventWriter.Base
   ( EventWriterT (..)
   , runEventWriterT
@@ -136,19 +137,7 @@ instance (Reflex t, Monad m, Semigroup w) => EventWriter t w (EventWriterT t w m
 instance MonadSample t m => MonadSample t (EventWriterT t w m) where
   sample = lift . sample
 
-instance MonadHold t m => MonadHold t (EventWriterT t w m) where
-  {-# INLINABLE hold #-}
-  hold v0 = lift . hold v0
-  {-# INLINABLE holdDyn #-}
-  holdDyn v0 = lift . holdDyn v0
-  {-# INLINABLE holdIncremental #-}
-  holdIncremental v0 = lift . holdIncremental v0
-  {-# INLINABLE buildDynamic #-}
-  buildDynamic a0 = lift . buildDynamic a0
-  {-# INLINABLE headE #-}
-  headE = lift . headE
-  {-# INLINABLE now #-}
-  now = lift now
+deriving instance MonadHold t m => MonadHold t (EventWriterT t w m)
 
 instance (Reflex t, Adjustable t m, MonadHold t m, Semigroup w) => Adjustable t (EventWriterT t w m) where
   runWithReplace = runWithReplaceEventWriterTWith $ \dm0 dm' -> lift $ runWithReplace dm0 dm'
