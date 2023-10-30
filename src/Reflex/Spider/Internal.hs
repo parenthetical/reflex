@@ -68,7 +68,6 @@ import qualified Data.Dependent.Map as DMap
 import Data.Dependent.Sum (DSum (..))
 import Data.Functor.Constant
 import Data.Functor.Misc
-import Data.Functor.Product
 import Data.GADT.Compare
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
@@ -282,97 +281,6 @@ instance Show EventLoopException where
 {-# NOINLINE zeroRef #-}
 zeroRef :: IORef Height
 zeroRef = unsafePerformIO $ newIORef zeroHeight
-
-fanG :: forall x k v. (HasSpiderTimeline x, GCompare k) => Event x (DMap k v) -> R.EventSelectorG (SpiderTimeline x) k v
-fanG =
-  fan
-  (DMap.null :: (DMap k (FanSubscribedChildren x k v) -> Bool))
-  (\f subscribers -> forM_ (DMap.toList subscribers) $ \(_ :=> v) ->
-              WeakBag.traverse_ (_fanSubscribedChildren v) f)
-  (\f -> R.EventSelectorG $ \(!k) -> unsafeCoerce f
-    ( fmap _fanSubscribedChildren . DMap.lookup k
-    , DMap.lookup k
-    , DMap.insert k . FanSubscribedChildren
-    , DMap.delete k
-    , \a subs ->
-         void
-         $ DMap.traverseWithKey (\_ (Pair v subsubs) -> do
-                                          propagate @x v $ _fanSubscribedChildren subsubs
-                                          return $ Constant ())
-         $ DMap.intersectionWithKey @k (const Pair) a subs
-    ))
-
-fanInt :: HasSpiderTimeline x => Event x (IntMap a) -> EventSelectorInt x a
-fanInt =
-  fan
-  IntMap.null
-  (\f subscribers -> forM_ (IntMap.elems subscribers) $ \v -> WeakBag.traverse_ v f)
-  (\f -> EventSelectorInt $ \(!k) -> f
-     ( IntMap.lookup k
-     , IntMap.lookup k
-     , IntMap.insert k
-     , IntMap.delete k
-     , \a -> sequence_ . IntMap.intersectionWith propagate a
-     ))
-
-{-# INLINE fan #-}
-fan :: forall {a1} {x1} {a2} {a3}
-       {a5}.
-  (Monoid a1, HasSpiderTimeline x1) =>
-  (a1 -> Bool)
-  -> ((forall a. Subscriber x1 a -> IO ()) -> a1 -> IO ())
-  -> (((a1 -> Maybe (WeakBag (Subscriber x1 a2)),
-        a3 -> Maybe a2,
-        WeakBag (Subscriber x1 a2) -> a1 -> a1,
-        a1 -> a1,
-        a3 -> a1 -> EventM x1 ()) -> Event x1 a2)
-      -> a5)
-  -> Event x1 a3
-  -> a5
-fan isNull traverseWeakBags eventSelector e = unsafePerformIO $ do
-  -- TODO: no need for Maybe in parentSubscriptionRef? Can do things unsafely instead
-  -- This is the subscription which will update occRef:
-  subscribersRef <- newIORef mempty
-  parentSubscriptionRef <- newIORef $ error "fanG: no subscription"
-  occRef <- newIORef Nothing
-  pure $ eventSelector $ \(lookup,lookup2,insert,delete,doPropagation) -> Event $ \sub -> do
-    whenM (liftIO $ isNull <$> readIORef subscribersRef) $ do
-      -- Not initialized: subscribe to parent.
-      liftIO . writeIORef parentSubscriptionRef
-      <=< subscribeWith e (writeAndScheduleClear occRef)
-        $ Subscriber
-        { subscriberPropagate = \a -> doPropagation a <=< liftIO $ readIORef subscribersRef
-        , subscriberInvalidateHeight = \old ->
-            traverseWeakBags (`subscriberInvalidateHeight` old) =<< readIORef subscribersRef
-        , subscriberRecalculateHeight = \new ->
-            traverseWeakBags (`subscriberRecalculateHeight` new) =<< readIORef subscribersRef
-        }
-    sln <- liftIO $ do
-      subscribers <- readIORef subscribersRef
-      list <- flip fromMaybe (pure <$> lookup subscribers) $ do
-          -- No WeakBag of subscribers yet for this key:
-          list <- WeakBag.empty
-          writeIORef subscribersRef $! insert list subscribers
-          pure list
-      WeakBag.insert' sub list $ do -- called when the WeakBag for a key is empty:
-        reducedSubscribers <- delete <$> readIORef subscribersRef
-        writeIORef subscribersRef $! reducedSubscribers
-        -- When we don't have any subscribers, unsubscribe from e
-        when (isNull reducedSubscribers) $ do
-          unsubscribe =<< readIORef parentSubscriptionRef
-          writeIORef parentSubscriptionRef (error "fanG: parentSubscriptionRef emptied")
-    subscribedParent <- liftIO $ _eventSubscription_subscribed <$> readIORef parentSubscriptionRef
-    returnSubscription (WeakBag.remove sln >> touch sln)
-             (eventSubscribedHeightRef subscribedParent)
-             (sln, parentSubscriptionRef)
-       . (lookup2 =<<)
-       =<< liftIO (readIORef occRef)
-
-newtype FanSubscribedChildren x k v a = FanSubscribedChildren
-  { _fanSubscribedChildren :: WeakBag (Subscriber x (v a))
-  }
-
-newtype EventSelectorInt x a = EventSelectorInt { selectInt :: Int -> Event x a }
 
 mergeG' :: forall k q x v patch. (HasSpiderTimeline x, GCompare k, PatchTarget (patch k q) ~ DMap k q)
   => ( TellE x (DMap k v)
@@ -866,10 +774,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                     pure
       addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
       pure $ pullSubscribedValue subscribed
-  {-# INLINABLE fanG #-}
-  fanG = fanG
-  {-# INLINABLE fanInt #-}
-  fanInt e = R.EventSelectorInt $ selectInt (fanInt e)
   switchUncached switchParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
     ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"

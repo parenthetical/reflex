@@ -269,7 +269,9 @@ class ( MonadHold t (PushM t)
   -- result in a @let@-binding, and then repeatedly 'selectG' on the result to
   -- create child events
   fanG :: GCompare k => Event t (DMap k v) -> EventSelectorG t k v
+  fanG e = EventSelectorG $ \k -> mapMaybe (DMap.lookup k) e
   fanInt :: Event t (IntMap a) -> EventSelectorInt t a
+  fanInt e = EventSelectorInt $ \k -> mapMaybe (IntMap.lookup k) e
   -- | Create an 'Event' that will occur whenever the currently-selected input
   -- 'Event' occurs
   switchUncached :: Behavior t (Event t a) -> Event t a
