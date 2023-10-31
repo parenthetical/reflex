@@ -93,7 +93,7 @@ data EventSubscription x = EventSubscription
 
 data Subscriber x a = Subscriber
   { subscriberPropagate :: !(a -> EventM x ())
-  , subscriberInvalidateHeight :: !(Height -> IO ())
+  , subscriberInvalidateHeight :: !(IO ())
   , subscriberRecalculateHeight :: !(Height -> IO ())
   }
 
@@ -180,7 +180,7 @@ invalidateHeight heightRef sub =  do
     -- Don't do anything if the height is already invalid
     when (oldHeight /= invalidHeight) $ do
       writeIORef heightRef $! invalidHeight
-      subscriberInvalidateHeight sub oldHeight
+      subscriberInvalidateHeight sub
 
 recalculateHeight :: forall {k} {x :: k} {a}. IORef Height -> Subscriber x a -> Height -> IO ()
 recalculateHeight heightRef sub maybeNewHeight = do
@@ -377,7 +377,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                                              iRef <- pure $! invsRef
                                              addToQueue (SomeAssignment @x vRef iRef v'1) =<< asksEventEnv eventEnvAssignments)
                    $ Subscriber { subscriberPropagate = const (pure ())
-                                , subscriberInvalidateHeight = \_ -> return ()
+                                , subscriberInvalidateHeight = return ()
                                 , subscriberRecalculateHeight = \_ -> return ()
                                 }
          pure valRef
@@ -425,7 +425,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
         liftIO . writeIORef parentSubscriptionRef
         <=< subscribeWith e (writeAndScheduleClear occRef) $ Subscriber
             { subscriberPropagate = flip propagate subscribers
-            , subscriberInvalidateHeight = WeakBag.traverse_ subscribers . flip subscriberInvalidateHeight
+            , subscriberInvalidateHeight = WeakBag.traverse_ subscribers subscriberInvalidateHeight
             , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
             })
       parentSub <- liftIO $ readIORef parentSubscriptionRef
@@ -472,7 +472,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   switchUncached switchParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
     ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-    let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
+    let subscriber = Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
     let writeNewWeakInvalidator i = do
           wi <- mkWeakPtrWithDebug i
           writeIORef ownWeakInvalidatorRef $! wi
@@ -509,7 +509,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef zeroHeight
-    let subscriber = Subscriber (subscriberPropagate sub) (const (invalidateHeight heightRef sub)) (recalculateHeight heightRef sub)
+    let subscriber = Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
     (subscription, occ) <-
       subscribeAndRead (R.pushCheap (\e -> do
                                       (subscription, mocc) <- subscribeAndRead e subscriber
@@ -520,7 +520,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                                               (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
                                       when (innerHeight > currentHeight) $ liftIO $ do 
                                         writeIORef heightRef innerHeight
-                                        subscriberInvalidateHeight sub currentHeight
+                                        subscriberInvalidateHeight sub
                                         subscriberRecalculateHeight sub innerHeight
                                       pure mocc)
                        coincidenceParent)
@@ -542,8 +542,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
     let seenAllEvents = (<=) <$> liftIO (readIORef heightRef) <*> (liftIO . readIORef =<< asksEventEnv eventEnvCurrentHeight)
     delayedRef <- asksEventEnv eventEnvDelayedMerges
-    liftIO . writeIORef subscriptionsRef <=< forM es $ \e -> do
-      subscribeWith e (\a -> do
+    liftIO . writeIORef subscriptionsRef <=< forM es $ \e ->
+      subscribeWith e
+      (\a -> do
              maybePrevAccumVal <- liftIO $ readIORef accumRef
              liftIO $ writeIORef accumRef (Just a <> maybePrevAccumVal)
              liftIO $ do height <- readIORef heightRef
@@ -559,7 +560,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                              liftIO $ writeIORef accumRef Nothing)]
                scheduleMerge' <=< liftIO $ readIORef heightRef
              pure (Just ()))
-        $ Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) $ \_ -> do
+        $ Subscriber (const (pure ())) (invalidateHeight heightRef sub) $ \_ -> do
           currentHeight <- readIORef heightRef
           when (currentHeight == invalidHeight) $ do
             maybeNewHeight <- getMaybeHeight
@@ -699,7 +700,7 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
     valRef <- liftIO $ newIORef Nothing
     subscription <- fmap fst . subscribeAndRead e $ Subscriber
       { subscriberPropagate = writeAndScheduleClear valRef
-      , subscriberInvalidateHeight = \_ -> return ()
+      , subscriberInvalidateHeight = pure ()
       , subscriberRecalculateHeight = \_ -> return ()
       }
     return $ SpiderEventHandle
