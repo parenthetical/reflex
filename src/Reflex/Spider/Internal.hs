@@ -273,8 +273,8 @@ runFrame a = SpiderHost $ do
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- unSpiderHost $ justRunInits a
   readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
-                                                    writeIORef vRef v
-                                                    invalidate iRef)
+                                      writeIORef vRef v
+                                      invalidate iRef)
   readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
   mergeUpdates <- readIORef mergeUpdateRef
   do writeIORef toAssignRef []
