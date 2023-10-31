@@ -348,7 +348,6 @@ addParentBAndInvalidator h invsRef = do
 -- TODO: what is really needed here?
 data PullSubscribed x a
    = PullSubscribed { pullSubscribedValue :: !a
-                    , pullSubscribedInvalidators :: !(IORef [Weak Invalidator])
                     , pullSubscribedOwnInvalidator :: !Invalidator
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
@@ -460,7 +459,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       parents <- liftIO $ readIORef parentsRef
                       let subscribed = PullSubscribed
                             { pullSubscribedValue = aVal
-                            , pullSubscribedInvalidators = invsRef
                             , pullSubscribedOwnInvalidator = i
                             , pullSubscribedParents = parents
                             }
