@@ -97,15 +97,12 @@ data Subscriber x a = Subscriber
   , subscriberRecalculateHeight :: !(Height -> IO ())
   }
 
-subscribe :: R.Event (SpiderTimeline x) a -> Subscriber x a -> EventM x (EventSubscription x)
-subscribe e s = fst <$> subscribeAndRead e s
-
 returnSubscription :: Monad m => IO () -> IORef Height -> a -> b -> m (EventSubscription x, b)
 returnSubscription cleanup heightRef retained occ =
   return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
 
 subscribeWith :: HasSpiderTimeline x => R.Event (SpiderTimeline x) a -> (a -> EventM x b) -> Subscriber x a -> EventM x (EventSubscription x)
-subscribeWith e f = subscribe (R.pushCheap (\a -> f a >> pure (Just a)) e)
+subscribeWith e f = fmap fst . subscribeAndRead (R.pushCheap (\a -> f a >> pure (Just a)) e)
 
 -- | Propagate everything at the current height
 propagate :: forall x a. a -> WeakBag (Subscriber x a) -> EventM x ()
@@ -242,14 +239,7 @@ zeroRef = unsafePerformIO $ newIORef zeroHeight
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
-  wis <- readIORef wisRef
-  forM_ wis $ \wi -> do
-    mi <- deRefWeak wi
-    case mi of
-      Nothing -> pure () --TODO: Should we clean this up here?
-      Just i -> do
-        finalize wi -- Once something's invalidated, it doesn't need to hang around; this will change when some things are strict
-        i
+  mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< deRefWeak $ wi) =<< readIORef wisRef
   writeIORef wisRef []
 
 justRunInits :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
@@ -550,13 +540,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     let getMaybeHeight = do
           subs <- mapM (readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed) =<< readIORef subscriptionsRef
           pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
-    let recalculateMyHeight = do
-          currentHeight <- readIORef heightRef
-          when (currentHeight == invalidHeight) $ do
-            maybeNewHeight <- getMaybeHeight
-            when (maybeNewHeight /= invalidHeight) $ do
-              writeIORef heightRef $! maybeNewHeight
-              subscriberRecalculateHeight sub maybeNewHeight
     let seenAllEvents = (<=) <$> liftIO (readIORef heightRef) <*> (liftIO . readIORef =<< asksEventEnv eventEnvCurrentHeight)
     delayedRef <- asksEventEnv eventEnvDelayedMerges
     liftIO . writeIORef subscriptionsRef <=< forM es $ \e -> do
@@ -576,7 +559,13 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                              liftIO $ writeIORef accumRef Nothing)]
                scheduleMerge' <=< liftIO $ readIORef heightRef
              pure (Just ()))
-        (Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) (const recalculateMyHeight))
+        $ Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) $ \_ -> do
+          currentHeight <- readIORef heightRef
+          when (currentHeight == invalidHeight) $ do
+            maybeNewHeight <- getMaybeHeight
+            when (maybeNewHeight /= invalidHeight) $ do
+              writeIORef heightRef $! maybeNewHeight
+              subscriberRecalculateHeight sub maybeNewHeight
     liftIO $ writeIORef heightRef =<< getMaybeHeight
     occ <- runMaybeT $ do
       guard =<< lift seenAllEvents
@@ -708,7 +697,7 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
   subscribeEvent e = SpiderHostFrame $ do
     --TODO: Unsubscribe eventually (manually and/or with weak ref)
     valRef <- liftIO $ newIORef Nothing
-    subscription <- subscribe e $ Subscriber
+    subscription <- fmap fst . subscribeAndRead e $ Subscriber
       { subscriberPropagate = writeAndScheduleClear valRef
       , subscriberInvalidateHeight = \_ -> return ()
       , subscriberRecalculateHeight = \_ -> return ()
