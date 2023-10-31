@@ -127,13 +127,6 @@ data EventSubscribed x = EventSubscribed
   , _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
   }
 
--- | A statically allocated 'SpiderTimeline'
-data Global
-
-{-# NOINLINE globalSpiderTimelineEnv #-}
-globalSpiderTimelineEnv :: SpiderTimelineEnv Global
-globalSpiderTimelineEnv = unsafePerformIO unsafeNewSpiderTimelineEnv
-
 -- | Stores all global data relevant to a particular Spider timeline; only one
 -- value should exist for each type @x@
 newtype SpiderTimelineEnv (x :: Type) = STE {unSTE :: SpiderTimelineEnv' x}
@@ -144,14 +137,6 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
   { _spiderTimeline_lock :: {-# UNPACK #-} !(MVar ())
   , _spiderTimeline_eventEnv :: {-# UNPACK #-} !(EventEnv x)
   }
-
-instance Eq (SpiderTimelineEnv x) where
-  _ == _ = True -- Since only one exists of each type
-
-instance GEq SpiderTimelineEnv where
-  a `geq` b = if _spiderTimeline_lock (unSTE a) == _spiderTimeline_lock (unSTE b)
-              then Just $ unsafeCoerce Refl -- This unsafeCoerce is safe because the same SpiderTimelineEnv can't have two different 'x' arguments
-              else Nothing
 
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
@@ -167,13 +152,6 @@ asksEventEnv f = return $ f $ _spiderTimeline_eventEnv (unSTE (spiderTimeline ::
 
 addToQueue :: MonadIO m => a -> IORef [a] -> m ()
 addToQueue a q = liftIO $ modifyIORef' q (a:)
-
-class HasSpiderTimeline x where
-  -- | Retrieve the current SpiderTimelineEnv
-  spiderTimeline :: SpiderTimelineEnv x
-
-instance HasSpiderTimeline Global where
-  spiderTimeline = globalSpiderTimelineEnv
 
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
@@ -257,13 +235,6 @@ data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# U
 mkWeakPtrWithDebug :: a -> IO (Weak a)
 mkWeakPtrWithDebug x = mkWeakPtr x Nothing
 
-data EventLoopException = EventLoopException
-instance Exception EventLoopException
-
-instance Show EventLoopException where
-  show EventLoopException = "causality loop detected: \n" <>
-    "compile reflex with flag 'debug-cycles' and compile with profiling enabled for stack tree"
-
 -- Always refers to 0
 {-# NOINLINE zeroRef #-}
 zeroRef :: IORef Height
@@ -342,85 +313,10 @@ unsafeNewSpiderTimelineEnv = do
     , _spiderTimeline_eventEnv = env
     }
 
--- | Create a new SpiderTimelineEnv
-newSpiderTimeline :: IO (Some SpiderTimelineEnv)
-newSpiderTimeline = withSpiderTimeline (pure . Some)
-
-data LocalSpiderTimeline (x :: Type) s
-
-instance Reifies s (SpiderTimelineEnv x) =>
-         HasSpiderTimeline (LocalSpiderTimeline x s) where
-  spiderTimeline = localSpiderTimeline Proxy $ reflect (Proxy :: Proxy s)
-
-localSpiderTimeline
-  :: proxy s
-  -> SpiderTimelineEnv x
-  -> SpiderTimelineEnv (LocalSpiderTimeline x s)
-localSpiderTimeline _ = coerce
-
--- | Pass a new timeline to the given function.
-withSpiderTimeline :: forall r. (forall x. HasSpiderTimeline x => SpiderTimelineEnv x -> IO r) -> IO r
-withSpiderTimeline k = do
-  env <- unsafeNewSpiderTimelineEnv
-  reify env $ \s -> k $ localSpiderTimeline s env
-
-data RootTrigger x a = forall k. GCompare k => RootTrigger (WeakBag (Subscriber x a), IORef (DMap k Identity), k a)
-
-data SpiderEventHandle x a = SpiderEventHandle
-  { spiderEventHandleSubscription :: EventSubscription x
-  , spiderEventHandleValue :: IORef (Maybe a)
-  }
-
--- | The monad for actions that manipulate a Spider timeline identified by @x@
-newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
-
-instance Monad (SpiderHost x) where
-  {-# INLINABLE (>>=) #-}
-  SpiderHost x >>= f = SpiderHost $ x >>= unSpiderHost . f
-
 data NewFanSubscribedChildren x a = NewFanSubscribedChildren
   { _newFanSubscribedChildren :: WeakBag (Subscriber x a)
   , _newFanSubscribedUninit :: IO ()
   }
-
--- TODO: anything in common with Fan?
-newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
-newFanEventWithTriggerIO f = do
-  occRef <- newIORef DMap.empty
-  subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
-  return $ R.EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
-    (NewFanSubscribedChildren subscribers uninit) <- readIORef subscribedRef >>= (\case
-      Just res -> pure res
-      Nothing -> do
-        subscribers <- WeakBag.empty
-        uninit <- f k $ RootTrigger (subscribers, occRef, k)
-        let res = NewFanSubscribedChildren subscribers uninit
-        modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") k res
-        pure res) . DMap.lookup k
-    sln <- WeakBag.insert' sub subscribers $ do
-              uninit
-              modifyIORef' subscribedRef $ DMap.delete k
-    -- TODO: understand original intent of this comment:
-    -- If we die at the same moment that all our children die, they will
-    -- try to clean us up but will fail because their Weak reference to us
-    -- will also be dead.  So, if we are dying, check if there are any
-    -- children; since children don't bother cleaning themselves up if
-    -- their parents are already dead, I don't think there's a race
-    -- condition here.  However, if there are any children, then we can
-    -- infer that we need to clean ourselves up, so we do.
-    -- finalCleanup = do
-    --   cs <- readIORef $ _weakBag_children subs
-    --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
-     -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-    returnSubscription (WeakBag.remove sln >> touch sln) zeroRef subscribedRef
-      . coerce . DMap.lookup k
-      =<< readIORef occRef
-
--- | Designates the default, global Spider timeline
-data SpiderTimeline (x :: Type)
-
--- | The default, global Spider environment
-type Spider = SpiderTimeline Global
 
 -- INFO: You'll be executing this at an event occurrence time, so
 -- you're safe to use a simple pull-based read of the behavior?
@@ -498,9 +394,9 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ R.Incremental
       { R.currentIncremental = Behavior $ do
-                    addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
-  --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
-                    liftIO $ readIORef forceLazyHoldReturnValRef
+          addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
+          --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
+          liftIO $ readIORef forceLazyHoldReturnValRef
       , R.updatedIncremental = v'
       }
   {-# INLINABLE now #-}
@@ -516,70 +412,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   {-# INLINABLE sample #-}
   sample = readBehaviorTracked
-
-instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE buildIncremental #-}
-  buildIncremental getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildIncremental getV0 e
-  {-# INLINABLE now #-}
-  now = runFrame . runSpiderHostFrame $ Reflex.Class.now
-
-instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE sample #-}
-  sample = runFrame . R.sample
-
-instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  {-# INLINABLE sample #-}
-  sample = Reflex.Spider.Internal.ReadPhase . Reflex.Class.sample
-
-instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  buildIncremental getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildIncremental getV0 e
-  {-# INLINABLE now #-}
-  now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
-
-instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
-  {-# INLINABLE subscribeEvent #-}
-  subscribeEvent e = SpiderHostFrame $ do
-    --TODO: Unsubscribe eventually (manually and/or with weak ref)
-    valRef <- liftIO $ newIORef Nothing
-    subscription <- subscribe e $ Subscriber
-      { subscriberPropagate = writeAndScheduleClear valRef
-      , subscriberInvalidateHeight = \_ -> return ()
-      , subscriberRecalculateHeight = \_ -> return ()
-      }
-    return $ SpiderEventHandle
-      { spiderEventHandleSubscription = subscription
-      , spiderEventHandleValue = valRef
-      }
-
-instance HasSpiderTimeline x => Reflex.Host.Class.ReflexHost (SpiderTimeline x) where
-  type EventTrigger (SpiderTimeline x) = RootTrigger x
-  type EventHandle (SpiderTimeline x) = SpiderEventHandle x
-  type HostFrame (SpiderTimeline x) = SpiderHostFrame x
-
-instance HasSpiderTimeline x => Reflex.Host.Class.MonadReadEvent (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  {-# NOINLINE readEvent #-}
-  readEvent h = Reflex.Spider.Internal.ReadPhase $ fmap (fmap return) $ liftIO $ do
-    result <- readIORef $ spiderEventHandleValue h
-    touch h
-    return result
-
-instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHost x) where
-  newEventWithTrigger = SpiderHost . newEventWithTriggerIO
-  newFanEventWithTrigger f = SpiderHost $ newFanEventWithTriggerIO f
-
-instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHostFrame x) where
-  newEventWithTrigger = SpiderHostFrame . EventM . liftIO . newEventWithTriggerIO
-  newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ newFanEventWithTriggerIO f
-
-instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE subscribeEvent #-}
-  subscribeEvent = runFrame . runSpiderHostFrame . Reflex.Host.Class.subscribeEvent
-
-instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexHost (SpiderTimeline x) (SpiderHost x) where
-  type ReadPhase (SpiderHost x) = Reflex.Spider.Internal.ReadPhase x
-  fireEventsAndRead es (Reflex.Spider.Internal.ReadPhase a) = run es a
-  runHostFrame = runFrame . runSpiderHostFrame
-
 
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
@@ -759,6 +591,168 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
 
+
+
+
+
+
+
+
+-- | Designates the default, global Spider timeline
+data SpiderTimeline (x :: Type)
+
+-- | The default, global Spider environment
+type Spider = SpiderTimeline Global
+
+-- | A statically allocated 'SpiderTimeline'
+data Global
+
+{-# NOINLINE globalSpiderTimelineEnv #-}
+globalSpiderTimelineEnv :: SpiderTimelineEnv Global
+globalSpiderTimelineEnv = unsafePerformIO unsafeNewSpiderTimelineEnv
+
+class HasSpiderTimeline x where
+  -- | Retrieve the current SpiderTimelineEnv
+  spiderTimeline :: SpiderTimelineEnv x
+
+instance HasSpiderTimeline Global where
+  spiderTimeline = globalSpiderTimelineEnv
+
+data EventLoopException = EventLoopException
+instance Exception EventLoopException
+
+instance Show EventLoopException where
+  show EventLoopException = "causality loop detected: \n" <>
+    "compile reflex with flag 'debug-cycles' and compile with profiling enabled for stack tree"
+
+-- | Create a new SpiderTimelineEnv
+newSpiderTimeline :: IO (Some SpiderTimelineEnv)
+newSpiderTimeline = withSpiderTimeline (pure . Some)
+
+data LocalSpiderTimeline (x :: Type) s
+
+instance Reifies s (SpiderTimelineEnv x) =>
+         HasSpiderTimeline (LocalSpiderTimeline x s) where
+  spiderTimeline = localSpiderTimeline Proxy $ reflect (Proxy :: Proxy s)
+
+localSpiderTimeline
+  :: proxy s
+  -> SpiderTimelineEnv x
+  -> SpiderTimelineEnv (LocalSpiderTimeline x s)
+localSpiderTimeline _ = coerce
+
+-- | Pass a new timeline to the given function.
+withSpiderTimeline :: forall r. (forall x. HasSpiderTimeline x => SpiderTimelineEnv x -> IO r) -> IO r
+withSpiderTimeline k = do
+  env <- unsafeNewSpiderTimelineEnv
+  reify env $ \s -> k $ localSpiderTimeline s env
+
+data RootTrigger x a = forall k. GCompare k => RootTrigger (WeakBag (Subscriber x a), IORef (DMap k Identity), k a)
+
+data SpiderEventHandle x a = SpiderEventHandle
+  { spiderEventHandleSubscription :: EventSubscription x
+  , spiderEventHandleValue :: IORef (Maybe a)
+  }
+
+-- | The monad for actions that manipulate a Spider timeline identified by @x@
+newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
+
+-- TODO: anything in common with Fan?
+newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
+newFanEventWithTriggerIO f = do
+  occRef <- newIORef DMap.empty
+  subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
+  return $ R.EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
+    (NewFanSubscribedChildren subscribers uninit) <- readIORef subscribedRef >>= (\case
+      Just res -> pure res
+      Nothing -> do
+        subscribers <- WeakBag.empty
+        uninit <- f k $ RootTrigger (subscribers, occRef, k)
+        let res = NewFanSubscribedChildren subscribers uninit
+        modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") k res
+        pure res) . DMap.lookup k
+    sln <- WeakBag.insert' sub subscribers $ do
+              uninit
+              modifyIORef' subscribedRef $ DMap.delete k
+    -- TODO: understand original intent of this comment:
+    -- If we die at the same moment that all our children die, they will
+    -- try to clean us up but will fail because their Weak reference to us
+    -- will also be dead.  So, if we are dying, check if there are any
+    -- children; since children don't bother cleaning themselves up if
+    -- their parents are already dead, I don't think there's a race
+    -- condition here.  However, if there are any children, then we can
+    -- infer that we need to clean ourselves up, so we do.
+    -- finalCleanup = do
+    --   cs <- readIORef $ _weakBag_children subs
+    --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
+     -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
+    returnSubscription (WeakBag.remove sln >> touch sln) zeroRef subscribedRef
+      . coerce . DMap.lookup k
+      =<< readIORef occRef
+
+instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
+  {-# INLINABLE buildIncremental #-}
+  buildIncremental getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildIncremental getV0 e
+  {-# INLINABLE now #-}
+  now = runFrame . runSpiderHostFrame $ Reflex.Class.now
+
+instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHost x) where
+  {-# INLINABLE sample #-}
+  sample = runFrame . R.sample
+
+instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
+  {-# INLINABLE sample #-}
+  sample = Reflex.Spider.Internal.ReadPhase . Reflex.Class.sample
+
+instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
+  buildIncremental getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildIncremental getV0 e
+  {-# INLINABLE now #-}
+  now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
+
+instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
+  {-# INLINABLE subscribeEvent #-}
+  subscribeEvent e = SpiderHostFrame $ do
+    --TODO: Unsubscribe eventually (manually and/or with weak ref)
+    valRef <- liftIO $ newIORef Nothing
+    subscription <- subscribe e $ Subscriber
+      { subscriberPropagate = writeAndScheduleClear valRef
+      , subscriberInvalidateHeight = \_ -> return ()
+      , subscriberRecalculateHeight = \_ -> return ()
+      }
+    return $ SpiderEventHandle
+      { spiderEventHandleSubscription = subscription
+      , spiderEventHandleValue = valRef
+      }
+
+instance HasSpiderTimeline x => Reflex.Host.Class.ReflexHost (SpiderTimeline x) where
+  type EventTrigger (SpiderTimeline x) = RootTrigger x
+  type EventHandle (SpiderTimeline x) = SpiderEventHandle x
+  type HostFrame (SpiderTimeline x) = SpiderHostFrame x
+
+instance HasSpiderTimeline x => Reflex.Host.Class.MonadReadEvent (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
+  {-# NOINLINE readEvent #-}
+  readEvent h = Reflex.Spider.Internal.ReadPhase $ fmap (fmap return) $ liftIO $ do
+    result <- readIORef $ spiderEventHandleValue h
+    touch h
+    return result
+
+instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHost x) where
+  newEventWithTrigger = SpiderHost . newEventWithTriggerIO
+  newFanEventWithTrigger f = SpiderHost $ newFanEventWithTriggerIO f
+
+instance Reflex.Host.Class.MonadReflexCreateTrigger (SpiderTimeline x) (SpiderHostFrame x) where
+  newEventWithTrigger = SpiderHostFrame . EventM . liftIO . newEventWithTriggerIO
+  newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ newFanEventWithTriggerIO f
+
+instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHost x) where
+  {-# INLINABLE subscribeEvent #-}
+  subscribeEvent = runFrame . runSpiderHostFrame . Reflex.Host.Class.subscribeEvent
+
+instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexHost (SpiderTimeline x) (SpiderHost x) where
+  type ReadPhase (SpiderHost x) = Reflex.Spider.Internal.ReadPhase x
+  fireEventsAndRead es (Reflex.Spider.Internal.ReadPhase a) = run es a
+  runHostFrame = runFrame . runSpiderHostFrame
+
 instance MonadRef (EventM x) where
   type Ref (EventM x) = Ref IO
   {-# INLINABLE newRef #-}
@@ -821,3 +815,12 @@ instance PrimMonad (SpiderHostFrame x) where
 instance HasSpiderTimeline x => NotReady (SpiderTimeline x) (PerformEventT (SpiderTimeline x) (SpiderHost x)) where
   notReadyUntil _ = return ()
   notReady = return ()
+
+instance Eq (SpiderTimelineEnv x) where
+  _ == _ = True -- Since only one exists of each type
+
+instance GEq SpiderTimelineEnv where
+  a `geq` b = if _spiderTimeline_lock (unSTE a) == _spiderTimeline_lock (unSTE b)
+              then Just $ unsafeCoerce Refl -- This unsafeCoerce is safe because the same SpiderTimelineEnv can't have two different 'x' arguments
+              else Nothing
+
