@@ -308,11 +308,9 @@ data NewFanSubscribedChildren x a = NewFanSubscribedChildren
   , _newFanSubscribedUninit :: IO ()
   }
 
--- INFO: You'll be executing this at an event occurrence time, so
--- you're safe to use a simple pull-based read of the behavior?
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   {-# INLINABLE sample #-}
-  sample b = fixmeUnifySample (R.sample b) --TODO: Specialize sample to the Nothing and Just cases
+  sample b = fixmeUnifySample (R.sample b)
 
 fixmeUnifySample :: HasSpiderTimeline x => BehaviorM x b -> EventM x b
 fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< asksEventEnv eventEnvInits
@@ -337,7 +335,6 @@ type Invalidator = IO ()
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
--- TODO: What is the meaning of this function?
 addBehaviorSubscribed :: BehaviorSubscribed x a -> BehaviorM x ()
 addBehaviorSubscribed h = do
   !m <- asks behaviorEnvMaybeWISubs
@@ -390,7 +387,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       { R.currentIncremental = Behavior $ do
           addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
           addThisBehaviorMInvalidator invsRef
-          --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
           liftIO $ readIORef forceLazyHoldReturnValRef
       , R.updatedIncremental = v'
       }
@@ -402,8 +398,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       occ <- liftIO . readIORef $ nowOrNot
       returnSubscription (pure ()) zeroRef () occ
 
--- INFO: With PullM you have to use readBehaviorTracked for Behavior's
--- change update mechanism?
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   {-# INLINABLE sample #-}
   sample = readBehaviorTracked
