@@ -558,31 +558,25 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
               writeIORef heightRef $! maybeNewHeight
               subscriberRecalculateHeight sub maybeNewHeight
     let seenAllEvents = (<=) <$> liftIO (readIORef heightRef) <*> (liftIO . readIORef =<< asksEventEnv eventEnvCurrentHeight)
-    let scheduleMerge height subscribed = do
-          delayedRef <- asksEventEnv eventEnvDelayedMerges
-          liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) (unHeight height) [subscribed]
-    let mergeSubscribeAndRead :: R.Event (SpiderTimeline x) a -> EventM x (EventSubscription x)
-        mergeSubscribeAndRead e = do
-          (subscription, _) <- subscribeAndRead
-            (R.pushCheap (\a -> do
-                 maybePrevAccumVal <- liftIO $ readIORef accumRef
-                 liftIO $ writeIORef accumRef (Just a <> maybePrevAccumVal)
-                 liftIO $ do height <- readIORef heightRef
-                             when (height == invalidHeight) $
-                               throwIO EventLoopException
-                 when (isNothing maybePrevAccumVal) $ do -- Only schedule the firing once
-                   let scheduleMerge' initialHeight = scheduleMerge initialHeight $ do
-                         seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
-                             maybeCurrentAccumVal <- liftIO $ readIORef accumRef
-                             when (isJust maybeCurrentAccumVal) $ do
-                               mapM_ (subscriberPropagate sub) maybeCurrentAccumVal
-                               liftIO $ writeIORef accumRef Nothing)
-                   scheduleMerge' <=< liftIO $ readIORef heightRef
-                 pure (Just ()))
-             e)
-            (Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) (const recalculateMyHeight))
-          pure subscription
-    liftIO . writeIORef subscriptionsRef =<< mapM mergeSubscribeAndRead es
+    delayedRef <- asksEventEnv eventEnvDelayedMerges
+    liftIO . writeIORef subscriptionsRef <=< forM es $ \e -> do
+      subscribeWith e (\a -> do
+             maybePrevAccumVal <- liftIO $ readIORef accumRef
+             liftIO $ writeIORef accumRef (Just a <> maybePrevAccumVal)
+             liftIO $ do height <- readIORef heightRef
+                         when (height == invalidHeight) $
+                           throwIO EventLoopException
+             when (isNothing maybePrevAccumVal) $ do -- Only schedule the firing once
+               let scheduleMerge' (Height initialHeight) =
+                     liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) initialHeight [do
+                       seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
+                           maybeCurrentAccumVal <- liftIO $ readIORef accumRef
+                           when (isJust maybeCurrentAccumVal) $ do
+                             mapM_ (subscriberPropagate sub) maybeCurrentAccumVal
+                             liftIO $ writeIORef accumRef Nothing)]
+               scheduleMerge' <=< liftIO $ readIORef heightRef
+             pure (Just ()))
+        (Subscriber (const (pure ())) (const (invalidateHeight heightRef sub)) (const recalculateMyHeight))
     liftIO $ writeIORef heightRef =<< getMaybeHeight
     occ <- runMaybeT $ do
       guard =<< lift seenAllEvents
