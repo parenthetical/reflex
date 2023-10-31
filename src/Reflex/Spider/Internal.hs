@@ -338,12 +338,17 @@ runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSub
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
 -- TODO: What is the meaning of this function?
-addParentBAndInvalidator :: BehaviorSubscribed x a -> IORef [Weak Invalidator] -> BehaviorM x ()
-addParentBAndInvalidator h invsRef = do
+addBehaviorSubscribed :: BehaviorSubscribed x a -> BehaviorM x ()
+addBehaviorSubscribed h = do
   !m <- asks behaviorEnvMaybeWISubs
-  forM_ m $ \(!wi, !p) -> do
-      liftIO $ modifyIORef' invsRef (wi:)
+  forM_ m $ \(_, !p) -> do
       liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
+
+addThisBehaviorMInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
+addThisBehaviorMInvalidator invsRef = do
+  !m <- asks behaviorEnvMaybeWISubs
+  forM_ m $ \(!wi, _) -> do
+      liftIO $ modifyIORef' invsRef (wi:)
 
 -- TODO: what is really needed here?
 data PullSubscribed x a
@@ -383,7 +388,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ R.Incremental
       { R.currentIncremental = Behavior $ do
-          addParentBAndInvalidator (BehaviorSubscribedHold parentRef) invsRef
+          addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
+          addThisBehaviorMInvalidator invsRef
           --                  liftIO $ touch parentRef -- Otherwise, if this gets inlined enough, the hold's parent reference may get collected -- TODO: still needed?
           liftIO $ readIORef forceLazyHoldReturnValRef
       , R.updatedIncremental = v'
@@ -465,7 +471,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       liftIO $ writeIORef ref $ Just subscribed
                       return subscribed)
                     pure
-      addParentBAndInvalidator (BehaviorSubscribedPull subscribed) invsRef
+      addBehaviorSubscribed (BehaviorSubscribedPull subscribed)
+      addThisBehaviorMInvalidator invsRef
       pure $ pullSubscribedValue subscribed
   switchUncached switchParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
