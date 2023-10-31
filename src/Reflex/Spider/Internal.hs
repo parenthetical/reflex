@@ -284,7 +284,7 @@ runFrame a = SpiderHost $ do
      writeIORef toClearRef []
      writeIORef delayedRef IntMap.empty
   liftIO . mapM_ unsubscribe =<< runEventM (concat <$> mapM _mergeUpdate_update mergeUpdates)
-  mapM_ _mergeUpdate_invalidateHeight mergeUpdates --TODO: In addition to when the patch is completely empty, we should also not run this if it has some Nothing values, but none of them have actually had any effect; potentially, we could even check for Just values with no effect (e.g. by comparing their IORefs and ignoring them if they are unchanged); actually, we could just check if the new height is different
+  mapM_ _mergeUpdate_invalidateHeight mergeUpdates
   mapM_ _mergeUpdate_recalculateHeight mergeUpdates
   return result
 
