@@ -478,14 +478,14 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef zeroHeight
     let subscriber = Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
-    (subscription, occ) <-
+    (subscriptionOuter, occ) <-
       subscribeAndRead (R.pushCheap (\e -> do
-                                      (subscription, mocc) <- subscribeAndRead e subscriber
-                                      innerHeight <- liftIO $ getSubscriptionHeight subscription
+                                      (subscriptionInner, mocc) <- subscribeAndRead e subscriber
+                                      innerHeight <- liftIO $ getSubscriptionHeight subscriptionInner
                                       currentHeight <- liftIO $ readIORef heightRef
-                                      deferMergeUpdate (pure [subscription])
+                                      deferMergeUpdate (pure [subscriptionInner])
                                               (invalidateHeight heightRef sub)
-                                              (recalculateHeight heightRef sub =<< getSubscriptionHeight subscription)
+                                              (recalculateHeight heightRef sub =<< getSubscriptionHeight subscriptionInner)
                                       when (innerHeight > currentHeight) $ liftIO $ do 
                                         writeIORef heightRef innerHeight
                                         subscriberInvalidateHeight sub
@@ -493,8 +493,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                                       pure mocc)
                        coincidenceParent)
       subscriber
-    liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
-    returnSubscription (unsubscribe subscription) heightRef subscription occ
+    liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscriptionOuter
+    returnSubscription (unsubscribe subscriptionOuter) heightRef subscriptionOuter occ
   unsafeBuildIncremental readV0 =
     unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
