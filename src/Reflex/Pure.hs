@@ -122,12 +122,11 @@ instance MonadSample (Pure t) ((->) t) where
   sample = unBehavior
 
 instance (Enum t, HasTrie t, Ord t) => MonadHold (Pure t) ((->) t) where
-  buildIncremental getInitialValue e initialTime =
-    holdIncremental' (getInitialValue initialTime) e initialTime
+  buildHold getInitialValue e initialTime =
+    hold' (getInitialValue initialTime) e initialTime
   now t = Event $ guard . (t ==)
 
-holdIncremental' :: (Ord t, Enum t, HasTrie t, Patch p) => PatchTarget p -> Event (Pure t) p -> t -> Incremental (Pure t) p
-holdIncremental' initialValue e initialTime = Incremental (Behavior f) e
+hold' initialValue e initialTime = Behavior f
   where f = memo $ \sampleTime ->
           -- Really, the sampleTime should never be prior to the initialTime,
           -- because that would mean the Behavior is being sampled before
@@ -136,9 +135,7 @@ holdIncremental' initialValue e initialTime = Incremental (Behavior f) e
           then initialValue
           else let lastTime = pred sampleTime
                    lastValue = f lastTime
-               in case unEvent e lastTime of
-                 Nothing -> lastValue
-                 Just x -> fromMaybe lastValue $ apply x lastValue
+               in fromMaybe lastValue $ unEvent e lastTime
 
 
   

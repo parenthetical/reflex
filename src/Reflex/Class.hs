@@ -489,12 +489,17 @@ class (Applicative m, Monad m) => MonadSample t m | m -> t where
 -- 'Event's; usually this will be 'PushM' or a monad based on it.  'MonadHold'
 -- is required to create any stateful computations with Reflex.
 class (MonadFix m, MonadSample t m) => MonadHold t m where
-  buildIncremental :: (Patch p) => PushM t (PatchTarget p) -> Event t p -> m (Incremental t p)
-  default buildIncremental ::  (Patch p, m ~ f m', MonadTrans f, MonadHold t m') => PushM t (PatchTarget p) -> Event t p -> m (Incremental t p)
-  buildIncremental readV0 = lift . buildIncremental readV0
+  buildHold :: PushM t a -> Event t a -> m (Behavior t a)
+  default buildHold :: (m ~ f m', MonadTrans f, MonadHold t m') => PushM t a -> Event t a -> m (Behavior t a)
+  buildHold readV0 = lift . buildHold readV0
   now :: m (Event t ())
   default now :: (m ~ f m', MonadTrans f, MonadHold t m') => m (Event t ())
   now = lift now
+
+buildIncremental :: (Reflex t, MonadHold t m, Patch p) => PushM t (PatchTarget p) -> Event t p -> m (Incremental t p)
+buildIncremental readV0 e = mdo
+  b <- buildHold readV0 (catMaybes $ flip apply <$> b <@> e)
+  pure (Incremental b e)
 
 -- | Accumulate an 'Incremental' with the supplied initial value and the firings of the provided 'Event',
 -- using the combining function to produce a patch.
@@ -650,42 +655,42 @@ instance MonadSample t m => MonadSample t (ReaderT r m) where
   sample = lift . sample
 
 instance MonadHold t m => MonadHold t (ReaderT r m) where
-  buildIncremental a0 = lift . buildIncremental a0
+  buildHold a0 = lift . buildHold a0
   now = lift now
 
 instance (MonadSample t m, Monoid r) => MonadSample t (WriterT r m) where
   sample = lift . sample
 
 instance (MonadHold t m, Monoid r) => MonadHold t (WriterT r m) where
-  buildIncremental a0 = lift . buildIncremental a0
+  buildHold a0 = lift . buildHold a0
   now = lift now
 
 instance MonadSample t m => MonadSample t (StateT s m) where
   sample = lift . sample
 
 instance MonadHold t m => MonadHold t (StateT s m) where
-  buildIncremental a0 = lift . buildIncremental a0
+  buildHold a0 = lift . buildHold a0
   now = lift now
 
 instance MonadSample t m => MonadSample t (ExceptT e m) where
   sample = lift . sample
 
 instance MonadHold t m => MonadHold t (ExceptT e m) where
-  buildIncremental a0 = lift . buildIncremental a0
+  buildHold a0 = lift . buildHold a0
   now = lift now
 
 instance (MonadSample t m, Monoid w) => MonadSample t (RWST r w s m) where
   sample = lift . sample
 
 instance (MonadHold t m, Monoid w) => MonadHold t (RWST r w s m) where
-  buildIncremental a0 = lift . buildIncremental a0
+  buildHold a0 = lift . buildHold a0
   now = lift now
 
 instance MonadSample t m => MonadSample t (ContT r m) where
   sample = lift . sample
 
 -- instance (MonadFix m, MonadHold t m) => MonadHold t (ContT r m) where
---   buildIncremental a0 = lift . buildIncremental a0
+--   buildHold a0 = lift . buildHold a0
 --   now = lift now
 
 --------------------------------------------------------------------------------

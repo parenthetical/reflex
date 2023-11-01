@@ -79,7 +79,6 @@ import Data.Reflection
 import Data.Some (Some(Some))
 import Data.WeakBag (WeakBag)
 import qualified Data.WeakBag as WeakBag
-import Data.Patch
 import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
 import Data.Bool (bool)
@@ -358,11 +357,9 @@ deferInit :: forall x. HasSpiderTimeline x => EventM x () -> EventM x ()
 deferInit i = addToQueue (SomeInit i) =<< asksEventEnv eventEnvInits
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
-  {-# NOINLINE buildIncremental #-}
+  {-# NOINLINE buildHold #-}
   -- Note: cannot examine its event until after the phase is over
-  buildIncremental :: forall p. (Patch p)
-    => EventM x (PatchTarget p) -> R.Event (SpiderTimeline x) p -> EventM x (R.Incremental (SpiderTimeline x) p)
-  buildIncremental readV0 v' = do
+  buildHold readV0 e = do
     invsRef <- liftIO $ newIORef [] -- invalidators
     parentRef <- liftIO $ newIORef Nothing
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
@@ -370,26 +367,18 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
          deferInit $ do
            maybeParent <- liftIO $ readIORef parentRef
            when (isNothing maybeParent) $ do
-                 liftIO . writeIORef parentRef . Just
-                   <=< subscribeWith v' (\a -> do
-                                           v <- liftIO $ readIORef valRef
-                                           forM_ (apply a v) $ \v'1 -> do
-                                             vRef <- pure $! valRef
-                                             iRef <- pure $! invsRef
-                                             addToQueue (SomeAssignment @x vRef iRef v'1) =<< asksEventEnv eventEnvAssignments)
-                   $ Subscriber { subscriberPropagate = const (pure ())
-                                , subscriberInvalidateHeight = return ()
-                                , subscriberRecalculateHeight = \_ -> return ()
-                                }
+             liftIO . writeIORef parentRef . Just
+               <=< subscribeWith e (\a -> do
+                                       vRef <- pure $! valRef
+                                       iRef <- pure $! invsRef
+                                       addToQueue (SomeAssignment @x vRef iRef a) =<< asksEventEnv eventEnvAssignments)
+               $ Subscriber (const (pure ())) (pure ()) (const (pure ()))
          pure valRef
     deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
-    pure $ R.Incremental
-      { R.currentIncremental = Behavior $ do
+    pure $ Behavior $ do
           addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
           addThisBehaviorMInvalidator invsRef
           liftIO $ readIORef forceLazyHoldReturnValRef
-      , R.updatedIncremental = v'
-      }
   {-# INLINABLE now #-}
   now = do
     nowOrNot <- liftIO $ newIORef $ Just ()
@@ -674,8 +663,8 @@ newFanEventWithTriggerIO f = do
       =<< readIORef occRef
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE buildIncremental #-}
-  buildIncremental getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildIncremental getV0 e
+  {-# INLINABLE buildHold #-}
+  buildHold getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildHold getV0 e
   {-# INLINABLE now #-}
   now = runFrame . runSpiderHostFrame $ Reflex.Class.now
 
@@ -688,7 +677,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Ref
   sample = Reflex.Spider.Internal.ReadPhase . Reflex.Class.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  buildIncremental getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildIncremental getV0 e
+  buildHold getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildHold getV0 e
   {-# INLINABLE now #-}
   now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
 

@@ -157,9 +157,7 @@ instance Reflex t => Reflex (ProfiledTimeline t) where
   fanInt (Event_Profiled e) = coerce $ fanInt $ profileEvent e
 
 instance MonadHold t m => MonadHold (ProfiledTimeline t) (ProfiledM m) where
-  buildIncremental (ProfiledM v0) (Event_Profiled v') = ProfiledM $ do
-    (Incremental b e) <- buildIncremental v0 v'
-    pure $ Incremental (Behavior_Profiled b) (Event_Profiled e)
+  buildHold (ProfiledM v0) (Event_Profiled v') = ProfiledM $ Behavior_Profiled <$> buildHold v0 v'
   now = ProfiledM $ Event_Profiled <$> now
 
 instance MonadSample t m => MonadSample (ProfiledTimeline t) (ProfiledM m) where
