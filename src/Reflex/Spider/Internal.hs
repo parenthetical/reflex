@@ -312,7 +312,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   sample b = liftIO . runBehaviorM (R.sample b) Nothing =<< asksEventEnv eventEnvInits
 
 data BehaviorEnv x = BehaviorEnv
-  { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x])
+  { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator, IORef [BehaviorSubscribed x])
   , behaviorEnvInitsRef :: IORef [SomeInit x]
   }
 
@@ -320,34 +320,25 @@ data BehaviorEnv x = BehaviorEnv
 newtype BehaviorM (x :: Type) a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
 
+-- INFO: This seems to keep hold of all events which might influence a Behavior's value?
 data BehaviorSubscribed x
    = BehaviorSubscribedHold (IORef (Maybe (EventSubscription x)))
-   | BehaviorSubscribedPull ![SomeBehaviorSubscribed x]
-
-newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (BehaviorSubscribed x)
+   | BehaviorSubscribedPull ![BehaviorSubscribed x]
 
 type Invalidator = IO ()
 
-runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
+runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [BehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
 addBehaviorSubscribed :: BehaviorSubscribed x -> BehaviorM x ()
 addBehaviorSubscribed h = do
   !m <- asks behaviorEnvMaybeWISubs
-  forM_ m $ \(_, !p) -> do
-      liftIO $ modifyIORef' p (SomeBehaviorSubscribed h :)
+  forM_ m $ \(_, !p) -> liftIO $ modifyIORef' p (h :)
 
 addThisBehaviorMInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
 addThisBehaviorMInvalidator invsRef = do
   !m <- asks behaviorEnvMaybeWISubs
-  forM_ m $ \(!wi, _) -> do
-      liftIO $ modifyIORef' invsRef (wi:)
-
--- TODO: what is really needed here?
-data PullSubscribed x a
-   = PullSubscribed { pullSubscribedValue :: !a
-                    , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
-                    }
+  forM_ m $ \(!wi, _) -> liftIO $ modifyIORef' invsRef (wi:)
 
 deferInit :: forall x. HasSpiderTimeline x => EventM x () -> EventM x ()
 deferInit i = addToQueue (SomeInit i) =<< asksEventEnv eventEnvInits
@@ -429,7 +420,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     return (subscription, occ')
   {-# INLINABLE pull #-}
   pull a = unsafePerformIO $ do
-    ref :: IORef (Maybe (PullSubscribed x a)) <- newIORef Nothing
+    ref :: IORef (Maybe (a, [BehaviorSubscribed x])) <- newIORef Nothing
     invsRef :: IORef [Weak Invalidator] <- newIORef []
     pure $ Behavior $ do
       subscribed <- liftIO (readIORef ref) >>= maybe (do
@@ -442,16 +433,13 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
                       aVal <- liftIO $ runReaderIO (unBehaviorM a) (BehaviorEnv (Just (wi, parentsRef)) holdInits)
                       parents <- liftIO $ readIORef parentsRef
-                      let subscribed = PullSubscribed
-                            { pullSubscribedValue = aVal
-                            , pullSubscribedParents = parents
-                            }
+                      let subscribed = (aVal, parents)
                       liftIO $ writeIORef ref $ Just subscribed
                       return subscribed)
                     pure
-      addBehaviorSubscribed (BehaviorSubscribedPull (pullSubscribedParents subscribed))
+      addBehaviorSubscribed (BehaviorSubscribedPull (snd subscribed))
       addThisBehaviorMInvalidator invsRef
-      pure $ pullSubscribedValue subscribed
+      pure $ fst subscribed
   switchUncached switchParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
     ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
