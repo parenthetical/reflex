@@ -32,14 +32,10 @@ module Reflex.Pure
   ) where
 
 import Control.Monad
-import Data.Dependent.Map (DMap)
-import Data.GADT.Compare (GCompare)
 import qualified Data.Dependent.Map as DMap
-import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import Data.Maybe
 import Data.MemoTrie
-import Data.Monoid
 import Data.Type.Coercion
 import Reflex.Class
 import Data.Kind (Type)
@@ -54,33 +50,20 @@ data Pure (t :: Type)
 occurs :: Event (Pure t) a -> (t -> Maybe a)
 occurs = unEvent
 
-
-
 toEvent :: HasTrie t => (t -> Maybe a) -> Event (Pure t) a
 toEvent = Event . memo
-
 
 -- | The 'Enum' instance of @/t/@ must be dense: for all @/x :: t/@, there must not exist
 -- any @/y :: t/@ such that @/'pred' x < y < x/@. The 'HasTrie' instance will be used
 -- exclusively to memoize functions of @/t/@, not for any of its other capabilities.
 instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
-
   newtype Behavior (Pure t) a = Behavior { unBehavior :: t -> a }
   newtype Event (Pure t) a = Event { unEvent :: t -> Maybe a }
-
   type PushM (Pure t) = (->) t
   type PullM (Pure t) = (->) t
-
-  never :: Event (Pure t) a
   never = toEvent (pure Nothing)
-
-  pushCheap :: (a -> PushM (Pure t) (Maybe b)) -> Event (Pure t) a -> Event (Pure t) b
   pushCheap f = toEvent . runMaybeT . (MaybeT . f <=< MaybeT . occurs)
-
-  pull :: PullM (Pure t) a -> Behavior (Pure t) a
   pull = Behavior . memo
---  The instance signature doeesn't compile, leave commented for documentation
---  fanG :: GCompare k => Event (Pure t) (DMap k v) -> EventSelectorG (Pure t) k v
   fanG e = EventSelectorG $ \k -> Event $ unEvent e >=> DMap.lookup k
   cacheEvent = id
   switchUncached :: Behavior (Pure t) (Event (Pure t) a) -> Event (Pure t) a
@@ -90,53 +73,23 @@ instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
   unsafeBuildIncremental readV = Incremental (pull readV)
   behaviorCoercion Coercion = Coercion
   eventCoercion Coercion = Coercion
-  -- dynamicCoercion Coercion = Coercion
-  -- incrementalCoercion Coercion Coercion = Coercion
   fanInt e = EventSelectorInt $ \k -> Event $ unEvent e >=> IntMap.lookup k
-  -- [UNUSED_CONSTRAINT]: The following type signature for merge will produce a
-  -- warning because the GCompare instance is not used; however, removing the
-  -- GCompare instance produces a different warning, due to that constraint
-  -- being present in the original class definition.
   mergeListUncached es = Event $ \t ->
     fmap sconcat . NonEmpty.nonEmpty . mapMaybe (($ t) . unEvent) $ es
   
-mergeIncrementalImpl :: (PatchTarget p ~ DMap k q, GCompare k)
-  => (forall a. q a -> Event (Pure t) (v a))
-  -> Incremental (Pure t) p -> Event (Pure t) (DMap k v)
-mergeIncrementalImpl nt i = Event $ \t ->
-  let results = DMap.mapMaybeWithKey (\_ q -> case nt q of Event e -> e t) $ unBehavior (currentIncremental i) t
-  in if DMap.null results
-     then Nothing
-     else Just results
-
-mergeIntIncrementalImpl :: (PatchTarget p ~ IntMap (Event (Pure t) a)) => Incremental (Pure t) p -> Event (Pure t) (IntMap a)
-mergeIntIncrementalImpl i = Event $ \t ->
-  let results = IntMap.mapMaybeWithKey (\_ (Event e) -> e t) $ unBehavior (currentIncremental i) t
-  in if IntMap.null results
-     then Nothing
-     else Just results
-
 instance MonadSample (Pure t) ((->) t) where
-
-  sample :: Behavior (Pure t) a -> (t -> a)
   sample = unBehavior
 
 instance (Enum t, HasTrie t, Ord t) => MonadHold (Pure t) ((->) t) where
-  buildHold getInitialValue e initialTime =
-    hold' (getInitialValue initialTime) e initialTime
+  buildHold getInitialValue e initialTime = hold' (getInitialValue initialTime)
+    where hold' initialValue = Behavior f
+            where f = memo $ \sampleTime ->
+                    -- Really, the sampleTime should never be prior to the initialTime,
+                    -- because that would mean the Behavior is being sampled before
+                    -- being created.
+                    if sampleTime <= initialTime
+                    then initialValue
+                    else let lastTime = pred sampleTime
+                             lastValue = f lastTime
+                         in fromMaybe lastValue $ unEvent e lastTime
   now t = Event $ guard . (t ==)
-
-hold' initialValue e initialTime = Behavior f
-  where f = memo $ \sampleTime ->
-          -- Really, the sampleTime should never be prior to the initialTime,
-          -- because that would mean the Behavior is being sampled before
-          -- being created.
-          if sampleTime <= initialTime
-          then initialValue
-          else let lastTime = pred sampleTime
-                   lastValue = f lastTime
-               in fromMaybe lastValue $ unEvent e lastTime
-
-
-  
-
