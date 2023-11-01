@@ -295,10 +295,10 @@ mergeIncrementalGUncached :: (GCompare k, Reflex t)
   => (forall a. q a -> Event t (v a))
   -> Incremental t (PatchDMap k q)
   -> Event t (DMap k v)
--- | Experimental: Create a merge whose parents can change over time; changing the key of an Event is more efficient than with mergeIncremental
 mergeIncrementalGUncached f =
   switch . fmap mergeDMapViaList . current . fmap (DMap.map (Compose . f)) . incrementalToDynamic
 
+-- | Experimental: Create a merge whose parents can change over time; changing the key of an Event is more efficient than with mergeIncremental
 mergeIncrementalWithMoveGUncached :: (GCompare k, Reflex t)
   => (forall a. q a -> Event t (v a))
   -> Incremental t (PatchDMapWithMove k q) -> Event t (DMap k v)
