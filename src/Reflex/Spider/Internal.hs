@@ -309,10 +309,7 @@ data NewFanSubscribedChildren x a = NewFanSubscribedChildren
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   {-# INLINABLE sample #-}
-  sample b = fixmeUnifySample (R.sample b)
-
-fixmeUnifySample :: HasSpiderTimeline x => BehaviorM x b -> EventM x b
-fixmeUnifySample readV0 = liftIO . runBehaviorM readV0 Nothing =<< asksEventEnv eventEnvInits
+  sample b = liftIO . runBehaviorM (R.sample b) Nothing =<< asksEventEnv eventEnvInits
 
 data BehaviorEnv x = BehaviorEnv
   { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x])
@@ -516,10 +513,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
     returnSubscription (unsubscribe subscription) heightRef subscription occ
   unsafeBuildIncremental readV0 v' =
-    -- TODO: using buildIncremental is lazier than the original implementation (because of the double Init scheduling)
-    unsafePerformIO . runEventM @x $ R.buildIncremental (fixmeUnifySample readV0) v'
-    -- TODO: why can't we do this? QueryT tests fail but others are fine (although they might not use unsafeBuild):
-    -- SpiderIncremental $ Dynamic (Behavior readV0) v'
+    -- FIXME: Why is sample . pull needed for tests to pass?
+    unsafePerformIO . runEventM @x $ R.buildIncremental (R.sample (R.pull readV0)) v'
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
     heightRef <- liftIO $ newIORef zeroHeight
