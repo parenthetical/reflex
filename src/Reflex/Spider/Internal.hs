@@ -386,9 +386,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   type PushM (SpiderTimeline x) = EventM x
   {-# INLINABLE never #-}
   never = Event $ const $ returnSubscription (pure ()) zeroRef () Nothing
-  --TODO: Try a caching strategy where we subscribe directly to the parent when
-  --there's only one subscriber, and then build our own FastWeakBag only when a second
-  --subscriber joins
   {-# NOINLINE [0] cacheEvent #-}
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
@@ -498,9 +495,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       subscriber
     liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscription
     returnSubscription (unsubscribe subscription) heightRef subscription occ
-  unsafeBuildIncremental readV0 v' =
-    -- FIXME: Why is sample . pull needed for tests to pass?
-    unsafePerformIO . runEventM @x $ R.buildIncremental (R.sample (R.pull readV0)) v'
+  unsafeBuildIncremental readV0 =
+    unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
     heightRef <- liftIO $ newIORef zeroHeight
