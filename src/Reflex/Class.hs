@@ -307,7 +307,7 @@ mergeIncrementalWithMoveGUncached f =
 
 mergeIntIncrementalUncached :: (Reflex t) => Incremental t (PatchIntMap (Event t a)) -> Event t (IntMap a)
 mergeIntIncrementalUncached =
-  switch . fmap (mergeListUncached . fmap ((\(k,e) -> IntMap.singleton k <$> e)) . IntMap.toList) . current . incrementalToDynamic
+  switch . fmap (mergeListUncached . fmap (\(k,e) -> IntMap.singleton k <$> e) . IntMap.toList) . current . incrementalToDynamic
 
 mergeDMapViaList :: (Reflex t, GCompare k)
   => DMap k (Compose (Event t) q)
@@ -513,7 +513,7 @@ accumIncremental f = accumMaybeIncremental $ \v o -> Just $ f v o
 
 -- | Similar to 'accumIncremental' but the combining function runs in 'PushM'
 accumMIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> PushM t p)
   -> PatchTarget p
   -> Event t b
@@ -523,7 +523,7 @@ accumMIncremental f = accumMaybeMIncremental $ \v o -> Just <$> f v o
 -- | Similar to 'accumIncremental' but allows filtering of updates (by dropping updates when the
 -- combining function produces @Nothing@)
 accumMaybeIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> Maybe p)
   -> PatchTarget p
   -> Event t b
@@ -532,7 +532,7 @@ accumMaybeIncremental f = accumMaybeMIncremental $ \v o -> return $ f v o
 
 -- | Similar to 'accumMaybeMIncremental' but the combining function runs in 'PushM'
 accumMaybeMIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> PushM t (Maybe p))
   -> PatchTarget p
   -> Event t b
@@ -549,7 +549,7 @@ accumMaybeMIncremental f z e = do
 -- as an 'Event'. Returns both the accumulated value and the constructed
 -- 'Event'.
 mapAccumIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> (p, c))
   -> PatchTarget p
   -> Event t b
@@ -558,7 +558,7 @@ mapAccumIncremental f = mapAccumMaybeIncremental $ \v o -> bimap Just Just $ f v
 
 -- | Like 'mapAccumIncremental' but the combining function runs in 'PushM'
 mapAccumMIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> PushM t (p, c))
   -> PatchTarget p
   -> Event t b
@@ -572,7 +572,7 @@ mapAccumMIncremental f = mapAccumMaybeMIncremental $ \v o -> bimap Just Just <$>
 -- 'Event' may fire even though the output 'Incremental' has not changed, and
 -- the output 'Incremental' may update even when the output 'Event' is not firing.
 mapAccumMaybeIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> (Maybe p, Maybe c))
   -> PatchTarget p
   -> Event t b
@@ -581,7 +581,7 @@ mapAccumMaybeIncremental f = mapAccumMaybeMIncremental $ \v o -> return $ f v o
 
 -- | Like 'mapAccumMaybeIncremental' but the combining function is a 'PushM' action
 mapAccumMaybeMIncremental
-  :: (Reflex t, Patch p, MonadHold t m, MonadFix m)
+  :: (Reflex t, Patch p, MonadHold t m)
   => (PatchTarget p -> b -> PushM t (Maybe p, Maybe c))
   -> PatchTarget p
   -> Event t b
@@ -596,7 +596,7 @@ mapAccumMaybeMIncremental f z e = do
       d' <- holdIncremental z $ mapMaybe fst e'
   return (d', mapMaybe snd e')
 
-headE :: (Reflex t, MonadHold t m, MonadFix m) => Event t a -> m (Event t a)
+headE :: (Reflex t, MonadHold t m) => Event t a -> m (Event t a)
 headE = slowHeadE
 
 holdIncremental :: (Patch p, MonadHold t m, Reflex t) => PatchTarget p -> Event t p -> m (Incremental t p)
@@ -612,7 +612,7 @@ buildDynamic :: (MonadHold t m, Reflex t) => PushM t a -> Event t a -> m (Dynami
 buildDynamic readV0 = fmap Dynamic . buildIncremental readV0 . fmap Identity
 
 -- | A somewhat slow implementation of 'headE'
-slowHeadE :: (Reflex t, MonadHold t m, MonadFix m) => Event t a -> m (Event t a)
+slowHeadE :: (Reflex t, MonadHold t m) => Event t a -> m (Event t a)
 slowHeadE e = do
   rec be <- hold e $ fmapCheap (const never) e'
       let e' = switch be
@@ -743,7 +743,6 @@ instance Reflex t => Monad (Behavior t) where
 
 instance (Reflex t, Monoid a) => Monoid (Behavior t a) where
   mempty = constant mempty
-  mappend a b = pull $ liftM2 mappend (sample a) (sample b)
   mconcat = pull . fmap mconcat . mapM sample
 
 instance (Reflex t, Num a) => Num (Behavior t a) where
@@ -875,7 +874,7 @@ headTailE e = do
 -- been encountered later.
 takeWhileE
   :: forall t m a
-  .  (Reflex t, MonadFix m, MonadHold t m)
+  .  (Reflex t, MonadHold t m)
   => (a -> Bool)
   -> Event t a
   -> m (Event t a)
@@ -890,7 +889,7 @@ takeWhileE f = takeWhileJustE $ \v -> guard (f v) $> v
 -- been encountered later.
 takeWhileJustE
   :: forall t m a b
-  .  (Reflex t, MonadFix m, MonadHold t m)
+  .  (Reflex t, MonadHold t m)
   => (a -> Maybe b)
   -> Event t a
   -> m (Event t b)
@@ -911,7 +910,7 @@ takeWhileJustE f e = do
 -- would have been encountered later.
 dropWhileE
   :: forall t m a
-  .  (Reflex t, MonadFix m, MonadHold t m)
+  .  (Reflex t, MonadHold t m)
   => (a -> Bool)
   -> Event t a
   -> m (Event t a)
@@ -931,7 +930,7 @@ dropWhileE f e = snd <$> takeDropWhileJustE (\v -> guard (f v) $> v) e
 -- on firing.
 takeDropWhileJustE
   :: forall t m a b
-  . (Reflex t, MonadFix m, MonadHold t m)
+  . (Reflex t, MonadHold t m)
   => (a -> Maybe b)
   -> Event t a
   -> m (Event t b, Event t a)
@@ -1215,7 +1214,6 @@ instance (Reflex t, Semigroup a) => Semigroup (Dynamic t a) where
 instance (Reflex t, Monoid a) => Monoid (Dynamic t a) where
   mconcat = distributeListOverDynWith mconcat
   mempty = constDyn mempty
-  mappend = zipDynWith mappend
 
 -- | This function converts a 'DMap' whose elements are 'Dynamic's into a
 -- 'Dynamic' 'DMap'.  Its implementation is more efficient than doing the same
@@ -1276,7 +1274,7 @@ alignEventWithMaybe f ea eb = mapMaybe (f <=< dmapToThese) $
 filterEventKey
   :: forall t m k v a.
      ( Reflex t
-     , MonadFix m
+     
      , MonadHold t m
      , GEq k
      )
@@ -1297,7 +1295,6 @@ filterEventKey k kv' = do
 factorEvent
   :: forall t m k v a.
      ( Reflex t
-     , MonadFix m
      , MonadHold t m
      , GEq k
      )
@@ -1328,25 +1325,25 @@ factorEvent k0 kv' = do
 {-# WARNING accumMaybeM "ghc < 8.2.1 doesn't seem to be able to specialize functions in this class, which can lead to poor performance" #-}
 #endif
 class Reflex t => Accumulator t f | f -> t where
-  accum :: (MonadHold t m, MonadFix m) => (a -> b -> a) -> a -> Event t b -> m (f a)
+  accum :: (MonadHold t m) => (a -> b -> a) -> a -> Event t b -> m (f a)
   accum f = accumMaybe $ \v o -> Just $ f v o
-  accumM :: (MonadHold t m, MonadFix m) => (a -> b -> PushM t a) -> a -> Event t b -> m (f a)
+  accumM :: (MonadHold t m) => (a -> b -> PushM t a) -> a -> Event t b -> m (f a)
   accumM f = accumMaybeM $ \v o -> Just <$> f v o
-  accumMaybe :: (MonadHold t m, MonadFix m) => (a -> b -> Maybe a) -> a -> Event t b -> m (f a)
+  accumMaybe :: (MonadHold t m) => (a -> b -> Maybe a) -> a -> Event t b -> m (f a)
   accumMaybe f = accumMaybeM $ \v o -> return $ f v o
-  accumMaybeM :: (MonadHold t m, MonadFix m) => (a -> b -> PushM t (Maybe a)) -> a -> Event t b -> m (f a)
-  mapAccum :: (MonadHold t m, MonadFix m) => (a -> b -> (a, c)) -> a -> Event t b -> m (f a, Event t c)
+  accumMaybeM :: (MonadHold t m) => (a -> b -> PushM t (Maybe a)) -> a -> Event t b -> m (f a)
+  mapAccum :: (MonadHold t m) => (a -> b -> (a, c)) -> a -> Event t b -> m (f a, Event t c)
   mapAccum f = mapAccumMaybe $ \v o -> bimap Just Just $ f v o
-  mapAccumM :: (MonadHold t m, MonadFix m) => (a -> b -> PushM t (a, c)) -> a -> Event t b -> m (f a, Event t c)
+  mapAccumM :: (MonadHold t m) => (a -> b -> PushM t (a, c)) -> a -> Event t b -> m (f a, Event t c)
   mapAccumM f = mapAccumMaybeM $ \v o -> bimap Just Just <$> f v o
-  mapAccumMaybe :: (MonadHold t m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event t b -> m (f a, Event t c)
+  mapAccumMaybe :: (MonadHold t m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event t b -> m (f a, Event t c)
   mapAccumMaybe f = mapAccumMaybeM $ \v o -> return $ f v o
-  mapAccumMaybeM :: (MonadHold t m, MonadFix m) => (a -> b -> PushM t (Maybe a, Maybe c)) -> a -> Event t b -> m (f a, Event t c)
+  mapAccumMaybeM :: (MonadHold t m) => (a -> b -> PushM t (Maybe a, Maybe c)) -> a -> Event t b -> m (f a, Event t c)
 
 -- | Accumulate a 'Dynamic' by folding occurrences of an 'Event'
 -- with the provided function. See 'foldDyn'.
 accumDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> a)
   -> a
   -> Event t b
@@ -1356,7 +1353,7 @@ accumDyn f = accumMaybeDyn $ \v o -> Just $ f v o
 -- | Accumulate a 'Dynamic' by folding occurrences of an 'Event'
 -- with the provided 'PushM' action.
 accumMDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> PushM t a)
   -> a
   -> Event t b
@@ -1366,7 +1363,7 @@ accumMDyn f = accumMaybeMDyn $ \v o -> Just <$> f v o
 -- | Accumulate a 'Dynamic' by folding occurrences of an 'Event'
 -- with the provided function, discarding 'Nothing' results.
 accumMaybeDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> Maybe a)
   -> a
   -> Event t b
@@ -1376,7 +1373,7 @@ accumMaybeDyn f = accumMaybeMDyn $ \v o -> return $ f v o
 -- | Accumulate a 'Dynamic' by folding occurrences of an 'Event'
 -- with the provided 'PushM' action, discarding 'Nothing' results.
 accumMaybeMDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> PushM t (Maybe a))
   -> a
   -> Event t b
@@ -1392,7 +1389,7 @@ accumMaybeMDyn f z e = do
 -- with a function that both accumulates and produces a value to fire
 -- as an 'Event'. Returns both the accumulated value and an 'Event'.
 mapAccumDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> (a, c))
   -> a
   -> Event t b
@@ -1402,7 +1399,7 @@ mapAccumDyn f = mapAccumMaybeDyn $ \v o -> bimap Just Just $ f v o
 -- | Similar to 'mapAccumDyn' except that the combining function is a
 -- 'PushM' action.
 mapAccumMDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> PushM t (a, c))
   -> a
   -> Event t b
@@ -1416,7 +1413,7 @@ mapAccumMDyn f = mapAccumMaybeMDyn $ \v o -> bimap Just Just <$> f v o
 -- 'Event' may fire even though the output 'Dynamic' has not changed, and
 -- the output 'Dynamic' may update even when the output 'Event' is not firing.
 mapAccumMaybeDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> (Maybe a, Maybe c))
   -> a
   -> Event t b
@@ -1426,7 +1423,7 @@ mapAccumMaybeDyn f = mapAccumMaybeMDyn $ \v o -> return $ f v o
 -- | Like 'mapAccumMaybeDyn' except that the combining function is a
 -- 'PushM' action.
 mapAccumMaybeMDyn
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> PushM t (Maybe a, Maybe c))
   -> a
   -> Event t b
@@ -1445,7 +1442,7 @@ mapAccumMaybeMDyn f z e = do
 -- with the provided function.
 {-# INLINE accumB #-}
 accumB
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> a)
   -> a
   -> Event t b
@@ -1455,7 +1452,7 @@ accumB f = accumMaybeB $ \v o -> Just $ f v o
 -- | Like 'accumB' except that the combining function is a 'PushM' action.
 {-# INLINE accumMB #-}
 accumMB
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> PushM t a)
   -> a
   -> Event t b
@@ -1466,7 +1463,7 @@ accumMB f = accumMaybeMB $ \v o -> Just <$> f v o
 -- with the provided function, discarding 'Nothing' results.
 {-# INLINE accumMaybeB #-}
 accumMaybeB
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> Maybe a)
   -> a
   -> Event t b
@@ -1475,7 +1472,7 @@ accumMaybeB f = accumMaybeMB $ \v o -> return $ f v o
 
 -- | Like 'accumMaybeB' except that the combining function is a 'PushM' action.
 {-# INLINE accumMaybeMB #-}
-accumMaybeMB :: (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> PushM t (Maybe a)) -> a -> Event t b -> m (Behavior t a)
+accumMaybeMB :: (Reflex t, MonadHold t m) => (a -> b -> PushM t (Maybe a)) -> a -> Event t b -> m (Behavior t a)
 accumMaybeMB f z e = do
   rec let e' = flip push e $ \o -> do
             v <- sample d'
@@ -1488,7 +1485,7 @@ accumMaybeMB f z e = do
 -- as an 'Event'. Returns both the accumulated value and an 'Event'.
 {-# INLINE mapAccumB #-}
 mapAccumB
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> (a, c))
   -> a
   -> Event t b
@@ -1498,7 +1495,7 @@ mapAccumB f = mapAccumMaybeB $ \v o -> bimap Just Just $ f v o
 -- | Like 'mapAccumB' except that the combining function is a 'PushM' action.
 {-# INLINE mapAccumMB #-}
 mapAccumMB
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> PushM t (a, c))
   -> a
   -> Event t b
@@ -1510,7 +1507,7 @@ mapAccumMB f = mapAccumMaybeMB $ \v o -> bimap Just Just <$> f v o
 -- a value to fire as a separate output 'Event'. 'Nothing's are discarded.
 {-# INLINE mapAccumMaybeB #-}
 mapAccumMaybeB
-  :: (Reflex t, MonadHold t m, MonadFix m)
+  :: (Reflex t, MonadHold t m)
   => (a -> b -> (Maybe a, Maybe c))
   -> a
   -> Event t b
@@ -1519,7 +1516,7 @@ mapAccumMaybeB f = mapAccumMaybeMB $ \v o -> return $ f v o
 
 -- | Like 'mapAccumMaybeB' except that the combining function is a 'PushM' action.
 {-# INLINE mapAccumMaybeMB #-}
-mapAccumMaybeMB :: (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> PushM t (Maybe a, Maybe c)) -> a -> Event t b -> m (Behavior t a, Event t c)
+mapAccumMaybeMB :: (Reflex t, MonadHold t m) => (a -> b -> PushM t (Maybe a, Maybe c)) -> a -> Event t b -> m (Behavior t a, Event t c)
 mapAccumMaybeMB f z e = do
   rec let e' = flip push e $ \o -> do
             v <- sample d'
@@ -1533,7 +1530,7 @@ mapAccumMaybeMB f z e = do
 -- | Accumulate occurrences of an 'Event', producing an output occurrence each
 -- time.  Discard the underlying 'Accumulator'.
 {-# INLINE mapAccum_ #-}
-mapAccum_ :: forall t m a b c. (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> (a, c)) -> a -> Event t b -> m (Event t c)
+mapAccum_ :: forall t m a b c. (Reflex t, MonadHold t m) => (a -> b -> (a, c)) -> a -> Event t b -> m (Event t c)
 mapAccum_ f z e = do
   (_, result) <- mapAccumB f z e
   return result
@@ -1541,7 +1538,7 @@ mapAccum_ f z e = do
 -- | Accumulate occurrences of an 'Event', possibly producing an output
 -- occurrence each time.  Discard the underlying 'Accumulator'.
 {-# INLINE mapAccumMaybe_ #-}
-mapAccumMaybe_ :: forall t m a b c. (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event t b -> m (Event t c)
+mapAccumMaybe_ :: forall t m a b c. (Reflex t, MonadHold t m) => (a -> b -> (Maybe a, Maybe c)) -> a -> Event t b -> m (Event t c)
 mapAccumMaybe_ f z e = do
   (_, result) <- mapAccumMaybeB f z e
   return result
@@ -1549,7 +1546,7 @@ mapAccumMaybe_ f z e = do
 -- | Accumulate occurrences of an 'Event', using a 'PushM' action and producing
 -- an output occurrence each time.  Discard the underlying 'Accumulator'.
 {-# INLINE mapAccumM_ #-}
-mapAccumM_ :: forall t m a b c. (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> PushM t (a, c)) -> a -> Event t b -> m (Event t c)
+mapAccumM_ :: forall t m a b c. (Reflex t, MonadHold t m) => (a -> b -> PushM t (a, c)) -> a -> Event t b -> m (Event t c)
 mapAccumM_ f z e = do
   (_, result) <- mapAccumMB f z e
   return result
@@ -1558,7 +1555,7 @@ mapAccumM_ f z e = do
 -- producing an output occurrence each time.  Discard the underlying
 -- 'Accumulator'.
 {-# INLINE mapAccumMaybeM_ #-}
-mapAccumMaybeM_ :: forall t m a b c. (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> PushM t (Maybe a, Maybe c)) -> a -> Event t b -> m (Event t c)
+mapAccumMaybeM_ :: forall t m a b c. (Reflex t, MonadHold t m) => (a -> b -> PushM t (Maybe a, Maybe c)) -> a -> Event t b -> m (Event t c)
 mapAccumMaybeM_ f z e = do
   (_, result) <- mapAccumMaybeMB f z e
   return result
@@ -1578,7 +1575,7 @@ instance Reflex t => Accumulator t (Event t) where
 -- | Create a new 'Event' by combining each occurrence with the next value of the
 -- list using the supplied function. If the list runs out of items, all
 -- subsequent 'Event' occurrences will be ignored.
-zipListWithEvent :: (Reflex t, MonadHold t m, MonadFix m) => (a -> b -> c) -> [a] -> Event t b -> m (Event t c)
+zipListWithEvent :: (Reflex t, MonadHold t m) => (a -> b -> c) -> [a] -> Event t b -> m (Event t c)
 zipListWithEvent f l e = do
   let f' a b = case a of
         h:t -> (Just t, Just $ f h b)
@@ -1587,17 +1584,17 @@ zipListWithEvent f l e = do
 
 -- | Assign a number to each occurrence of the given 'Event', starting from 0
 {-# INLINE numberOccurrences #-}
-numberOccurrences :: (Reflex t, MonadHold t m, MonadFix m, Num b) => Event t a -> m (Event t (b, a))
+numberOccurrences :: (Reflex t, MonadHold t m, Num b) => Event t a -> m (Event t (b, a))
 numberOccurrences = numberOccurrencesFrom 0
 
 -- | Assign a number to each occurrence of the given 'Event'
 {-# INLINE numberOccurrencesFrom #-}
-numberOccurrencesFrom :: (Reflex t, MonadHold t m, MonadFix m, Num b) => b -> Event t a -> m (Event t (b, a))
+numberOccurrencesFrom :: (Reflex t, MonadHold t m, Num b) => b -> Event t a -> m (Event t (b, a))
 numberOccurrencesFrom = mapAccum_ (\n a -> let !next = n + 1 in (next, (n, a)))
 
 -- | Assign a number to each occurrence of the given 'Event'; discard the occurrences' values
 {-# INLINE numberOccurrencesFrom_ #-}
-numberOccurrencesFrom_ :: (Reflex t, MonadHold t m, MonadFix m, Num b) => b -> Event t a -> m (Event t b)
+numberOccurrencesFrom_ :: (Reflex t, MonadHold t m, Num b) => b -> Event t a -> m (Event t b)
 numberOccurrencesFrom_ = mapAccum_ (\n _ -> let !next = n + 1 in (next, n))
 
 -- | This is used to sample the value of a 'Behavior' using an 'Event'.
