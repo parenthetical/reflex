@@ -320,22 +320,22 @@ data BehaviorEnv x = BehaviorEnv
 newtype BehaviorM (x :: Type) a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
 
-data BehaviorSubscribed x a
+data BehaviorSubscribed x
    = BehaviorSubscribedHold (IORef (Maybe (EventSubscription x)))
-   | BehaviorSubscribedPull (PullSubscribed x a)
+   | BehaviorSubscribedPull ![SomeBehaviorSubscribed x]
 
-newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (Some (BehaviorSubscribed x))
+newtype SomeBehaviorSubscribed x = SomeBehaviorSubscribed (BehaviorSubscribed x)
 
 type Invalidator = IO ()
 
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [SomeBehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
-addBehaviorSubscribed :: BehaviorSubscribed x a -> BehaviorM x ()
+addBehaviorSubscribed :: BehaviorSubscribed x -> BehaviorM x ()
 addBehaviorSubscribed h = do
   !m <- asks behaviorEnvMaybeWISubs
   forM_ m $ \(_, !p) -> do
-      liftIO $ modifyIORef' p (SomeBehaviorSubscribed (Some h) :)
+      liftIO $ modifyIORef' p (SomeBehaviorSubscribed h :)
 
 addThisBehaviorMInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
 addThisBehaviorMInvalidator invsRef = do
@@ -449,7 +449,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       liftIO $ writeIORef ref $ Just subscribed
                       return subscribed)
                     pure
-      addBehaviorSubscribed (BehaviorSubscribedPull subscribed)
+      addBehaviorSubscribed (BehaviorSubscribedPull (pullSubscribedParents subscribed))
       addThisBehaviorMInvalidator invsRef
       pure $ pullSubscribedValue subscribed
   switchUncached switchParent = Event $ \sub -> do
