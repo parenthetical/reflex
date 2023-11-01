@@ -346,7 +346,6 @@ addThisBehaviorMInvalidator invsRef = do
 -- TODO: what is really needed here?
 data PullSubscribed x a
    = PullSubscribed { pullSubscribedValue :: !a
-                    , pullSubscribedOwnInvalidator :: !Invalidator
                     , pullSubscribedParents :: ![SomeBehaviorSubscribed x] -- Need to keep parent behaviors alive, or they won't let us know when they're invalidated
                     }
 
@@ -445,7 +444,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       parents <- liftIO $ readIORef parentsRef
                       let subscribed = PullSubscribed
                             { pullSubscribedValue = aVal
-                            , pullSubscribedOwnInvalidator = i
                             , pullSubscribedParents = parents
                             }
                       liftIO $ writeIORef ref $ Just subscribed
