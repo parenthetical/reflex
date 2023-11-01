@@ -1,4 +1,5 @@
 {-# LANGUAGE ApplicativeDo #-}
+{-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE CPP #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE EmptyDataDecls #-}
@@ -475,7 +476,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       heightRef
       ownInvalidatorRef
       parentOcc
-  coincidenceUncached coincidenceParent = Event $ \sub -> do
+  coincidenceUncached coincidenceParent = Event $ \sub -> mdo
     heightRef <- liftIO $ newIORef zeroHeight
     let subscriber = Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
     (subscriptionOuter, occ) <-
@@ -483,17 +484,21 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                                       (subscriptionInner, mocc) <- subscribeAndRead e subscriber
                                       innerHeight <- liftIO $ getSubscriptionHeight subscriptionInner
                                       currentHeight <- liftIO $ readIORef heightRef
-                                      deferMergeUpdate (pure [subscriptionInner])
+                                      if innerHeight > currentHeight
+                                        then do
+                                          liftIO $ writeIORef heightRef innerHeight
+                                          liftIO $ subscriberInvalidateHeight sub
+                                          liftIO $ subscriberRecalculateHeight sub innerHeight
+                                          deferMergeUpdate (pure [subscriptionInner])
                                               (invalidateHeight heightRef sub)
-                                              (recalculateHeight heightRef sub =<< getSubscriptionHeight subscriptionInner)
-                                      when (innerHeight > currentHeight) $ liftIO $ do 
-                                        writeIORef heightRef innerHeight
-                                        subscriberInvalidateHeight sub
-                                        subscriberRecalculateHeight sub innerHeight
+                                              (recalculateHeight heightRef sub
+                                               =<< getSubscriptionHeight subscriptionOuter)
+                                        else do
+                                          liftIO $ unsubscribe subscriptionInner
                                       pure mocc)
                        coincidenceParent)
       subscriber
-    liftIO $ modifyIORef heightRef . max =<< getSubscriptionHeight subscriptionOuter
+    liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscriptionOuter
     returnSubscription (unsubscribe subscriptionOuter) heightRef subscriptionOuter occ
   unsafeBuildIncremental readV0 =
     unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
