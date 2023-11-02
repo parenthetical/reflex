@@ -333,7 +333,7 @@ newtype BehaviorM (x :: Type) a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorE
 
 -- INFO: This seems to keep hold of all events which might influence a Behavior's value?
 data BehaviorSubscribed x
-   = BehaviorSubscribedHold (IORef (Maybe (EventSubscription x)))
+   = BehaviorSubscribedHold !(IORef (EventSubscription x))
    | BehaviorSubscribedPull ![BehaviorSubscribed x]
 
 type Invalidator = IO ()
@@ -359,13 +359,10 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   -- Note: cannot examine its event until after the phase is over
   buildHold readV0 e = do
     invsRef <- liftIO $ newIORef [] -- invalidators
-    parentRef <- liftIO $ newIORef Nothing
+    parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
          valRef <- liftIO . newIORef =<< readV0
-         deferInit $ do
-           maybeParent <- liftIO $ readIORef parentRef
-           when (isNothing maybeParent) $ do
-             liftIO . writeIORef parentRef . Just . fst
+         deferInit $ liftIO . writeIORef parentRef . fst
                <=< subscribeWithRec e (\a _ -> do
                                        vRef <- pure $! valRef
                                        iRef <- pure $! invsRef
@@ -373,11 +370,11 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                                        pure (Just a))
                $ Subscriber (const (pure ())) (pure ()) (const (pure ()))
          pure valRef
-    deferInit @x $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
+    deferInit $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
-          addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
-          addThisBehaviorMInvalidator invsRef
-          liftIO $ readIORef forceLazyHoldReturnValRef
+      addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
+      addThisBehaviorMInvalidator invsRef
+      liftIO $ readIORef forceLazyHoldReturnValRef    
   {-# INLINABLE now #-}
   now = do
     nowOrNot <- liftIO $ newIORef $ Just ()
