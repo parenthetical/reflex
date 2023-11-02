@@ -341,8 +341,9 @@ type Invalidator = IO ()
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [BehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
-addBehaviorSubscribed :: BehaviorSubscribed x -> BehaviorM x ()
-addBehaviorSubscribed h = do
+-- | Log an Event or Behavior which influences the value of this Behavior.
+tellBehaviorParent :: BehaviorSubscribed x -> BehaviorM x ()
+tellBehaviorParent h = do
   !m <- asks behaviorEnvMaybeWISubs
   forM_ m $ \(_, !p) -> liftIO $ modifyIORef' p (h :)
 
@@ -376,7 +377,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
          pure valRef
     deferInit $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
-      addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
+      tellBehaviorParent (BehaviorSubscribedHold parentRef)
       addThisBehaviorMsInvalidator invsRef
       liftIO $ readIORef forceLazyHoldReturnValRef
   {-# INLINABLE now #-}
@@ -440,7 +441,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       liftIO $ writeIORef ref $ Just subscribed
                       return subscribed)
                     pure
-      addBehaviorSubscribed (BehaviorSubscribedPull parents)
+      tellBehaviorParent (BehaviorSubscribedPull parents)
       addThisBehaviorMsInvalidator invsRef
       pure val
   switchUncached switchParent = Event $ \sub -> do
