@@ -346,8 +346,8 @@ addBehaviorSubscribed h = do
   !m <- asks behaviorEnvMaybeWISubs
   forM_ m $ \(_, !p) -> liftIO $ modifyIORef' p (h :)
 
-addThisBehaviorMInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
-addThisBehaviorMInvalidator invsRef = do
+addThisBehaviorMsInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
+addThisBehaviorMsInvalidator invsRef = do
   !m <- asks behaviorEnvMaybeWISubs
   forM_ m $ \(!wi, _) -> liftIO $ modifyIORef' invsRef (wi:)
 
@@ -373,8 +373,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     deferInit $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
       addBehaviorSubscribed (BehaviorSubscribedHold parentRef)
-      addThisBehaviorMInvalidator invsRef
-      liftIO $ readIORef forceLazyHoldReturnValRef    
+      addThisBehaviorMsInvalidator invsRef
+      liftIO $ readIORef forceLazyHoldReturnValRef
   {-# INLINABLE now #-}
   now = do
     nowOrNot <- liftIO $ newIORef $ Just ()
@@ -444,7 +444,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       return subscribed)
                     pure
       addBehaviorSubscribed (BehaviorSubscribedPull (snd subscribed))
-      addThisBehaviorMInvalidator invsRef
+      addThisBehaviorMsInvalidator invsRef
       pure $ fst subscribed
   switchUncached switchParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
