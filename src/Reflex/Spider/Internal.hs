@@ -354,6 +354,10 @@ addThisBehaviorMsInvalidator invsRef = do
 deferInit :: forall x. HasSpiderTimeline x => EventM x () -> EventM x ()
 deferInit i = addToQueue (SomeInit i) =<< asksEventEnv eventEnvInits
 
+instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
+  {-# INLINABLE sample #-}
+  sample = readBehaviorTracked
+
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   {-# NOINLINE buildHold #-}
   -- Note: cannot examine its event until after the phase is over
@@ -383,10 +387,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       occ <- liftIO . readIORef $ nowOrNot
       returnSubscription (pure ()) zeroRef () occ
 
-instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
-  {-# INLINABLE sample #-}
-  sample = readBehaviorTracked
-
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
   newtype Behavior (SpiderTimeline x) a = Behavior { readBehaviorTracked :: BehaviorM x a }
@@ -404,11 +404,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     pure $ Event $ \sub -> do
       liftIO (WeakBag.null subscribers) >>= flip when (
         liftIO . writeIORef parentSubscriptionRef . fst
-        <=< subscribeWithRec e (\a _ -> writeAndScheduleClear occRef a >> pure (Just a)) $ Subscriber
-            { subscriberPropagate = flip propagate subscribers
-            , subscriberInvalidateHeight = WeakBag.traverse_ subscribers subscriberInvalidateHeight
-            , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
-            })
+        <=< subscribeWithRec e (\a _ -> writeAndScheduleClear occRef a >> pure (Just a))
+        $ Subscriber { subscriberPropagate = flip propagate subscribers
+                     , subscriberInvalidateHeight = WeakBag.traverse_ subscribers subscriberInvalidateHeight
+                     , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
+                     })
       parentSub <- liftIO $ readIORef parentSubscriptionRef
       sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
       returnSubscription (WeakBag.remove sln >> touch sln)
@@ -429,11 +429,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     ref :: IORef (Maybe (a, [BehaviorSubscribed x])) <- newIORef Nothing
     invsRef :: IORef [Weak Invalidator] <- newIORef []
     pure $ Behavior $ do
-      subscribed <- liftIO (readIORef ref) >>= maybe (do
-                      let i = readIORef ref
-                              >>= mapM_ (const $ do
-                                            writeIORef ref Nothing
-                                            invalidate invsRef)
+      (val, parents) <- liftIO (readIORef ref) >>= maybe (do
+                      let i = readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
                       wi <- liftIO $ mkWeakPtrWithDebug i
                       parentsRef <- liftIO $ newIORef []
                       !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
@@ -443,9 +440,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       liftIO $ writeIORef ref $ Just subscribed
                       return subscribed)
                     pure
-      addBehaviorSubscribed (BehaviorSubscribedPull (snd subscribed))
+      addBehaviorSubscribed (BehaviorSubscribedPull parents)
       addThisBehaviorMsInvalidator invsRef
-      pure $ fst subscribed
+      pure val
   switchUncached switchParent = Event $ \sub -> do
     heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
     ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
