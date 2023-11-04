@@ -146,7 +146,7 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvUnsubscribeUpdates :: !(IORef [UnsubscribeUpdate x])
-              , eventEnvInits :: !(IORef [SomeInit x]) -- Needed for Subscribe
+              , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
               , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
               , eventEnvDelayedMerges :: !(IORef (IntMap [EventM x ()]))
@@ -177,8 +177,6 @@ data UnsubscribeUpdate x = UnsubscribeUpdate
   , _unsubscribeUpdate_subscriber :: !(Some (Subscriber x))
   , _unsubscribeUpdate_subscription :: !(EventSubscription x)
   }
-
-newtype SomeInit x = SomeInit { unSomeInit :: EventM x () }
 
 -- EventM can do everything BehaviorM can, plus create holds
 newtype EventM x a = EventM { runEventM :: IO a }
@@ -262,7 +260,7 @@ justRunInits a = SpiderHost $ do
           inits <- liftIO $ readIORef (eventEnvInits env)
           unless (null inits) $ do
             liftIO $ writeIORef (eventEnvInits env) []
-            forM_ inits unSomeInit
+            sequence_ inits
             runInits
         return result
 
@@ -319,7 +317,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
 
 data BehaviorEnv x = BehaviorEnv
   { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator, IORef [BehaviorSubscribed x])
-  , behaviorEnvInitsRef :: IORef [SomeInit x]
+  , behaviorEnvInitsRef :: IORef [EventM x ()]
   }
 
 -- BehaviorM can sample behaviors
@@ -333,7 +331,7 @@ data BehaviorSubscribed x
 
 type Invalidator = IO ()
 
-runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [BehaviorSubscribed x]) -> IORef [SomeInit x] -> IO a
+runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [BehaviorSubscribed x]) -> IORef [EventM x ()] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
 -- | Log an Event or Behavior which influences the value of this Behavior.
@@ -360,7 +358,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
          valRef <- liftIO . newIORef =<< readV0
-         flip addToQueue initsQueue . SomeInit $ do
+         flip addToQueue initsQueue $ do
            liftIO . writeIORef parentRef . fst
                <=< subscribeWithRec e (\a _ -> do
                                        vRef <- pure $! valRef
@@ -369,7 +367,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                                        pure (Just a))
                $ Subscriber (const (pure ())) (pure ()) (const (pure ()))
          pure valRef
-    flip addToQueue initsQueue . SomeInit $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
+    flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
       tellBehaviorParent (BehaviorSubscribedHold parentRef)
       addThisBehaviorMsInvalidator invsRef
@@ -429,7 +427,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
                       wi <- liftIO $ mkWeakPtrWithDebug i
                       parentsRef <- liftIO $ newIORef []
                       !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
-                      aVal <- liftIO $ runReaderIO (unBehaviorM a) (BehaviorEnv (Just (wi, parentsRef)) holdInits)
+                      aVal <- liftIO $ runBehaviorM a (Just (wi, parentsRef)) holdInits
                       parents <- liftIO $ readIORef parentsRef
                       let subscribed = (aVal, parents)
                       liftIO $ writeIORef ref $ Just subscribed
