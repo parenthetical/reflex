@@ -313,11 +313,6 @@ unsafeNewSpiderTimelineEnv = do
     , _spiderTimeline_eventEnv = env
     }
 
-data NewFanSubscribedChildren x a = NewFanSubscribedChildren
-  { _newFanSubscribedChildren :: WeakBag (Subscriber x a)
-  , _newFanSubscribedUninit :: IO ()
-  }
-
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   {-# INLINABLE sample #-}
   sample b = liftIO . runBehaviorM (R.sample b) Nothing =<< asksEventEnv eventEnvInits
@@ -608,6 +603,11 @@ data SpiderEventHandle x a = SpiderEventHandle
 
 -- | The monad for actions that manipulate a Spider timeline identified by @x@
 newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
+
+data NewFanSubscribedChildren x a = NewFanSubscribedChildren
+  { _newFanSubscribedChildren :: WeakBag (Subscriber x a)
+  , _newFanSubscribedUninit :: IO ()
+  }
 
 -- TODO: anything in common with Fan?
 newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
