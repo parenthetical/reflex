@@ -347,9 +347,6 @@ addThisBehaviorMsInvalidator invsRef = do
   !m <- asks behaviorEnvMaybeWISubs
   forM_ m $ \(!wi, _) -> liftIO $ modifyIORef' invsRef (wi:)
 
-deferInit :: forall x. HasSpiderTimeline x => EventM x () -> EventM x ()
-deferInit i = addToQueue (SomeInit i) =<< asksEventEnv eventEnvInits
-
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   {-# INLINABLE sample #-}
   sample = readBehaviorTracked
@@ -358,11 +355,13 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   {-# NOINLINE buildHold #-}
   -- Note: cannot examine its event until after the phase is over
   buildHold readV0 e = do
+    initsQueue <- asksEventEnv eventEnvInits
     invsRef <- liftIO $ newIORef [] -- invalidators
     parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do -- This originally used custom lazy caching code, replaced with unsafePerformIO
          valRef <- liftIO . newIORef =<< readV0
-         deferInit $ liftIO . writeIORef parentRef . fst
+         flip addToQueue initsQueue . SomeInit $ do
+           liftIO . writeIORef parentRef . fst
                <=< subscribeWithRec e (\a _ -> do
                                        vRef <- pure $! valRef
                                        iRef <- pure $! invsRef
@@ -370,7 +369,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                                        pure (Just a))
                $ Subscriber (const (pure ())) (pure ()) (const (pure ()))
          pure valRef
-    deferInit $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
+    flip addToQueue initsQueue . SomeInit $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
       tellBehaviorParent (BehaviorSubscribedHold parentRef)
       addThisBehaviorMsInvalidator invsRef
