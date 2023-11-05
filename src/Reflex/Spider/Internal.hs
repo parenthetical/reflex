@@ -66,8 +66,6 @@ import Data.Dependent.Map (DMap)
 import qualified Data.Dependent.Map as DMap
 import Data.Dependent.Sum (DSum (..))
 import Data.GADT.Compare
-import Data.IntMap.Strict (IntMap)
-import qualified Data.IntMap.Strict as IntMap
 import Data.IORef
 import Data.Kind (Type)
 import Data.Proxy
@@ -77,12 +75,10 @@ import System.IO.Unsafe
 import System.Mem.Weak
 import Unsafe.Coerce
 import Data.Reflection
-import Data.Some (Some(Some), withSome)
+import Data.Some (Some(Some))
 import Data.WeakBag (WeakBag)
 import qualified Data.WeakBag as WeakBag
-import Control.Monad.Trans.Maybe
 import Control.Monad.Reader
-import Data.Bool (bool)
 
 --NB: Once you subscribe to an Event, you must always hold on the the WHOLE EventSubscription you get back
 -- If you do not retain the subscription, you may be prematurely unsubscribed from the parent event.
@@ -91,29 +87,25 @@ data EventSubscription x = EventSubscription
   , _eventSubscription_subscribed :: {-# UNPACK #-} !(EventSubscribed x)
   }
 
-data Subscriber x a = Subscriber
-  { subscriberPropagate :: !(a -> EventM x ())
-  , subscriberInvalidateHeight :: !(IO ())
-  , subscriberRecalculateHeight :: !(Height -> IO ())
+newtype Subscriber x a = Subscriber
+  { subscriberPropagate :: Maybe a -> EventM x ()
   }
 
-returnSubscription :: Monad m => IO () -> IORef Height -> a -> b -> m (EventSubscription x, b)
-returnSubscription cleanup heightRef retained occ =
-  return (EventSubscription cleanup (EventSubscribed heightRef (toAny retained)), occ)
+returnSubscription :: Monad m => IO () -> a -> b -> m (EventSubscription x, b)
+returnSubscription cleanup retained occ =
+  return (EventSubscription cleanup (EventSubscribed (toAny retained)), occ)
 
 subscribeWithRec :: R.Event (SpiderTimeline x) a -> (a -> EventSubscription x -> EventM x (Maybe b)) -> Subscriber x b -> EventM x (EventSubscription x, Maybe b)
 subscribeWithRec e f subscriber = mdo
   (subscription, occ) <- subscribeAndRead e $ subscriber
-         { subscriberPropagate = \a -> do
-             mb <- f a subscription
-             mapM_ (subscriberPropagate subscriber) mb
+         { subscriberPropagate = subscriberPropagate subscriber . join <=< mapM (`f` subscription)
          }
   occ' <- join <$> mapM (`f` subscription) occ
   return (subscription, occ')
 
 
--- | Propagate everything at the current height
-propagate :: forall x a. a -> WeakBag (Subscriber x a) -> EventM x ()
+-- | Propagate everything
+propagate :: forall x a. Maybe a -> WeakBag (Subscriber x a) -> EventM x ()
 propagate a subscribers =
   -- Note: in the following traversal, we do not visit nodes that are added to the list during our traversal; they are new events, which will necessarily have full information already, so there is no need to traverse them
   --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
@@ -128,8 +120,7 @@ toAny = unsafeCoerce
 -- to type Any on the way in. Since we never coerce them back, this is
 -- perfectly safe.
 data EventSubscribed x = EventSubscribed
-  { eventSubscribedHeightRef :: {-# UNPACK #-} !(IORef Height)
-  , _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
+  { _eventSubscribedRetained :: {-# NOUNPACK #-} !Any
   }
 
 -- | Stores all global data relevant to a particular Spider timeline; only one
@@ -145,11 +136,8 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
 
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
-              , eventEnvUnsubscribeUpdates :: !(IORef [UnsubscribeUpdate x])
               , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
-              , eventEnvCurrentHeight :: !(IORef Height) -- Needed for Subscribe
-              , eventEnvDelayedMerges :: !(IORef (IntMap [EventM x ()]))
               }
 
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
@@ -161,47 +149,15 @@ addToQueue a q = liftIO $ modifyIORef' q (a:)
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 
-deferUnsubscribeUpdate :: HasSpiderTimeline x => EventSubscription x -> IORef Height -> Subscriber x a -> EventSubscription x -> EventM x ()
-deferUnsubscribeUpdate toUnsubscribe heightRef subscriber subscription =
-  addToQueue (UnsubscribeUpdate toUnsubscribe heightRef (Some subscriber) subscription) =<< asksEventEnv eventEnvUnsubscribeUpdates
-
 {-# INLINE writeAndScheduleClear #-}
 writeAndScheduleClear :: forall x a. HasSpiderTimeline x => IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear ref val = do
   liftIO $ writeIORef ref (Just val)
   deferClear $ writeIORef ref Nothing
 
-data UnsubscribeUpdate x = UnsubscribeUpdate
-  { _unsubscribeUpdate_toUnsubscribe :: !(EventSubscription x)
-  , _unsubscribeUpdate_heightRef :: !(IORef Height)
-  , _unsubscribeUpdate_subscriber :: !(Some (Subscriber x))
-  , _unsubscribeUpdate_subscription :: !(EventSubscription x)
-  }
-
 -- EventM can do everything BehaviorM can, plus create holds
 newtype EventM x a = EventM { runEventM :: IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
-
-invalidateHeight :: forall {k} {x :: k} {a}. IORef Height -> Subscriber x a -> IO ()
-invalidateHeight heightRef sub =  do
-    oldHeight <- readIORef heightRef
-    -- Don't do anything if the height is already invalid
-    when (oldHeight /= invalidHeight) $ do
-      writeIORef heightRef $! invalidHeight
-      subscriberInvalidateHeight sub
-
-recalculateHeight :: forall {k} {x :: k} {a}. IORef Height -> Subscriber x a -> Height -> IO ()
-recalculateHeight heightRef sub maybeNewHeight = do
-    currentHeight <- readIORef heightRef
-    -- recalculateMyHeight may be called multiple times; perhaps the's a way to finesse it to avoid this check
-    -- TODO: This will almost always be true; can we get rid of this check and just proceed to the next one always?
-    when (currentHeight == invalidHeight) $ do
-      when (maybeNewHeight /= invalidHeight) $ do
-        writeIORef heightRef $! maybeNewHeight
-        subscriberRecalculateHeight sub maybeNewHeight
-
-getSubscriptionHeight :: forall {k} {x :: k}. EventSubscription x -> IO Height
-getSubscriptionHeight = readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed
 
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
@@ -218,19 +174,7 @@ run roots after = do
                 return $ Just r
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
-      propagate a subscribersRef
-    delayedRef <- asksEventEnv eventEnvDelayedMerges
-    let putCurrentHeight h = do
-          heightRef <- asksEventEnv eventEnvCurrentHeight
-          liftIO $ writeIORef heightRef $! h
-    fix $ \go -> do
-          delayed <- liftIO $ readIORef delayedRef
-          forM_ (IntMap.minViewWithKey delayed) $ \((currentHeight, cur), future) -> do
-              putCurrentHeight $ Height currentHeight
-              liftIO $ writeIORef delayedRef $! future
-              sequence_ cur
-              go
-    putCurrentHeight maxBound
+      propagate (Just a) subscribersRef -- FIXME: need to progate Nothing as well
     after
 
 newtype Clear = Clear (IO ())
@@ -239,11 +183,6 @@ data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# U
 
 mkWeakPtrWithDebug :: a -> IO (Weak a)
 mkWeakPtrWithDebug x = mkWeakPtr x Nothing
-
--- Always refers to 0
-{-# NOINLINE zeroRef #-}
-zeroRef :: IORef Height
-zeroRef = unsafePerformIO $ newIORef zeroHeight
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
@@ -267,45 +206,25 @@ justRunInits a = SpiderHost $ do
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
-  let (EventEnv toAssignRef unsubscribeUpdateRef initRef toClearRef heightRef delayedRef) =
+  let (EventEnv toAssignRef initRef toClearRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- unSpiderHost $ justRunInits a
   readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                       writeIORef vRef v
                                       invalidate iRef)
   readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
-  unsubscribeUpdates <- readIORef unsubscribeUpdateRef
   do writeIORef toAssignRef []
-     writeIORef unsubscribeUpdateRef []
      writeIORef initRef []
-     writeIORef heightRef zeroHeight
      writeIORef toClearRef []
-     writeIORef delayedRef IntMap.empty
-  liftIO . mapM_ (unsubscribe . _unsubscribeUpdate_toUnsubscribe) $ unsubscribeUpdates
-  mapM_ (\mu -> withSome (_unsubscribeUpdate_subscriber mu) (invalidateHeight (_unsubscribeUpdate_heightRef mu))) unsubscribeUpdates
-  mapM_ (\mu -> withSome (_unsubscribeUpdate_subscriber mu) (\sub -> recalculateHeight (_unsubscribeUpdate_heightRef mu) sub  =<< getSubscriptionHeight (_unsubscribeUpdate_subscription mu))) unsubscribeUpdates
   return result
-
-newtype Height = Height { unHeight :: Int } deriving (Show, Read, Eq, Ord, Bounded)
-
-{-# INLINE zeroHeight #-}
-zeroHeight :: Height
-zeroHeight = Height 0
-
-{-# INLINE invalidHeight #-}
-invalidHeight :: Height
-invalidHeight = Height (-1000)
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
   lock <- newMVar ()
   env <- do toAssignRef <- newIORef []
-            unsubscribeUpdateRef <- newIORef []
             initRef <- newIORef []
-            heightRef <- newIORef zeroHeight
             toClearRef <- newIORef []
-            delayedRef <- newIORef IntMap.empty
-            return $ EventEnv toAssignRef unsubscribeUpdateRef initRef toClearRef heightRef delayedRef
+            return $ EventEnv toAssignRef initRef toClearRef
   return $ STE $ SpiderTimelineEnv
     { _spiderTimeline_lock = lock
     , _spiderTimeline_eventEnv = env
@@ -365,7 +284,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                                         iRef <- pure $! invsRef
                                         addToQueue (SomeAssignment @x vRef iRef a) =<< asksEventEnv eventEnvAssignments
                                         pure (Just a))
-                $ Subscriber (const (pure ())) (pure ()) (const (pure ()))
+                $ Subscriber (const (pure ()))
           pure valRef
     flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
@@ -378,7 +297,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     deferClear $ writeIORef nowOrNot Nothing
     return . Event $ \_ -> do
       occ <- liftIO . readIORef $ nowOrNot
-      returnSubscription (pure ()) zeroRef () occ
+      returnSubscription (pure ()) () occ
 
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
@@ -387,7 +306,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
   {-# INLINABLE never #-}
-  never = Event $ const $ returnSubscription (pure ()) zeroRef () Nothing
+  never = Event $ const $ returnSubscription (pure ()) () Nothing
   {-# NOINLINE [0] cacheEvent #-}
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
@@ -399,21 +318,16 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
         liftIO . writeIORef parentSubscriptionRef . fst
         <=< subscribeWithRec e (\a _ -> writeAndScheduleClear occRef a >> pure (Just a))
         $ Subscriber { subscriberPropagate = flip propagate subscribers
-                     , subscriberInvalidateHeight = WeakBag.traverse_ subscribers subscriberInvalidateHeight
-                     , subscriberRecalculateHeight = WeakBag.traverse_ subscribers . flip subscriberRecalculateHeight
                      })
       parentSub <- liftIO $ readIORef parentSubscriptionRef
       sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
       returnSubscription (WeakBag.remove sln >> touch sln)
-                         (eventSubscribedHeightRef $ _eventSubscription_subscribed parentSub)
                          (sln, parentSubscriptionRef)
                          <=< liftIO $ readIORef occRef
   {-# INLINE [1] pushCheap #-}
   pushCheap !f e = Event $ \sub -> do
     (subscription, occ) <- subscribeAndRead e $ sub
-      { subscriberPropagate = \a -> do
-          mb <- f a
-          mapM_ (subscriberPropagate sub) mb
+      { subscriberPropagate = subscriberPropagate sub <=< fmap join . mapM f
       }
     occ' <- join <$> mapM f occ
     return (subscription, occ')
@@ -437,9 +351,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       addThisBehaviorMsInvalidator invsRef
       pure val
   switchUncached switchParent = Event $ \sub -> do
-    heightRef <- liftIO $ newIORef $ error "switchUncached: heightRef uninitialized"
     ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-    let subscriber = Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
     let writeNewWeakInvalidator i = do
           wi <- mkWeakPtrWithDebug i
           writeIORef ownWeakInvalidatorRef $! wi
@@ -449,7 +361,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     let withB :: forall s b. s -> R.Behavior (SpiderTimeline x) b -> (s -> b -> EventM x s) -> EventM x s
         withB currentState b f = mfix $ \newState -> do
          let ownInvalidator = runEventM @x $ deferClear $ do
-               putStrLn "Running inits inside switch"
                -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to UnsubscribeUpdate it doesn't loop).
                unSpiderHost . justRunInits $ void $ withB newState b f
          liftIO $ writeIORef ownInvalidatorRef ownInvalidator
@@ -460,78 +371,75 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
            initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
            parentsRef <- newIORef []
            runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
-    (unsubscribeSubscription :: IO (), parentOcc) <- withB (pure (), Nothing) switchParent $ \(unsubscribePrevious,_) e -> do
-          liftIO unsubscribePrevious
-          (subscription, occ) <- subscribeAndRead e subscriber
-          liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscription
-          pure (runEventM @x $ deferUnsubscribeUpdate subscription heightRef sub subscription
-               , occ)
+    unsubscribeRef <- liftIO $ newIORef $ pure ()
+    parentOcc <- withB Nothing switchParent $ \_ e -> do
+          liftIO $ join $ readIORef unsubscribeRef
+          (subscription, occ) <- subscribeAndRead e $  Subscriber (subscriberPropagate sub)
+          liftIO $ writeIORef unsubscribeRef $ unsubscribe subscription
+          pure occ
     returnSubscription
-      (unsubscribeSubscription >> (finalize =<< readIORef ownWeakInvalidatorRef))
-      heightRef
+      ((join . readIORef $ unsubscribeRef) >> (finalize =<< readIORef ownWeakInvalidatorRef))
       ownInvalidatorRef
       parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> mdo
-    heightRef <- liftIO $ newIORef $ error "coincidenceUncached: heightRef uninitialized"
-    (subscriptionOuter', occ) <- subscribeWithRec coincidenceParent
-         (\e subscriptionOuter -> do
-             (subscriptionInner, mocc) <- subscribeAndRead e $ Subscriber (subscriberPropagate sub) (pure ()) (const (pure ()))
-             innerHeight <- liftIO $ getSubscriptionHeight subscriptionInner
-             outerHeight <- liftIO $ getSubscriptionHeight subscriptionOuter
-             if innerHeight > outerHeight
-               then do
-                 -- TODO: why do tests pass without all this?
-                 liftIO $ writeIORef heightRef innerHeight
-                 liftIO $ subscriberInvalidateHeight sub
-                 liftIO $ subscriberRecalculateHeight sub innerHeight
-                 deferUnsubscribeUpdate subscriptionInner heightRef sub subscriptionOuter
-               else liftIO $ unsubscribe subscriptionInner
-             pure mocc)
-        $ Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
-    liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscriptionOuter'
-    returnSubscription (unsubscribe subscriptionOuter') heightRef subscriptionOuter' occ
+    undefined
+    -- (subscriptionOuter', occ) <- subscribeWithRec coincidenceParent
+    --      (\e subscriptionOuter -> do
+    --          (subscriptionInner, mocc) <- subscribeAndRead e $ Subscriber (subscriberPropagate sub)
+    --          if innerHeight > outerHeight
+    --            then do
+    --              -- TODO: why do tests pass without all this?
+    --              liftIO $ writeIORef heightRef innerHeight
+    --              liftIO $ subscriberInvalidateHeight sub
+    --              liftIO $ subscriberRecalculateHeight sub innerHeight
+    --              deferUnsubscribeUpdate subscriptionInner heightRef sub subscriptionOuter
+    --            else liftIO $ unsubscribe subscriptionInner
+    --          pure mocc)
+    --     $ Subscriber (subscriberPropagate sub) (invalidateHeight heightRef sub) (recalculateHeight heightRef sub)
+    -- liftIO $ writeIORef heightRef =<< getSubscriptionHeight subscriptionOuter'
+    -- returnSubscription (unsubscribe subscriptionOuter') subscriptionOuter' occ
   unsafeBuildIncremental readV0 =
     unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
-    heightRef <- liftIO $ newIORef zeroHeight
-    accumRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
-    subscriptionsRef <- liftIO $ newIORef []
-    let getMaybeHeight = do
-          subs <- mapM (readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed) =<< readIORef subscriptionsRef
-          pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
-    let seenAllEvents = (<=) <$> liftIO (readIORef heightRef) <*> (liftIO . readIORef =<< asksEventEnv eventEnvCurrentHeight)
-    delayedRef <- asksEventEnv eventEnvDelayedMerges
-    liftIO . writeIORef subscriptionsRef <=< forM es $ \e ->
-      fmap fst $ subscribeWithRec e
-      (\a _ -> do
-             maybePrevAccumVal <- liftIO $ readIORef accumRef
-             liftIO $ writeIORef accumRef (Just a <> maybePrevAccumVal)
-             liftIO $ do height <- readIORef heightRef
-                         when (height == invalidHeight) $
-                           throwIO EventLoopException
-             when (isNothing maybePrevAccumVal) $ do -- Only schedule the firing once
-               let scheduleMerge' (Height initialHeight) =
-                     liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) initialHeight [do
-                       seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
-                           maybeCurrentAccumVal <- liftIO $ readIORef accumRef
-                           when (isJust maybeCurrentAccumVal) $ do
-                             mapM_ (subscriberPropagate sub) maybeCurrentAccumVal
-                             liftIO $ writeIORef accumRef Nothing)]
-               scheduleMerge' <=< liftIO $ readIORef heightRef
-             pure (Just ()))
-        $ Subscriber (const (pure ())) (invalidateHeight heightRef sub) $ \_ -> do
-          currentHeight <- readIORef heightRef
-          when (currentHeight == invalidHeight) $ do
-            maybeNewHeight <- getMaybeHeight
-            when (maybeNewHeight /= invalidHeight) $ do
-              writeIORef heightRef $! maybeNewHeight
-              subscriberRecalculateHeight sub maybeNewHeight
-    liftIO $ writeIORef heightRef =<< getMaybeHeight
-    occ <- runMaybeT $ do
-      guard =<< lift seenAllEvents
-      liftIO $ atomicModifyIORef accumRef (Nothing,)
-    returnSubscription (mapM_ unsubscribe =<< readIORef subscriptionsRef) heightRef subscriptionsRef (join occ)
+    undefined
+    -- accumRef :: IORef (Maybe a) <- liftIO $ newIORef Nothing
+    -- subscriptionsRef <- liftIO $ newIORef []
+    -- let getMaybeHeight = do
+    --       subs <- mapM (readIORef . eventSubscribedHeightRef . _eventSubscription_subscribed) =<< readIORef subscriptionsRef
+    --       pure $ if invalidHeight `elem` subs then invalidHeight else let (Height h) = maximum (zeroHeight:subs) in Height (succ h)
+    -- let seenAllEvents = (<=) <$> liftIO (readIORef heightRef) <*> (liftIO . readIORef =<< asksEventEnv eventEnvCurrentHeight)
+    -- delayedRef <- asksEventEnv eventEnvDelayedMerges
+    -- liftIO . writeIORef subscriptionsRef <=< forM es $ \e ->
+    --   fmap fst $ subscribeWithRec e
+    --   (\a _ -> do
+    --          maybePrevAccumVal <- liftIO $ readIORef accumRef
+    --          liftIO $ writeIORef accumRef (Just a <> maybePrevAccumVal)
+    --          liftIO $ do height <- readIORef heightRef
+    --                      when (height == invalidHeight) $
+    --                        throwIO EventLoopException
+    --          when (isNothing maybePrevAccumVal) $ do -- Only schedule the firing once
+    --            let scheduleMerge' (Height initialHeight) =
+    --                  liftIO $ modifyIORef' delayedRef $ IntMap.insertWith (++) initialHeight [do
+    --                    seenAllEvents >>= bool (scheduleMerge' =<< liftIO (readIORef heightRef)) (do
+    --                        maybeCurrentAccumVal <- liftIO $ readIORef accumRef
+    --                        when (isJust maybeCurrentAccumVal) $ do
+    --                          mapM_ (subscriberPropagate sub) maybeCurrentAccumVal
+    --                          liftIO $ writeIORef accumRef Nothing)]
+    --            scheduleMerge' <=< liftIO $ readIORef heightRef
+    --          pure (Just ()))
+    --     $ Subscriber (const (pure ())) (invalidateHeight heightRef sub) $ \_ -> do
+    --       currentHeight <- readIORef heightRef
+    --       when (currentHeight == invalidHeight) $ do
+    --         maybeNewHeight <- getMaybeHeight
+    --         when (maybeNewHeight /= invalidHeight) $ do
+    --           writeIORef heightRef $! maybeNewHeight
+    --           subscriberRecalculateHeight sub maybeNewHeight
+    -- liftIO $ writeIORef heightRef =<< getMaybeHeight
+    -- occ <- runMaybeT $ do
+    --   guard =<< lift seenAllEvents
+    --   liftIO $ atomicModifyIORef accumRef (Nothing,)
+    -- returnSubscription (mapM_ unsubscribe =<< readIORef subscriptionsRef) heightRef subscriptionsRef (join occ)
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
 
@@ -635,7 +543,7 @@ newFanEventWithTriggerIO f = do
     --   cs <- readIORef $ _weakBag_children subs
     --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
      -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-    returnSubscription (WeakBag.remove sln >> touch sln) zeroRef subscribedRef
+    returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef
       . coerce . DMap.lookup k
       =<< readIORef occRef
 
@@ -664,9 +572,7 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
     --TODO: Unsubscribe eventually (manually and/or with weak ref)
     valRef <- liftIO $ newIORef Nothing
     subscription <- fmap fst . subscribeAndRead e $ Subscriber
-      { subscriberPropagate = writeAndScheduleClear valRef
-      , subscriberInvalidateHeight = pure ()
-      , subscriberRecalculateHeight = \_ -> return ()
+      { subscriberPropagate = mapM_ (writeAndScheduleClear valRef)
       }
     return $ SpiderEventHandle
       { spiderEventHandleSubscription = subscription
@@ -772,4 +678,3 @@ instance GEq SpiderTimelineEnv where
   a `geq` b = if _spiderTimeline_lock (unSTE a) == _spiderTimeline_lock (unSTE b)
               then Just $ unsafeCoerce Refl -- This unsafeCoerce is safe because the same SpiderTimelineEnv can't have two different 'x' arguments
               else Nothing
-
