@@ -79,6 +79,10 @@ import Data.Some (Some(Some))
 import Data.WeakBag (WeakBag)
 import qualified Data.WeakBag as WeakBag
 import Control.Monad.Reader
+import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
+import Text.Printf (printf)
+import Debug.RecoverRTTI (anythingToString)
 
 --NB: Once you subscribe to an Event, you must always hold on the the WHOLE EventSubscription you get back
 -- If you do not retain the subscription, you may be prematurely unsubscribed from the parent event.
@@ -128,13 +132,15 @@ newtype SpiderTimelineEnv (x :: Type) = STE {unSTE :: SpiderTimelineEnv' x}
 data SpiderTimelineEnv' x = SpiderTimelineEnv
   { _spiderTimeline_lock :: {-# UNPACK #-} !(MVar ())
   , _spiderTimeline_eventEnv :: {-# UNPACK #-} !(EventEnv x)
-  , _spiderTimeline_rootTriggers :: IORef [Some (RootTrigger x)]
+  , _spiderTimeline_rootTriggers :: IORef (IntMap (Some (RootTrigger x)))
   }
 
 data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
+              , eventEnvUnsubscribes :: !(IORef [EventSubscription x])
+              , eventEnvBla :: !(IORef [IO ()])
               }
    
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
@@ -145,6 +151,12 @@ addToQueue a q = liftIO $ modifyIORef' q (a:)
 
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
+
+deferUnsubscribe :: HasSpiderTimeline x => EventSubscription x -> EventM x ()
+deferUnsubscribe subscription = addToQueue subscription =<< asksEventEnv eventEnvUnsubscribes
+
+deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
+deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
 
 {-# INLINE writeAndScheduleClear #-}
 writeAndScheduleClear :: forall x a. HasSpiderTimeline x => IORef (Maybe a) -> a -> EventM x ()
@@ -160,20 +172,24 @@ newtype EventM x a = EventM { runEventM :: IO a }
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
 run roots after = do
   let t = spiderTimeline :: SpiderTimelineEnv x
+  liftIO $ putStrLn "\nRUN ~~~"
   SpiderHost $ withMVar (_spiderTimeline_lock (unSTE t)) $ \_ -> unSpiderHost $ runFrame $ do
-    rootsToPropagate <- forM roots $ \r@(RootTrigger (_, occRef, k) :=> a) -> do
+    rootsToPropagate <- forM roots $ \r@(RootTrigger (triggerId, _, occRef, k) :=> a) -> do
       occBefore <- liftIO $ readIORef occRef
       liftIO $ writeIORef occRef $! DMap.insert k a occBefore
       if DMap.null occBefore
         then do deferClear $ writeIORef occRef $! DMap.empty
                 return $ Just r
         else return Nothing
-    forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (subscribersRef, _, _) :=> Identity a) -> do
-      propagate (Just a) subscribersRef -- FIXME: need to progate Nothing as well
+    forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (triggerId, subscribersRef, _, _) :=> Identity a) -> do
+      liftIO $ printf "Propagating trigger %d with value %s\n" triggerId $ anythingToString a
+      propagate (Just a) subscribersRef
     triggers <- liftIO $ readIORef $ _spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))
-    forM_ triggers $ \(Some (RootTrigger (subscribersRef, occRef, _))) -> do
+    forM_ triggers $ \(Some (RootTrigger (triggerId, subscribersRef, occRef, _))) -> do
       occ <- liftIO $ readIORef occRef
-      when (DMap.null occ) $ propagate Nothing subscribersRef
+      when (DMap.null occ) $ do
+        liftIO $ printf "Propagating null trigger %d\n" triggerId
+        propagate Nothing subscribersRef
     after
 
 newtype Clear = Clear (IO ())
@@ -188,10 +204,14 @@ invalidate wisRef = do
   mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< deRefWeak $ wi) =<< readIORef wisRef
   writeIORef wisRef []
 
-justRunInits :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
-justRunInits a = SpiderHost $ do
+-- | Run an event action outside of a frame
+runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
+runFrame a = SpiderHost $ do
+  let (EventEnv toAssignRef initRef toClearRef toUnsubscribeRef toBlaRef) =
+        _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
+  liftIO $ putStrLn ">>> Running inits"
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-  runEventM $ do
+  result <- runEventM $ do
         result <- a
         -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
         fix $ \runInits -> do
@@ -201,20 +221,23 @@ justRunInits a = SpiderHost $ do
             sequence_ inits
             runInits
         return result
-
--- | Run an event action outside of a frame
-runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
-runFrame a = SpiderHost $ do
-  let (EventEnv toAssignRef initRef toClearRef) =
-        _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-  result <- unSpiderHost $ justRunInits a
+  liftIO $ putStrLn "<<< End running inits"
+  putStrLn "-- ASSIGNMENTS"
   readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                       writeIORef vRef v
                                       invalidate iRef)
+  putStrLn "-- CLEARING"
   readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
+  putStrLn "-- BLA"
+  sequence_ =<< readIORef toBlaRef
+  putStrLn "-- UNSUBSCRIBING"
+  mapM_ unsubscribe =<< readIORef toUnsubscribeRef
+  putStrLn "-- DONE RUNFRAME"
   do writeIORef toAssignRef []
      writeIORef initRef []
      writeIORef toClearRef []
+     writeIORef toUnsubscribeRef []
+     writeIORef toBlaRef []
   return result
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
@@ -223,8 +246,10 @@ unsafeNewSpiderTimelineEnv = do
   env <- do toAssignRef <- newIORef []
             initRef <- newIORef []
             toClearRef <- newIORef []
-            return $ EventEnv toAssignRef initRef toClearRef
-  triggers <- newIORef []
+            toUnsubscribeRef <- newIORef []
+            toBlaRef <- newIORef []
+            return $ EventEnv toAssignRef initRef toClearRef toUnsubscribeRef toBlaRef
+  triggers <- newIORef mempty
   return $ STE $ SpiderTimelineEnv
     { _spiderTimeline_lock = lock
     , _spiderTimeline_eventEnv = env
@@ -283,6 +308,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                 <=< subscribeWithRec e (\ma _ -> mapM (\a -> do
                                                           vRef <- pure $! valRef
                                                           iRef <- pure $! invsRef
+                                                          liftIO $ printf "Hold update %s\n" $ anythingToString a 
                                                           addToQueue (SomeAssignment @x vRef iRef a) =<< asksEventEnv eventEnvAssignments
                                                           pure a)
                                                  ma)
@@ -362,48 +388,69 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     -- withB is like "fold over Behavior updates"
     let withB :: forall s b. s -> R.Behavior (SpiderTimeline x) b -> (s -> b -> EventM x s) -> EventM x s
         withB currentState b f = mfix $ \newState -> do
-         let ownInvalidator = runEventM @x $ deferClear $ do
-               -- TODO: this used to be runFrame instead of justRunInits but in the tests only inits are generated, also it now loops if you use runFrame (if you defer to UnsubscribeUpdate it doesn't loop).
-               unSpiderHost . justRunInits $ void $ withB newState b f
+         let ownInvalidator = runEventM @x $ deferBla $ do
+               putStrLn $ "SWITCH INITS"
+               unSpiderHost . runFrame $ void $ withB newState b f
+               putStrLn $ "END SWITCH INITS"
          liftIO $ writeIORef ownInvalidatorRef ownInvalidator
          liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
          liftIO $ writeNewWeakInvalidator ownInvalidator
          f currentState <=< liftIO $ do
            wi <- readIORef ownWeakInvalidatorRef
-           initsRef <- newIORef [] -- TODO: normally initsRef <- getDeferralQueue, but here the initsRef stays empty?
+           initsRef <- newIORef []
            parentsRef <- newIORef []
            runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
     unsubscribeRef <- liftIO $ newIORef $ pure ()
     parentOcc <- withB Nothing switchParent $ \_ e -> do
-          liftIO $ join $ readIORef unsubscribeRef
-          (subscription, occ) <- subscribeAndRead e $  Subscriber (subscriberPropagate sub)
-          liftIO $ writeIORef unsubscribeRef $ unsubscribe subscription
-          pure occ
+      liftIO $ join $ readIORef unsubscribeRef
+      (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
+        liftIO $ printf "Switch hold update: %s\n" $ anythingToString ma
+        subscriberPropagate sub ma
+      mapM_ (subscriberPropagate sub) occ
+      liftIO $ writeIORef unsubscribeRef $ runEventM @x $ deferUnsubscribe subscription
+      liftIO $ printf "Switch hold update: %s\n" $ anythingToString occ
+      pure occ
+    liftIO $ printf "Initial switch occ: %s\n" $ anythingToString parentOcc
     returnSubscription
       ((join . readIORef $ unsubscribeRef) >> (finalize =<< readIORef ownWeakInvalidatorRef))
       ownInvalidatorRef
       parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> mdo
+    liftIO $ putStrLn "Coincidence: subscribing"
     (subscriptionOuter', occ) <- subscribeWithRec coincidenceParent
          (\me _subscriptionOuter -> do
-             fmap join $ case me of
+             mocc <- fmap join $ case me of
                Nothing -> pure Nothing
-               Just e -> fmap snd . subscribeWithRec e (\mocc subscriptionInner -> do
-                                                when (isJust mocc) $ liftIO $ unsubscribe subscriptionInner
-                                                pure mocc)
-                         $ Subscriber (subscriberPropagate sub)
+               Just e -> fmap snd
+                         . subscribeWithRec e (\mocc subscriptionInner -> do
+                                                  deferUnsubscribe subscriptionInner
+                                                  pure mocc)
+                         $ Subscriber (\occ -> do
+                                         liftIO $ printf "Coincidence propagating inner occ: %s\n" $ anythingToString occ
+                                         subscriberPropagate sub occ)
+             liftIO $ printf "Coincidence occ: %s\n" $ anythingToString mocc
+             pure mocc
             )
-        $ Subscriber (subscriberPropagate sub)
+        $ Subscriber (\occ -> do
+                         liftIO $ printf "Coincidence propagating outer occ: %s\n" $ anythingToString occ
+                         subscriberPropagate sub occ)
     returnSubscription (unsubscribe subscriptionOuter') subscriptionOuter' occ
   unsafeBuildIncremental readV0 =
     unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> mdo
-    let maybeResult = liftIO . fmap (fmap mconcat . sequence) . mapM (readIORef . fst) $ occRefsSubscriptions
-    occRefsSubscriptions <- forM es $ \e -> do
+    let maybeResult = do
+          res <- liftIO . fmap (fmap mconcat . sequence) . mapM (readIORef . fst) $ occRefsSubscriptions
+          liftIO $ printf "Merge state: %s\n" . anythingToString =<< mapM (readIORef . fst) occRefsSubscriptions
+          liftIO $ printf "Merge maybeResult: %s\n" $ anythingToString res
+          pure res
+    occRefsSubscriptions <- forM (zip es [(0 :: Int)..]) $ \(e,n) -> do
       occRef <- liftIO $ newIORef Nothing
       subscription <- fmap fst . subscribeWithRec e
         (\occ _ -> do
+            liftIO $ printf "Merge incoming occ nr %d: %s\n" n (anythingToString occ)
+            prev <- liftIO $ readIORef occRef
+            unless (isNothing prev) $ error $ "merge slot written twice: " <> anythingToString prev <> " to " <> anythingToString occ
             writeAndScheduleClear occRef occ
             pure Nothing)
         $ Subscriber $ \_ -> mapM_ (subscriberPropagate sub) =<< maybeResult
@@ -468,7 +515,7 @@ withSpiderTimeline k = do
   env <- unsafeNewSpiderTimelineEnv
   reify env $ \s -> k $ localSpiderTimeline s env
 
-data RootTrigger x a = forall k. GCompare k => RootTrigger (WeakBag (Subscriber x a), IORef (DMap k Identity), k a)
+data RootTrigger x a = forall k. GCompare k => RootTrigger (Int, WeakBag (Subscriber x a), IORef (DMap k Identity), k a)
 
 data SpiderEventHandle x a = SpiderEventHandle
   { spiderEventHandleSubscription :: EventSubscription x
@@ -613,18 +660,25 @@ instance Monad (SpiderHostFrame x) where
 -- newEventWithTriggerIO f = do
 --   es <- newFanEventWithTriggerIO $ \Refl -> f
 --   return $ R.select es Refl
+
+{-# NOINLINE triggerCtr #-}
+triggerCtr :: IORef Int
+triggerCtr = unsafePerformIO $ newIORef 0
+
 newEventWithTriggerIO :: forall (x :: Type) a. HasSpiderTimeline x => (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
 newEventWithTriggerIO f = do
   occRef <- newIORef DMap.empty
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
+  triggerId <- atomicModifyIORef triggerCtr (\c -> (succ c, c))
+  printf "New trigger with id %d\n" triggerId
   pure $ Event $ \sub -> liftIO $ do
     (NewFanSubscribedChildren subscribers uninit) <-
       (\case
         Just res -> pure res
         Nothing -> do
           subscribers <- WeakBag.empty
-          let trigger = RootTrigger (subscribers, occRef, Refl)
-          modifyIORef (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))) (Some trigger:)
+          let trigger = RootTrigger (triggerId, subscribers, occRef, Refl)
+          modifyIORef (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))) (IntMap.insert triggerId (Some trigger))
           uninit <- f trigger
           let res = NewFanSubscribedChildren subscribers uninit
           modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") Refl res
@@ -634,6 +688,7 @@ newEventWithTriggerIO f = do
     sln <- WeakBag.insert' sub subscribers $ do
               uninit
               modifyIORef' subscribedRef $ DMap.delete Refl
+              modifyIORef' (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))) (IntMap.delete triggerId)
     -- TODO: understand original intent of this comment:
     -- If we die at the same moment that all our children die, they will
     -- try to clean us up but will fail because their Weak reference to us
