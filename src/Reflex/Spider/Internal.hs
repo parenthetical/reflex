@@ -133,6 +133,7 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
   { _spiderTimeline_lock :: {-# UNPACK #-} !(MVar ())
   , _spiderTimeline_eventEnv :: {-# UNPACK #-} !(EventEnv x)
   , _spiderTimeline_rootTriggers :: IORef (IntMap (Some (RootTrigger x)))
+  , _spiderTimeline_never :: R.Event (SpiderTimeline x) ()
   }
 
 data EventEnv x
@@ -155,7 +156,7 @@ deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 deferUnsubscribe :: HasSpiderTimeline x => EventSubscription x -> EventM x ()
 deferUnsubscribe subscription = addToQueue subscription =<< asksEventEnv eventEnvUnsubscribes
 
-deferBla :: HasSpiderTimeline x => IO _ -> EventM x ()
+deferBla :: HasSpiderTimeline x => IO (EventSubscription x) -> EventM x ()
 deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
 
 {-# INLINE writeAndScheduleClear #-}
@@ -242,12 +243,12 @@ runFrame a = SpiderHost $ do
   return result
 
 runHoldInits :: MonadIO m => IORef [m a] -> m ()
-runHoldInits initsRef = fix $ \runHoldInits -> do
-          inits <- liftIO $ readIORef initsRef
-          unless (null inits) $ do
-            liftIO $ writeIORef initsRef []
-            sequence_ inits
-            runHoldInits
+runHoldInits initsRef = fix $ \runHoldInits' -> do
+  inits <- liftIO $ readIORef initsRef
+  unless (null inits) $ do
+    liftIO $ writeIORef initsRef []
+    sequence_ inits
+    runHoldInits'
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
@@ -259,10 +260,12 @@ unsafeNewSpiderTimelineEnv = do
             toBlaRef <- newIORef []
             return $ EventEnv toAssignRef initRef toClearRef toUnsubscribeRef toBlaRef
   triggers <- newIORef mempty
+  never' <- newEventWithTriggerIO' triggers (\_ -> pure (pure ()))
   return $ STE $ SpiderTimelineEnv
     { _spiderTimeline_lock = lock
     , _spiderTimeline_eventEnv = env
     , _spiderTimeline_rootTriggers = triggers
+    , _spiderTimeline_never = never'
     }
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
@@ -343,7 +346,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
   {-# INLINABLE never #-}
-  never = Event $ const $ returnSubscription (pure ()) () (Just Nothing)
+  never = fmap unsafeCoerce $ _spiderTimeline_never (unSTE (spiderTimeline :: SpiderTimelineEnv x)) -- Event $ const $ returnSubscription (pure ()) () (Just Nothing)
   {-# NOINLINE [0] cacheEvent #-}
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
@@ -568,7 +571,7 @@ localSpiderTimeline
   :: proxy s
   -> SpiderTimelineEnv x
   -> SpiderTimelineEnv (LocalSpiderTimeline x s)
-localSpiderTimeline _ = coerce
+localSpiderTimeline _ = unsafeCoerce -- FIXME: was coerce
 
 -- | Pass a new timeline to the given function.
 withSpiderTimeline :: forall r. (forall x. HasSpiderTimeline x => SpiderTimelineEnv x -> IO r) -> IO r
@@ -727,7 +730,11 @@ triggerCtr :: IORef Int
 triggerCtr = unsafePerformIO $ newIORef 0
 
 newEventWithTriggerIO :: forall (x :: Type) a. HasSpiderTimeline x => (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
-newEventWithTriggerIO f = do
+newEventWithTriggerIO = newEventWithTriggerIO' (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
+
+
+newEventWithTriggerIO' :: forall (x :: Type) a. IORef (IntMap (Some (RootTrigger x))) -> (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
+newEventWithTriggerIO' rootTriggersRef f = do
   occRef <- newIORef DMap.empty
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
   triggerId <- atomicModifyIORef triggerCtr (\c -> (succ c, c))
@@ -739,7 +746,7 @@ newEventWithTriggerIO f = do
         Nothing -> do
           subscribers <- WeakBag.empty
           let trigger = RootTrigger (triggerId, subscribers, occRef, Refl)
-          modifyIORef (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))) (IntMap.insert triggerId (Some trigger))
+          modifyIORef rootTriggersRef (IntMap.insert triggerId (Some trigger))
           uninit <- f trigger
           let res = NewFanSubscribedChildren subscribers uninit
           modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") Refl res
@@ -749,7 +756,7 @@ newEventWithTriggerIO f = do
     sln <- WeakBag.insert' sub subscribers $ do
               uninit
               modifyIORef' subscribedRef $ DMap.delete Refl
-              modifyIORef' (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))) (IntMap.delete triggerId)
+              modifyIORef' rootTriggersRef (IntMap.delete triggerId)
     -- TODO: understand original intent of this comment:
     -- If we die at the same moment that all our children die, they will
     -- try to clean us up but will fail because their Weak reference to us
