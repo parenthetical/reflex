@@ -214,7 +214,7 @@ import qualified Data.IntMap.Strict as IntMap
 import Data.Kind (Type)
 import Data.List.NonEmpty (NonEmpty (..))
 import Data.Map (Map)
-import Data.Semigroup (Semigroup (..))
+import Data.Semigroup (Semigroup (..), First (..))
 import Data.Some (Some(Some))
 import Data.String
 import Data.These
@@ -993,7 +993,8 @@ mergeWith' f g es = fmap (Prelude.foldl1 g . fmap f)
 -- leftmost event.
 {-# INLINE leftmost #-}
 leftmost :: Reflex t => [Event t a] -> Event t a
-leftmost = mergeWith const
+leftmost = cacheEvent . fmap getFirst . mergeListUncached . fmap (fmap First)
+-- leftmost = mergeWith const
 
 -- | Create a new 'Event' that occurs if at least one of the 'Event's in the
 -- list occurs and has a list of the values of all 'Event's occurring at that
@@ -1080,8 +1081,8 @@ switchHold ea0 eea = switch <$> hold ea0 eea
 switchHoldPromptly :: (Reflex t, MonadHold t m) => Event t a -> Event t (Event t a) -> m (Event t a)
 switchHoldPromptly ea0 eea = do
   bea <- hold ea0 eea
-  let eLag = switch bea
-      eCoincidences = coincidence eea
+  let eLag = switchUncached bea
+      eCoincidences = coincidenceUncached eea
   return $ leftmost [eCoincidences, eLag]
 
 -- | switches to a new event whenever it receives one.  At the moment of
