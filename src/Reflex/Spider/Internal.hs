@@ -159,8 +159,10 @@ deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
 deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
 
 {-# INLINE writeAndScheduleClear #-}
-writeAndScheduleClear :: forall x a. HasSpiderTimeline x => IORef (Maybe a) -> a -> EventM x ()
-writeAndScheduleClear ref val = do
+writeAndScheduleClear :: forall x a. HasSpiderTimeline x => String -> IORef (Maybe a) -> a -> EventM x ()
+writeAndScheduleClear info ref val = do
+  prevVal <- liftIO $ readIORef ref
+  when (isJust prevVal) $ error $ "Val was already set in " <> info <> ". Old:" <> anythingToString (fromJust prevVal) <> ", new: " <> anythingToString val
   liftIO $ writeIORef ref (Just val)
   deferClear $ writeIORef ref Nothing
 
@@ -174,7 +176,7 @@ run roots after = do
   let t = spiderTimeline :: SpiderTimelineEnv x
   liftIO $ putStrLn "\nRUN ~~~"
   SpiderHost $ withMVar (_spiderTimeline_lock (unSTE t)) $ \_ -> unSpiderHost $ runFrame $ do
-    rootsToPropagate <- forM roots $ \r@(RootTrigger (triggerId, _, occRef, k) :=> a) -> do
+    rootsToPropagate <- forM roots $ \r@(RootTrigger (_triggerId, _, occRef, k) :=> a) -> do
       occBefore <- liftIO $ readIORef occRef
       liftIO $ writeIORef occRef $! DMap.insert k a occBefore
       if DMap.null occBefore
@@ -214,12 +216,7 @@ runFrame a = SpiderHost $ do
   result <- runEventM $ do
         result <- a
         -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
-        fix $ \runInits -> do
-          inits <- liftIO $ readIORef (eventEnvInits env)
-          unless (null inits) $ do
-            liftIO $ writeIORef (eventEnvInits env) []
-            sequence_ inits
-            runInits
+        runHoldInits (eventEnvInits env)
         return result
   liftIO $ putStrLn "<<< End running inits"
   putStrLn "-- ASSIGNMENTS"
@@ -239,6 +236,14 @@ runFrame a = SpiderHost $ do
      writeIORef toUnsubscribeRef []
      writeIORef toBlaRef []
   return result
+
+runHoldInits :: MonadIO m => IORef [m a] -> m ()
+runHoldInits initsRef = fix $ \runHoldInits -> do
+          inits <- liftIO $ readIORef initsRef
+          unless (null inits) $ do
+            liftIO $ writeIORef initsRef []
+            sequence_ inits
+            runHoldInits
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
@@ -308,7 +313,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                 <=< subscribeWithRec e (\ma _ -> mapM (\a -> do
                                                           vRef <- pure $! valRef
                                                           iRef <- pure $! invsRef
-                                                          liftIO $ printf "Hold update %s\n" $ anythingToString a 
+                                                          liftIO $ printf "Hold update %s\n" $ anythingToString a
                                                           addToQueue (SomeAssignment @x vRef iRef a) =<< asksEventEnv eventEnvAssignments
                                                           pure a)
                                                  ma)
@@ -345,7 +350,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       do notSubscribed <- liftIO (WeakBag.null subscribers)
          when notSubscribed $
            liftIO . writeIORef parentSubscriptionRef . fst
-           <=< subscribeWithRec e (\occ _ -> writeAndScheduleClear occRef occ >> pure occ)
+           <=< subscribeWithRec e (\occ _ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
            $ Subscriber { subscriberPropagate = flip propagate subscribers }
       parentSub <- liftIO $ readIORef parentSubscriptionRef
       sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
@@ -378,43 +383,78 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       tellBehaviorParent (BehaviorSubscribedPull parents)
       addThisBehaviorMsInvalidator invsRef
       pure val
-  switchUncached switchParent = Event $ \sub -> do
-    ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-    let writeNewWeakInvalidator i = do
+  switchUncached switchParent = Event $ \sub -> mdo
+    parentsRef <- liftIO $ newIORef [] --TODO: This should be unnecessary, because it will always be filled with just the single parent behavior
+    holdInitsRef <- asksEventEnv eventEnvInits
+    subscriptionRef <- liftIO $ newIORef $ error "switchUncached: subscriptionRef uninitialized"
+    liftIO $ putStrLn "initializing switch"
+    wiRef <- liftIO $ newIORef $ error "switchUncached: wiRef uninitialized"
+    let subscriber = Subscriber $  \ma -> do
+          liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
+          subscriberPropagate sub ma
+    let switchInvalidator = runEventM @x $ deferBla $ do
+          oldSubscription <- readIORef subscriptionRef
+          writeIORef parentsRef []
+          writeIORef holdInitsRef [] --TODO: Should we reuse this?
+          finalize =<< readIORef wiRef
+          i <- evaluate switchInvalidator
           wi <- mkWeakPtrWithDebug i
-          writeIORef ownWeakInvalidatorRef $! wi
-    liftIO $ writeNewWeakInvalidator (pure ())
-    ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
-    -- withB is like "fold over Behavior updates"
-    let withB :: forall s b. s -> R.Behavior (SpiderTimeline x) b -> (s -> b -> EventM x s) -> EventM x s
-        withB currentState b f = mfix $ \newState -> do
-         let ownInvalidator = runEventM @x $ deferBla $ do
-               putStrLn $ "SWITCH INITS"
-               unSpiderHost . runFrame $ void $ withB newState b f
-               putStrLn $ "END SWITCH INITS"
-         liftIO $ writeIORef ownInvalidatorRef ownInvalidator
-         liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
-         liftIO $ writeNewWeakInvalidator ownInvalidator
-         f currentState <=< liftIO $ do
-           wi <- readIORef ownWeakInvalidatorRef
-           initsRef <- newIORef []
-           parentsRef <- newIORef []
-           runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
-    unsubscribeRef <- liftIO $ newIORef $ pure ()
-    parentOcc <- withB Nothing switchParent $ \_ e -> do
-      liftIO $ join $ readIORef unsubscribeRef
-      (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
-        liftIO $ printf "Switch hold update: %s\n" $ anythingToString ma
-        subscriberPropagate sub ma
-      mapM_ (subscriberPropagate sub) occ
-      liftIO $ writeIORef unsubscribeRef $ runEventM @x $ deferUnsubscribe subscription
-      liftIO $ printf "Switch hold update: %s\n" $ anythingToString occ
-      pure occ
-    liftIO $ printf "Initial switch occ: %s\n" $ anythingToString parentOcc
-    returnSubscription
-      ((join . readIORef $ unsubscribeRef) >> (finalize =<< readIORef ownWeakInvalidatorRef))
-      ownInvalidatorRef
-      parentOcc
+          liftIO $ writeIORef wiRef wi
+          e <- runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
+          runEventM $ runHoldInits holdInitsRef  --TODO: Is this actually OK? It seems like it should be, since we know that no events are firing at this point, but it still seems inelegant
+          -- ORIGINALLY, but it loops:
+          (subscription, occ) <- unSpiderHost $ runFrame $ subscribeAndRead e subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+          when (isJust occ) $ error $ "Event is firing but it shouldn't?"
+          -- END
+          writeIORef subscriptionRef subscription
+          runEventM @x $ deferUnsubscribe oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
+    do wi <- liftIO $ mkWeakPtrWithDebug switchInvalidator
+       liftIO $ writeIORef wiRef wi
+       e <- liftIO $ runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
+       (subscription, parentOcc) <- subscribeAndRead e subscriber
+       liftIO $ writeIORef subscriptionRef subscription
+       liftIO $ putStrLn $ "Initial switch occ: " <> anythingToString parentOcc
+       returnSubscription
+          (unsubscribe =<< readIORef subscriptionRef)
+          (switchInvalidator, wiRef, subscriptionRef, holdInitsRef, parentsRef)
+          parentOcc
+  -- switchUncached switchParent = Event $ \sub -> do
+  --   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
+  --   let writeNewWeakInvalidator i = do
+  --         wi <- mkWeakPtrWithDebug i
+  --         writeIORef ownWeakInvalidatorRef $! wi
+  --   liftIO $ writeNewWeakInvalidator (pure ())
+  --   ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
+  --   -- withB is like "fold over Behavior updates"
+  --   let withB :: forall s b. s -> R.Behavior (SpiderTimeline x) b -> (s -> b -> EventM x s) -> EventM x s
+  --       withB currentState b f = mfix $ \newState -> do
+  --        let ownInvalidator = runEventM @x $ deferBla $ do
+  --              putStrLn $ "SWITCH INITS"
+  --              unSpiderHost . runFrame $ void $ withB newState b f
+  --              putStrLn $ "END SWITCH INITS"
+  --        liftIO $ writeIORef ownInvalidatorRef ownInvalidator
+  --        liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
+  --        liftIO $ writeNewWeakInvalidator ownInvalidator
+  --        f currentState <=< liftIO $ do
+  --          wi <- readIORef ownWeakInvalidatorRef
+  --          initsRef <- newIORef []
+  --          parentsRef <- newIORef []
+  --          runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
+  --   unsubscribeRef <- liftIO $ newIORef $ pure ()
+  --   parentOcc <- withB Nothing switchParent $ \_ e -> do
+  --     liftIO $ join $ readIORef unsubscribeRef
+  --     (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
+  --       liftIO $ printf "Switch hold update: %s\n" $ anythingToString ma
+  --       subscriberPropagate sub ma
+  --     mapM_ (subscriberPropagate sub) occ
+  --     liftIO $ writeIORef unsubscribeRef $ runEventM @x $ deferUnsubscribe subscription
+  --     liftIO $ printf "Switch hold update: %s\n" $ anythingToString occ
+  --     pure occ
+  --   liftIO $ printf "Initial switch occ: %s\n" $ anythingToString parentOcc
+  --   returnSubscription
+  --     ((join . readIORef $ unsubscribeRef) >> (finalize =<< readIORef ownWeakInvalidatorRef))
+  --     ownInvalidatorRef
+  --     parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> mdo
     liftIO $ putStrLn "Coincidence: subscribing"
     (subscriptionOuter', occ) <- subscribeWithRec coincidenceParent
@@ -438,24 +478,38 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   unsafeBuildIncremental readV0 =
     unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
-  mergeListUncached es = Event $ \sub -> mdo
+  mergeListUncached es = Event $ \sub -> do
+    clearScheduledRef <- liftIO $ newIORef False
+    occRefsSubscriptionsRef <- liftIO $ newIORef $ error "mergeListUncached: occRefsSubscriptions unitialized"
     let maybeResult = do
-          res <- liftIO . fmap (fmap mconcat . sequence) . mapM (readIORef . fst) $ occRefsSubscriptions
-          liftIO $ printf "Merge state: %s\n" . anythingToString =<< mapM (readIORef . fst) occRefsSubscriptions
-          liftIO $ printf "Merge maybeResult: %s\n" $ anythingToString res
+          res <- fmap (fmap mconcat . sequence) . mapM (readIORef . fst) =<< readIORef occRefsSubscriptionsRef
+          printf "Merge state: %s\n" . anythingToString =<< mapM (readIORef . fst) =<< readIORef occRefsSubscriptionsRef
+          printf "Merge maybeResult: %s\n" $ anythingToString res
           pure res
-    occRefsSubscriptions <- forM (zip es [(0 :: Int)..]) $ \(e,n) -> do
+    let doScheduleClearOnce = do
+          isScheduled <- liftIO $ readIORef clearScheduledRef
+          unless isScheduled $ do
+            liftIO $ writeIORef clearScheduledRef True
+            deferClear $ do
+              status <- maybeResult
+              when (isNothing status) $
+                error "Merge: not all inputs fired"
+              occRefs <- fmap fst <$> readIORef occRefsSubscriptionsRef
+              forM_ occRefs (`writeIORef` Nothing)
+    liftIO . writeIORef occRefsSubscriptionsRef <=< forM (zip es [(0 :: Int)..]) $ \(e,n) -> do
       occRef <- liftIO $ newIORef Nothing
       subscription <- fmap fst . subscribeWithRec e
         (\occ _ -> do
             liftIO $ printf "Merge incoming occ nr %d: %s\n" n (anythingToString occ)
             prev <- liftIO $ readIORef occRef
             unless (isNothing prev) $ error $ "merge slot written twice: " <> anythingToString prev <> " to " <> anythingToString occ
-            writeAndScheduleClear occRef occ
+            liftIO $ writeIORef occRef (Just occ)
+            doScheduleClearOnce
             pure Nothing)
-        $ Subscriber $ \_ -> mapM_ (subscriberPropagate sub) =<< maybeResult
+        $ Subscriber $ \_ -> mapM_ (subscriberPropagate sub) =<< liftIO maybeResult
       pure (occRef, subscription)
-    returnSubscription (mapM_ (unsubscribe . snd) occRefsSubscriptions) () =<< maybeResult
+    maybeOcc <- liftIO maybeResult
+    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) () maybeOcc
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
 
@@ -589,9 +643,9 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
     --TODO: Unsubscribe eventually (manually and/or with weak ref)
     valRef <- liftIO $ newIORef Nothing
     (subscription, occ) <- subscribeAndRead e $ Subscriber
-      { subscriberPropagate = mapM_ (writeAndScheduleClear valRef)
+      { subscriberPropagate = mapM_ (writeAndScheduleClear "subscribeEvent propagate" valRef)
       }
-    mapM_ (mapM_ (writeAndScheduleClear valRef)) occ -- TODO: added but why was this originally not like that?
+    mapM_ (mapM_ (writeAndScheduleClear "subscribeEvent init" valRef)) occ -- TODO: added but why was this originally not like that?
     return $ SpiderEventHandle
       { spiderEventHandleSubscription = subscription
       , spiderEventHandleValue = valRef
