@@ -140,7 +140,7 @@ data EventEnv x
               , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
               , eventEnvUnsubscribes :: !(IORef [EventSubscription x])
-              , eventEnvBla :: !(IORef [IO ()])
+              , eventEnvBla :: !(IORef [IO (EventSubscription x)])
               }
    
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
@@ -155,7 +155,7 @@ deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 deferUnsubscribe :: HasSpiderTimeline x => EventSubscription x -> EventM x ()
 deferUnsubscribe subscription = addToQueue subscription =<< asksEventEnv eventEnvUnsubscribes
 
-deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
+deferBla :: HasSpiderTimeline x => IO _ -> EventM x ()
 deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
 
 {-# INLINE writeAndScheduleClear #-}
@@ -219,22 +219,26 @@ runFrame a = SpiderHost $ do
         runHoldInits (eventEnvInits env)
         return result
   liftIO $ putStrLn "<<< End running inits"
+  putStrLn "-- CLEARING"
+  readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
+  writeIORef toClearRef []
   putStrLn "-- ASSIGNMENTS"
   readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                                       writeIORef vRef v
                                       invalidate iRef)
-  putStrLn "-- CLEARING"
-  readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
+  writeIORef toAssignRef []
+  ----------------
+  toBla <- readIORef toBlaRef
+  toUnsubscribe <- readIORef toUnsubscribeRef
+  writeIORef toUnsubscribeRef []
+  writeIORef initRef []
+  writeIORef toBlaRef []
   putStrLn "-- BLA"
-  sequence_ =<< readIORef toBlaRef
+  toUnsubscribeBla <- sequence toBla
   putStrLn "-- UNSUBSCRIBING"
-  mapM_ unsubscribe =<< readIORef toUnsubscribeRef
+  mapM_ unsubscribe toUnsubscribe
+  mapM_ unsubscribe toUnsubscribeBla
   putStrLn "-- DONE RUNFRAME"
-  do writeIORef toAssignRef []
-     writeIORef initRef []
-     writeIORef toClearRef []
-     writeIORef toUnsubscribeRef []
-     writeIORef toBlaRef []
   return result
 
 runHoldInits :: MonadIO m => IORef [m a] -> m ()
@@ -339,7 +343,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
   {-# INLINABLE never #-}
-  never = Event $ const $ returnSubscription (pure ()) () Nothing
+  never = Event $ const $ returnSubscription (pure ()) () (Just Nothing)
   {-# NOINLINE [0] cacheEvent #-}
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
@@ -393,6 +397,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
           subscriberPropagate sub ma
     let switchInvalidator = runEventM @x $ deferBla $ do
+          putStrLn "switchInvalidator executing"
           oldSubscription <- readIORef subscriptionRef
           writeIORef parentsRef []
           writeIORef holdInitsRef [] --TODO: Should we reuse this?
@@ -404,10 +409,10 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           runEventM $ runHoldInits holdInitsRef  --TODO: Is this actually OK? It seems like it should be, since we know that no events are firing at this point, but it still seems inelegant
           -- ORIGINALLY, but it loops:
           (subscription, occ) <- unSpiderHost $ runFrame $ subscribeAndRead e subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-          when (isJust occ) $ error $ "Event is firing but it shouldn't?"
+          -- FIXME          when (isJust occ) $ error $ "Event is firing but it shouldn't?"
           -- END
           writeIORef subscriptionRef subscription
-          runEventM @x $ deferUnsubscribe oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
+          pure oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
     do wi <- liftIO $ mkWeakPtrWithDebug switchInvalidator
        liftIO $ writeIORef wiRef wi
        e <- liftIO $ runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
@@ -494,9 +499,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
               status <- maybeResult
               when (isNothing status) $
                 error "Merge: not all inputs fired"
+              liftIO $ writeIORef clearScheduledRef False
               occRefs <- fmap fst <$> readIORef occRefsSubscriptionsRef
               forM_ occRefs (`writeIORef` Nothing)
     liftIO . writeIORef occRefsSubscriptionsRef <=< forM (zip es [(0 :: Int)..]) $ \(e,n) -> do
+      liftIO $ printf "Merge starting subscribe of input nr %d\n" n
       occRef <- liftIO $ newIORef Nothing
       subscription <- fmap fst . subscribeWithRec e
         (\occ _ -> do
