@@ -83,10 +83,10 @@ import Control.Monad.Reader
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as IntMap
 import Text.Printf (printf)
-import Debug.RecoverRTTI (anythingToString)
+-- import Debug.RecoverRTTI (anythingToString)
 
--- anythingToString :: p -> String
--- anythingToString x = "<anythingToString>"
+anythingToString :: p -> String
+anythingToString x = "<anythingToString>"
 
 {-# NOINLINE nodeCtrRef #-}
 nodeCtrRef :: IORef Int
@@ -201,9 +201,9 @@ run roots after = do
   SpiderHost $ withMVar (_spiderTimeline_lock (unSTE t)) $ \_ -> unSpiderHost $ runFrame $ do
     rootsToPropagate <- forM roots $ \r@(RootTrigger (_triggerId, _, occRef, k) :=> a) -> do
       occBefore <- liftIO $ readIORef occRef
-      liftIO $ writeIORef occRef $! DMap.insert k a occBefore
-      if DMap.null occBefore
-        then do deferClear $ writeIORef occRef $! DMap.empty
+      liftIO $ writeIORef occRef $! Just $ DMap.insert k a (fromMaybe mempty occBefore)
+      if isNothing occBefore
+        then do deferClear $ writeIORef occRef Nothing
                 return $ Just r
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (triggerId, subscribersRef, _, _) :=> Identity a) -> do
@@ -212,7 +212,9 @@ run roots after = do
     triggers <- liftIO $ readIORef $ _spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))
     forM_ triggers $ \(Some (RootTrigger (triggerId, subscribersRef, occRef, _))) -> do
       occ <- liftIO $ readIORef occRef
-      when (DMap.null occ) $ do
+      when (isNothing occ) $ do
+        liftIO $ writeIORef occRef (Just mempty)
+        deferClear $ writeIORef occRef Nothing
         liftIO $ printf "Propagating null trigger %d\n" triggerId
         propagateTrigger Nothing subscribersRef
     after
@@ -460,43 +462,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           (unsubscribe =<< readIORef subscriptionRef)
           (switchInvalidator, wiRef, subscriptionRef, holdInitsRef, parentsRef)
           parentOcc
-  -- switchUncached switchParent = Event $ \sub -> do
-  --   ownWeakInvalidatorRef :: IORef (Weak Invalidator) <- liftIO $ newIORef $ error "switch: ownWeakInvalidatorRef uninitialized"
-  --   let writeNewWeakInvalidator i = do
-  --         wi <- mkWeakPtrWithDebug i
-  --         writeIORef ownWeakInvalidatorRef $! wi
-  --   liftIO $ writeNewWeakInvalidator (pure ())
-  --   ownInvalidatorRef <- liftIO $ newIORef $ error "switch: ownInvalidatorRef uninitialized"
-  --   -- withB is like "fold over Behavior updates"
-  --   let withB :: forall s b. s -> R.Behavior (SpiderTimeline x) b -> (s -> b -> EventM x s) -> EventM x s
-  --       withB currentState b f = mfix $ \newState -> do
-  --        let ownInvalidator = runEventM @x $ deferBla $ do
-  --              putStrLn $ "SWITCH INITS"
-  --              unSpiderHost . runFrame $ void $ withB newState b f
-  --              putStrLn $ "END SWITCH INITS"
-  --        liftIO $ writeIORef ownInvalidatorRef ownInvalidator
-  --        liftIO $ finalize =<< readIORef ownWeakInvalidatorRef
-  --        liftIO $ writeNewWeakInvalidator ownInvalidator
-  --        f currentState <=< liftIO $ do
-  --          wi <- readIORef ownWeakInvalidatorRef
-  --          initsRef <- newIORef []
-  --          parentsRef <- newIORef []
-  --          runBehaviorM (R.sample b) (Just (wi, parentsRef)) initsRef
-  --   unsubscribeRef <- liftIO $ newIORef $ pure ()
-  --   parentOcc <- withB Nothing switchParent $ \_ e -> do
-  --     liftIO $ join $ readIORef unsubscribeRef
-  --     (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
-  --       liftIO $ printf "Switch hold update: %s\n" $ anythingToString ma
-  --       subscriberPropagate sub ma
-  --     mapM_ (subscriberPropagate sub) occ
-  --     liftIO $ writeIORef unsubscribeRef $ runEventM @x $ deferUnsubscribe subscription
-  --     liftIO $ printf "Switch hold update: %s\n" $ anythingToString occ
-  --     pure occ
-  --   liftIO $ printf "Initial switch occ: %s\n" $ anythingToString parentOcc
-  --   returnSubscription
-  --     ((join . readIORef $ unsubscribeRef) >> (finalize =<< readIORef ownWeakInvalidatorRef))
-  --     ownInvalidatorRef
-  --     parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     liftIO $ putStrLn "Coincidence being subscribed to"
     let bliblu innerE = mdo
@@ -552,8 +517,10 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     --                      -- when (isNothing occ) $ -- if isJust then inner has propagated already
     --                      subscriberPropagate sub occ)
     -- returnSubscription (unsubscribe subscriptionOuter') subscriptionOuter' (fmap join occ)
-  unsafeBuildIncremental readV0 =
-    unsafePerformIO . runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0)
+  unsafeBuildIncremental readV0 e =
+    unsafePerformIO $ do
+      putStrLn "unsafeBuildIncremental"
+      runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0) $ e
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
     nodeId <- newNodeId
@@ -654,7 +621,7 @@ withSpiderTimeline k = do
   env <- unsafeNewSpiderTimelineEnv
   reify env $ \s -> k $ localSpiderTimeline s env
 
-data RootTrigger x a = forall k. GCompare k => RootTrigger (Int, WeakBag (Subscriber x a, IORef Bool), IORef (DMap k Identity), k a)
+data RootTrigger x a = forall k. GCompare k => RootTrigger (Int, WeakBag (Subscriber x a, IORef Bool), IORef (Maybe (DMap k Identity)), k a)
 
 data SpiderEventHandle x a = SpiderEventHandle
   { spiderEventHandleSubscription :: EventSubscription x
@@ -810,7 +777,7 @@ newEventWithTriggerIO = newEventWithTriggerIO' (_spiderTimeline_rootTriggers (un
 
 newEventWithTriggerIO' :: forall (x :: Type) a. IORef (IntMap (Some (RootTrigger x))) -> (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
 newEventWithTriggerIO' rootTriggersRef f = do
-  occRef <- newIORef DMap.empty
+  occRef :: (IORef (Maybe (DMap ((:~:) a) Identity))) <- newIORef Nothing
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
   triggerId <- atomicModifyIORef triggerCtr (\c -> (succ c, c))
   printf "New trigger with id %d\n" triggerId
@@ -850,7 +817,7 @@ newEventWithTriggerIO' rootTriggersRef f = do
     -- occ <- if havePropagated
     --        then coerce . Just . DMap.lookup Refl <$> readIORef occRef
     --        else pure Nothing
-    occ <- coerce . Just . DMap.lookup Refl <$> readIORef occRef
+    occ <- fmap (fmap (coerce . DMap.lookup Refl)) $ readIORef occRef
     printf "newEventTriggerIO': subscribing with occ: %s\n" $ anythingToString occ
     returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef occ
 
