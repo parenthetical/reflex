@@ -24,7 +24,6 @@
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE PartialTypeSignatures #-}
 {-# LANGUAGE BangPatterns #-}
-{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -115,15 +114,13 @@ returnSubscription :: Monad m => IO () -> a -> b -> m (EventSubscription x, b)
 returnSubscription cleanup retained occ =
   return (EventSubscription cleanup (toAny retained), occ)
 
-subscribeWithRec :: R.Event (SpiderTimeline x) a -> (Maybe a -> EventSubscription x -> EventM x (Maybe b)) -> Subscriber x b -> EventM x (EventSubscription x, Maybe (Maybe b))
+subscribeWithRec :: R.Event (SpiderTimeline x) a -> (EventSubscription x -> Maybe a -> EventM x (Maybe b)) -> Subscriber x b -> EventM x (EventSubscription x, Maybe (Maybe b))
 subscribeWithRec e f subscriber = mdo
   (subscription, occ) <- subscribeAndRead e $ subscriber
          { subscriberPropagate = \mocc -> do
-             liftIO $ printf "subscribeWithRec propagating\n"
-             subscriberPropagate subscriber <=< (`f` subscription) $ mocc
+             subscriberPropagate subscriber <=< (subscription `f`) $ mocc
          }
-  when (isJust occ) $ liftIO $ printf "subscribeWithRec known on subscribe\n"
-  occ' <- mapM (`f` subscription) occ
+  occ' <- mapM (subscription `f`) occ
   return (subscription, occ')
 
 
@@ -343,7 +340,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
           valRef <- liftIO . newIORef =<< readV0
           flip addToQueue initsQueue $ do
             liftIO . writeIORef parentRef . fst
-                <=< subscribeWithRec e (\ma _ -> mapM (\a -> do
+                <=< subscribeWithRec e (\_ ma -> mapM (\a -> do
                                                           vRef <- pure $! valRef
                                                           iRef <- pure $! invsRef
                                                           liftIO $ printf "Hold update %s\n" $ anythingToString a
@@ -380,7 +377,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# NOINLINE [0] cacheEvent #-}
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
-    nodeId <- newNodeId
     liftIO $ putStrLn "cacheEvent being subscribed to"
     subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
     parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
@@ -389,23 +385,15 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       do notSubscribed <- liftIO (WeakBag.null subscribers)
          when notSubscribed $
            liftIO . writeIORef parentSubscriptionRef . fst
-           <=< subscribeWithRec e (\occ _ -> do
-                                      liftIO $ printf "cacheEvent %d occ %s\n" nodeId $ anythingToString occ
-                                      writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
+           <=< subscribeWithRec e (\_ occ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
            $ Subscriber { subscriberPropagate = flip propagate subscribers }
       parentSub <- liftIO $ readIORef parentSubscriptionRef
       sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub
       returnSubscription (WeakBag.remove sln >> touch sln)
-                         (sln, parentSubscriptionRef)
+                         (sln, parentSubscriptionRef, subscribers)
                          <=< liftIO $ readIORef occRef
   {-# INLINE [1] pushCheap #-}
-  pushCheap !f e = Event $ \sub -> do
-    liftIO $ putStrLn "pushCheap being subscribed to"
-    (subscription, occ) <- subscribeAndRead e $ sub
-      { subscriberPropagate = subscriberPropagate sub <=< fmap join . mapM f
-      }
-    occ' <- mapM (fmap join . mapM f) occ
-    return (subscription, occ')
+  pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
   {-# INLINABLE pull #-}
   pull a = unsafePerformIO $ do
     ref :: IORef (Maybe (a, [BehaviorSubscribed x])) <- newIORef Nothing
@@ -446,10 +434,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           e <- runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
           putStrLn "switchInvalidator runHoldInits"
           runEventM $ runHoldInits holdInitsRef  --TODO: Is this actually OK? It seems like it should be, since we know that no events are firing at this point, but it still seems inelegant
-          -- ORIGINALLY, but it loops:
           (subscription, occ) <- unSpiderHost $ runFrame $ subscribeAndRead e subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-          -- FIXME          when (isJust occ) $ error $ "Event is firing but it shouldn't?"
-          -- END
+          -- FIXME: when (isJust occ) $ error $ "Event is firing but it shouldn't?"
           writeIORef subscriptionRef subscription
           pure oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
     do wi <- liftIO $ mkWeakPtrWithDebug switchInvalidator
@@ -463,60 +449,15 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           (switchInvalidator, wiRef, subscriptionRef, holdInitsRef, parentsRef)
           parentOcc
   coincidenceUncached coincidenceParent = Event $ \sub -> do
-    liftIO $ putStrLn "Coincidence being subscribed to"
-    let bliblu innerE = mdo
-         (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ \occ -> do
-           liftIO $ printf "Coincidence propagating inner occ: %s\n" $ anythingToString occ
-           deferUnsubscribe subscriptionInner
-           subscriberPropagate sub occ
-         case occInner of
-           Nothing -> do
-             liftIO $ printf "Coincidence inner not yet known\n"
-             pure Nothing -- inner not yet known, inner should propagate
-           Just x -> do -- inner known, unsubscribe
-             liftIO $ printf "Coincidence inner occ known: %s\n" $ anythingToString x
-             deferUnsubscribe subscriptionInner
-             pure (Just x)
-    (subscriptionOuter, occOuter) <- subscribeAndRead coincidenceParent $ Subscriber $ \case
-        Nothing -> do
-          liftIO $ printf "Coincidence outer propagating \"not occurring\"\n"
-          subscriberPropagate sub Nothing
-        Just innerE -> do
-          liftIO $ printf "Coincidence outer propagating...\n"
-          occVal <- bliblu innerE
-          liftIO $ printf "Coincidence outer propagating value %s\n" $ anythingToString occVal
-          mapM_ (subscriberPropagate sub) occVal
-    occ <- case occOuter of
-      Nothing -> pure Nothing -- outer not yet known
-      Just Nothing -> pure $ Just Nothing -- outer will have no occurrence
-      Just (Just innerE) -> bliblu innerE
-    liftIO $ printf "Coincidence occ at subscription: %s\n" $ anythingToString occ
+    let f = fmap join
+          . mapM (maybe (pure (Just Nothing)) $ \innerE -> do
+                                 (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ subscriberPropagate sub
+                                 deferUnsubscribe subscriptionInner
+                                 pure occInner)
+    (subscriptionOuter, occOuter) <-
+      subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
+    occ <- f occOuter
     returnSubscription (unsubscribe subscriptionOuter) subscriptionOuter occ
-    -- (subscriptionOuter', occ) <- subscribeWithRec coincidenceParent
-    --      (\me _subscriptionOuter -> do
-    --          -- WASHERE: immediately unsubscribe instead of deferred if e is known to have occurred
-    --          -- WASHERE: don't propagate outer occ if inner e occ was not known yet
-    --          liftIO $ printf "Coincidence me: %s\n" $ anythingToString me
-    --          mocc <- case me of
-    --            Nothing -> pure Nothing -- no inner event, outer has to propagate
-    --            Just e -> fmap snd
-    --                      . subscribeWithRec e (\mocc subscriptionInner -> do
-    --                                               liftIO $ printf "Coincidence inner mocc: %s\n" $ anythingToString mocc
-    --                                               deferUnsubscribe subscriptionInner
-    --                                               pure mocc)
-    --                      $ Subscriber (\occ -> do
-    --                                       liftIO $ printf "Coincidence propagating inner occ: %s\n" $ anythingToString occ
-    --                                       subscriberPropagate sub occ)
-    --          liftIO $ printf "Coincidence occ: %s\n" $ anythingToString mocc
-    --          pure mocc
-    --         )
-    --     $ Subscriber (\occ -> do
-    --                      liftIO $ printf "Coincidence propagating outer occ: %s\n" $ anythingToString occ
-    --                      case mocc of
-    --                        Just ()
-    --                      -- when (isNothing occ) $ -- if isJust then inner has propagated already
-    --                      subscriberPropagate sub occ)
-    -- returnSubscription (unsubscribe subscriptionOuter') subscriptionOuter' (fmap join occ)
   unsafeBuildIncremental readV0 e =
     unsafePerformIO $ do
       putStrLn "unsafeBuildIncremental"
@@ -547,7 +488,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       liftIO $ printf "Merge starting subscribe of input nr %d\n" n
       occRef <- liftIO $ newIORef Nothing
       subscription <- fmap fst . subscribeWithRec e
-        (\occ _ -> do
+        (\_ occ -> do
             liftIO $ printf "Merge %d incoming known occ nr %d: %s\n" nodeId n (anythingToString occ)
             prev <- liftIO $ readIORef occRef
             unless (isNothing prev) $ error $ "merge slot written twice: " <> anythingToString prev <> " to " <> anythingToString occ
@@ -564,6 +505,104 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) occRefsSubscriptionsRef maybeOcc
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
+
+-- INFO: I inlined this from the original
+-- newEventWithTriggerIO f = do
+--   es <- newFanEventWithTriggerIO $ \Refl -> f
+--   return $ R.select es Refl
+
+{-# NOINLINE triggerCtr #-}
+triggerCtr :: IORef Int
+triggerCtr = unsafePerformIO $ newIORef 0
+
+newEventWithTriggerIO :: forall (x :: Type) a. HasSpiderTimeline x => (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
+newEventWithTriggerIO = newEventWithTriggerIO' (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
+
+newEventWithTriggerIO' :: forall (x :: Type) a. IORef (IntMap (Some (RootTrigger x))) -> (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
+newEventWithTriggerIO' rootTriggersRef f = do
+  occRef :: (IORef (Maybe (DMap ((:~:) a) Identity))) <- newIORef Nothing
+  subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
+  triggerId <- atomicModifyIORef triggerCtr (\c -> (succ c, c))
+  printf "New trigger with id %d\n" triggerId
+  pure $ Event $ \sub -> liftIO $ do
+    havePropagatedRef <- newIORef True
+    (NewFanSubscribedChildren subscribers uninit) <-
+      (\case
+        Just res -> pure res
+        Nothing -> do
+          subscribers <- WeakBag.empty
+          let trigger = RootTrigger (triggerId, subscribers, occRef, Refl)
+          modifyIORef rootTriggersRef (IntMap.insert triggerId (Some trigger))
+          uninit <- f trigger
+          let res = NewFanSubscribedChildren subscribers uninit
+          modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") Refl res
+          pure res)
+      . DMap.lookup Refl
+      =<< readIORef subscribedRef
+    sln <- WeakBag.insert' (sub, havePropagatedRef) subscribers $ do
+              uninit
+              modifyIORef' subscribedRef $ DMap.delete Refl
+              modifyIORef' rootTriggersRef (IntMap.delete triggerId)
+    -- TODO: understand original intent of this comment:
+    -- If we die at the same moment that all our children die, they will
+    -- try to clean us up but will fail because their Weak reference to us
+    -- will also be dead.  So, if we are dying, check if there are any
+    -- children; since children don't bother cleaning themselves up if
+    -- their parents are already dead, I don't think there's a race
+    -- condition here.  However, if there are any children, then we can
+    -- infer that we need to clean ourselves up, so we do.
+    -- finalCleanup = do
+    --   cs <- readIORef $ _weakBag_children subs
+    --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
+     -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
+    havePropagated <- readIORef havePropagatedRef
+    printf "newEventTriggerIO': subscribing with havePropagated: %s\n" $ show havePropagated
+    -- occ <- if havePropagated
+    --        then coerce . Just . DMap.lookup Refl <$> readIORef occRef
+    --        else pure Nothing
+    occ <- fmap (fmap (coerce . DMap.lookup Refl)) $ readIORef occRef
+    printf "newEventTriggerIO': subscribing with occ: %s\n" $ anythingToString occ
+    returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef occ
+
+data NewFanSubscribedChildren x a = NewFanSubscribedChildren
+  { _newFanSubscribedChildren :: WeakBag (Subscriber x a, IORef Bool)
+  , _newFanSubscribedUninit :: IO ()
+  }
+
+-- TODO: anything in common with Fan?
+newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
+newFanEventWithTriggerIO f = do
+  error "FIXME: temporarily disabled"
+  -- occRef <- newIORef DMap.empty
+  -- subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
+  -- return $ R.EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
+  --   (NewFanSubscribedChildren subscribers uninit) <- readIORef subscribedRef >>= (\case
+  --     Just res -> pure res
+  --     Nothing -> do
+  --       subscribers <- WeakBag.empty
+  --       uninit <- f k $ RootTrigger (subscribers, occRef, k)
+  --       let res = NewFanSubscribedChildren subscribers uninit
+  --       modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") k res
+  --       pure res) . DMap.lookup k
+  --   sln <- WeakBag.insert' sub subscribers $ do
+  --             uninit
+  --             modifyIORef' subscribedRef $ DMap.delete k
+  --   -- TODO: understand original intent of this comment:
+  --   -- If we die at the same moment that all our children die, they will
+  --   -- try to clean us up but will fail because their Weak reference to us
+  --   -- will also be dead.  So, if we are dying, check if there are any
+  --   -- children; since children don't bother cleaning themselves up if
+  --   -- their parents are already dead, I don't think there's a race
+  --   -- condition here.  However, if there are any children, then we can
+  --   -- infer that we need to clean ourselves up, so we do.
+  --   -- finalCleanup = do
+  --   --   cs <- readIORef $ _weakBag_children subs
+  --   --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
+  --    -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
+  --   returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef
+  --     . coerce . Just . DMap.lookup k -- TODO: make sure that Just i.e. "(non)occurrence is known" is true
+  --     =<< readIORef occRef
+
 
 
 
@@ -630,45 +669,6 @@ data SpiderEventHandle x a = SpiderEventHandle
 
 -- | The monad for actions that manipulate a Spider timeline identified by @x@
 newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
-
-data NewFanSubscribedChildren x a = NewFanSubscribedChildren
-  { _newFanSubscribedChildren :: WeakBag (Subscriber x a, IORef Bool)
-  , _newFanSubscribedUninit :: IO ()
-  }
-
--- TODO: anything in common with Fan?
-newFanEventWithTriggerIO :: forall x k. (GCompare k) => (forall a. k a -> RootTrigger x a -> IO (IO ())) -> IO (R.EventSelector (SpiderTimeline x) k)
-newFanEventWithTriggerIO f = do
-  error "FIXME: temporarily disabled"
-  -- occRef <- newIORef DMap.empty
-  -- subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
-  -- return $ R.EventSelector $ \(!k) -> Event $ \sub -> liftIO $ do
-  --   (NewFanSubscribedChildren subscribers uninit) <- readIORef subscribedRef >>= (\case
-  --     Just res -> pure res
-  --     Nothing -> do
-  --       subscribers <- WeakBag.empty
-  --       uninit <- f k $ RootTrigger (subscribers, occRef, k)
-  --       let res = NewFanSubscribedChildren subscribers uninit
-  --       modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") k res
-  --       pure res) . DMap.lookup k
-  --   sln <- WeakBag.insert' sub subscribers $ do
-  --             uninit
-  --             modifyIORef' subscribedRef $ DMap.delete k
-  --   -- TODO: understand original intent of this comment:
-  --   -- If we die at the same moment that all our children die, they will
-  --   -- try to clean us up but will fail because their Weak reference to us
-  --   -- will also be dead.  So, if we are dying, check if there are any
-  --   -- children; since children don't bother cleaning themselves up if
-  --   -- their parents are already dead, I don't think there's a race
-  --   -- condition here.  However, if there are any children, then we can
-  --   -- infer that we need to clean ourselves up, so we do.
-  --   -- finalCleanup = do
-  --   --   cs <- readIORef $ _weakBag_children subs
-  --   --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
-  --    -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-  --   returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef
-  --     . coerce . Just . DMap.lookup k -- TODO: make sure that Just i.e. "(non)occurrence is known" is true
-  --     =<< readIORef occRef
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
   {-# INLINABLE buildHold #-}
@@ -761,65 +761,6 @@ newtype SpiderHostFrame (x :: Type) a = SpiderHostFrame { runSpiderHostFrame :: 
 instance Monad (SpiderHostFrame x) where
   {-# INLINABLE (>>=) #-}
   SpiderHostFrame x >>= f = SpiderHostFrame $ x >>= runSpiderHostFrame . f
-
--- INFO: I inlined this from the original
--- newEventWithTriggerIO f = do
---   es <- newFanEventWithTriggerIO $ \Refl -> f
---   return $ R.select es Refl
-
-{-# NOINLINE triggerCtr #-}
-triggerCtr :: IORef Int
-triggerCtr = unsafePerformIO $ newIORef 0
-
-newEventWithTriggerIO :: forall (x :: Type) a. HasSpiderTimeline x => (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
-newEventWithTriggerIO = newEventWithTriggerIO' (_spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
-
-
-newEventWithTriggerIO' :: forall (x :: Type) a. IORef (IntMap (Some (RootTrigger x))) -> (RootTrigger x a -> IO (IO ())) -> IO (R.Event (SpiderTimeline x) a)
-newEventWithTriggerIO' rootTriggersRef f = do
-  occRef :: (IORef (Maybe (DMap ((:~:) a) Identity))) <- newIORef Nothing
-  subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
-  triggerId <- atomicModifyIORef triggerCtr (\c -> (succ c, c))
-  printf "New trigger with id %d\n" triggerId
-  pure $ Event $ \sub -> liftIO $ do
-    havePropagatedRef <- newIORef True
-    (NewFanSubscribedChildren subscribers uninit) <-
-      (\case
-        Just res -> pure res
-        Nothing -> do
-          subscribers <- WeakBag.empty
-          let trigger = RootTrigger (triggerId, subscribers, occRef, Refl)
-          modifyIORef rootTriggersRef (IntMap.insert triggerId (Some trigger))
-          uninit <- f trigger
-          let res = NewFanSubscribedChildren subscribers uninit
-          modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") Refl res
-          pure res)
-      . DMap.lookup Refl
-      =<< readIORef subscribedRef
-    sln <- WeakBag.insert' (sub, havePropagatedRef) subscribers $ do
-              uninit
-              modifyIORef' subscribedRef $ DMap.delete Refl
-              modifyIORef' rootTriggersRef (IntMap.delete triggerId)
-    -- TODO: understand original intent of this comment:
-    -- If we die at the same moment that all our children die, they will
-    -- try to clean us up but will fail because their Weak reference to us
-    -- will also be dead.  So, if we are dying, check if there are any
-    -- children; since children don't bother cleaning themselves up if
-    -- their parents are already dead, I don't think there's a race
-    -- condition here.  However, if there are any children, then we can
-    -- infer that we need to clean ourselves up, so we do.
-    -- finalCleanup = do
-    --   cs <- readIORef $ _weakBag_children subs
-    --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
-     -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-    havePropagated <- readIORef havePropagatedRef
-    printf "newEventTriggerIO': subscribing with havePropagated: %s\n" $ show havePropagated
-    -- occ <- if havePropagated
-    --        then coerce . Just . DMap.lookup Refl <$> readIORef occRef
-    --        else pure Nothing
-    occ <- fmap (fmap (coerce . DMap.lookup Refl)) $ readIORef occRef
-    printf "newEventTriggerIO': subscribing with occ: %s\n" $ anythingToString occ
-    returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef occ
 
 newtype ReadPhase x a = ReadPhase (EventM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
