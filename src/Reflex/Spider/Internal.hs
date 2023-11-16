@@ -524,18 +524,6 @@ newEventWithTriggerIO' rootTriggersRef f = do
               uninit
               modifyIORef' subscribedRef $ DMap.delete Refl
               modifyIORef' rootTriggersRef (IntMap.delete triggerId)
-    -- TODO: understand original intent of this comment:
-    -- If we die at the same moment that all our children die, they will
-    -- try to clean us up but will fail because their Weak reference to us
-    -- will also be dead.  So, if we are dying, check if there are any
-    -- children; since children don't bother cleaning themselves up if
-    -- their parents are already dead, I don't think there's a race
-    -- condition here.  However, if there are any children, then we can
-    -- infer that we need to clean ourselves up, so we do.
-    -- finalCleanup = do
-    --   cs <- readIORef $ _weakBag_children subs
-    --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
-     -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
     occ <- fmap (fmap (coerce . DMap.lookup Refl)) $ readIORef occRef
     printf "newEventTriggerIO': subscribing with occ: %s\n" $ anythingToString occ
     returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef occ
@@ -563,18 +551,6 @@ newFanEventWithTriggerIO f = do
   --   sln <- WeakBag.insert' sub subscribers $ do
   --             uninit
   --             modifyIORef' subscribedRef $ DMap.delete k
-  --   -- TODO: understand original intent of this comment:
-  --   -- If we die at the same moment that all our children die, they will
-  --   -- try to clean us up but will fail because their Weak reference to us
-  --   -- will also be dead.  So, if we are dying, check if there are any
-  --   -- children; since children don't bother cleaning themselves up if
-  --   -- their parents are already dead, I don't think there's a race
-  --   -- condition here.  However, if there are any children, then we can
-  --   -- infer that we need to clean ourselves up, so we do.
-  --   -- finalCleanup = do
-  --   --   cs <- readIORef $ _weakBag_children subs
-  --   --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
-  --    -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
   --   returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef
   --     . coerce . Just . DMap.lookup k -- TODO: make sure that Just i.e. "(non)occurrence is known" is true
   --     =<< readIORef occRef
