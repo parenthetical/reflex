@@ -85,7 +85,7 @@ import Text.Printf (printf)
 -- import Debug.RecoverRTTI (anythingToString)
 
 anythingToString :: p -> String
-anythingToString x = "<anythingToString>"
+anythingToString _ = "<anythingToString>"
 
 {-# NOINLINE nodeCtrRef #-}
 nodeCtrRef :: IORef Int
@@ -182,14 +182,6 @@ writeAndScheduleClear info ref val = do
 newtype EventM x a = EventM { runEventM :: IO a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadException, MonadAsyncException, MonadCatch, MonadThrow, MonadMask)
 
-propagateTrigger :: forall (x :: Type) a. HasSpiderTimeline x => Maybe a -> WeakBag (Subscriber x a, IORef Bool) -> EventM x ()
-propagateTrigger a subscribers =
-  WeakBag.traverse_ subscribers $ \(s, havePropagatedRef) -> do
-    liftIO $ writeIORef havePropagatedRef True
-    deferClear $ writeIORef havePropagatedRef False
-    subscriberPropagate s a
-
-
 -- Propagate the given event occurrence; before cleaning up, run the given action, which may read the state of events and behaviors
 run :: forall x b. HasSpiderTimeline x => [DSum (RootTrigger x) Identity] -> EventM x b -> SpiderHost x b
 run roots after = do
@@ -205,7 +197,7 @@ run roots after = do
         else return Nothing
     forM_ (catMaybes rootsToPropagate) $ \(RootTrigger (triggerId, subscribersRef, _, _) :=> Identity a) -> do
       liftIO $ printf "Propagating trigger %d with value %s\n" triggerId $ anythingToString a
-      propagateTrigger (Just a) subscribersRef
+      propagate (Just a) subscribersRef
     triggers <- liftIO $ readIORef $ _spiderTimeline_rootTriggers (unSTE (spiderTimeline :: SpiderTimelineEnv x))
     forM_ triggers $ \(Some (RootTrigger (triggerId, subscribersRef, occRef, _))) -> do
       occ <- liftIO $ readIORef occRef
@@ -213,15 +205,12 @@ run roots after = do
         liftIO $ writeIORef occRef (Just mempty)
         deferClear $ writeIORef occRef Nothing
         liftIO $ printf "Propagating null trigger %d\n" triggerId
-        propagateTrigger Nothing subscribersRef
+        propagate Nothing subscribersRef
     after
 
 newtype Clear = Clear (IO ())
 
 data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
-
-mkWeakPtrWithDebug :: a -> IO (Weak a)
-mkWeakPtrWithDebug x = mkWeakPtr x Nothing
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
@@ -401,7 +390,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     pure $ Behavior $ do
       (val, parents) <- liftIO (readIORef ref) >>= maybe (do
                       let i = readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
-                      wi <- liftIO $ mkWeakPtrWithDebug i
+                      wi <- liftIO $ mkWeakPtr i Nothing
                       parentsRef <- liftIO $ newIORef []
                       !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
                       aVal <- liftIO $ runBehaviorM a (Just (wi, parentsRef)) holdInits
@@ -423,27 +412,24 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           subscriberPropagate sub ma
     -- TODO: holdInitsRef is always empty, parentsRef is always length 1?
     let f = do
-          i <- evaluate switchInvalidator
-          wi <- mkWeakPtrWithDebug i
-          writeIORef wiRef wi
-          e <- runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
-          pure e
+          i <- liftIO $ evaluate switchInvalidator
+          wi <- liftIO $ mkWeakPtr i Nothing
+          liftIO $ writeIORef wiRef wi
+          e <- liftIO $ runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
+          (subscription, occ) <- subscribeAndRead e subscriber
+          liftIO $ writeIORef subscriptionRef subscription
+          pure occ
     let switchInvalidator = runEventM @x $ deferBla $ do
           oldSubscription <- readIORef subscriptionRef
           finalize =<< readIORef wiRef
           writeIORef parentsRef []
-          e <- f
-          (subscription, _occ) <- unSpiderHost $ runFrame $ subscribeAndRead e subscriber --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+          void $ unSpiderHost $ runFrame f  --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
           -- FIXME: when (isJust occ) $ error $ "Event is firing but it shouldn't?"
-          writeIORef subscriptionRef subscription
           pure oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
-    do e <- liftIO f
-       (subscription, parentOcc) <- subscribeAndRead e subscriber
-       liftIO $ writeIORef subscriptionRef subscription
-       returnSubscription
+    returnSubscription
           (unsubscribe =<< readIORef subscriptionRef)
           (switchInvalidator, wiRef, subscriptionRef, parentsRef)
-          parentOcc
+          =<< f
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     let f = fmap join
           . mapM (maybe (pure (Just Nothing)) $ \innerE -> do
@@ -521,7 +507,6 @@ newEventWithTriggerIO' rootTriggersRef f = do
   triggerId <- atomicModifyIORef triggerCtr (\c -> (succ c, c))
   printf "New trigger with id %d\n" triggerId
   pure $ Event $ \sub -> liftIO $ do
-    havePropagatedRef <- newIORef True
     (NewFanSubscribedChildren subscribers uninit) <-
       (\case
         Just res -> pure res
@@ -535,7 +520,7 @@ newEventWithTriggerIO' rootTriggersRef f = do
           pure res)
       . DMap.lookup Refl
       =<< readIORef subscribedRef
-    sln <- WeakBag.insert' (sub, havePropagatedRef) subscribers $ do
+    sln <- WeakBag.insert' sub subscribers $ do
               uninit
               modifyIORef' subscribedRef $ DMap.delete Refl
               modifyIORef' rootTriggersRef (IntMap.delete triggerId)
@@ -551,17 +536,12 @@ newEventWithTriggerIO' rootTriggersRef f = do
     --   cs <- readIORef $ _weakBag_children subs
     --   when (not $ IntMap.null cs) (cleanupRootSubscribed subscribed)
      -- writeIORef weakSelf =<< evaluate =<< mkWeakPtr subscribed (Just finalCleanup)
-    havePropagated <- readIORef havePropagatedRef
-    printf "newEventTriggerIO': subscribing with havePropagated: %s\n" $ show havePropagated
-    -- occ <- if havePropagated
-    --        then coerce . Just . DMap.lookup Refl <$> readIORef occRef
-    --        else pure Nothing
     occ <- fmap (fmap (coerce . DMap.lookup Refl)) $ readIORef occRef
     printf "newEventTriggerIO': subscribing with occ: %s\n" $ anythingToString occ
     returnSubscription (WeakBag.remove sln >> touch sln) subscribedRef occ
 
 data NewFanSubscribedChildren x a = NewFanSubscribedChildren
-  { _newFanSubscribedChildren :: WeakBag (Subscriber x a, IORef Bool)
+  { _newFanSubscribedChildren :: WeakBag (Subscriber x a)
   , _newFanSubscribedUninit :: IO ()
   }
 
@@ -656,7 +636,7 @@ withSpiderTimeline k = do
   env <- unsafeNewSpiderTimelineEnv
   reify env $ \s -> k $ localSpiderTimeline s env
 
-data RootTrigger x a = forall k. GCompare k => RootTrigger (Int, WeakBag (Subscriber x a, IORef Bool), IORef (Maybe (DMap k Identity)), k a)
+data RootTrigger x a = forall k. GCompare k => RootTrigger (Int, WeakBag (Subscriber x a), IORef (Maybe (DMap k Identity)), k a)
 
 data SpiderEventHandle x a = SpiderEventHandle
   { spiderEventHandleSubscription :: EventSubscription x
