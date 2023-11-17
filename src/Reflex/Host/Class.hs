@@ -43,6 +43,7 @@ import Control.Monad.Trans.Writer (WriterT)
 import Data.Dependent.Sum (DSum (..))
 import Data.GADT.Compare
 import Data.Kind (Type)
+import Data.Type.Equality ((:~:)(Refl))
 
 -- | Framework implementation support class for the reflex implementation
 -- represented by @t@.
@@ -105,6 +106,9 @@ class (Applicative m, Monad m) => MonadReflexCreateTrigger t m | m -> t where
   -- Note: An event may be set up multiple times. So after the teardown action
   -- is executed, the event may still be set up again in the future.
   newEventWithTrigger :: (EventTrigger t a -> IO (IO ())) -> m (Event t a)
+  newEventWithTrigger f = do
+    es <- newFanEventWithTrigger $ \Refl -> f
+    return $ select es Refl
   newFanEventWithTrigger :: GCompare k => (forall a. k a -> EventTrigger t a -> IO (IO ())) -> m (EventSelector t k)
 
 -- | 'MonadReflexHost' designates monads that can run reflex frames.
