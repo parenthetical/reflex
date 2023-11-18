@@ -475,10 +475,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   behaviorCoercion Coercion = Coercion
 
 
-data NewFanSubscribedChildren x a = NewFanSubscribedChildren
+newtype NewFanSubscribedChildren x a = NewFanSubscribedChildren
   { _newFanSubscribedChildren :: WeakBag (Subscriber x a)
-  , _newFanSubscribedUninit :: IO ()
-  , _newFanSubscribedParent :: EventSubscription x
   }
 
 newtype RootTrigger x a = RootTrigger (a -> IO ())
@@ -490,22 +488,22 @@ newFanEventWithTriggerIO f = do
   occRef <- newIORef DMap.empty
   return $ R.EventSelector $ \(!k) ->
     Event $ \sub -> do
-      (NewFanSubscribedChildren subscribers uninit subscription) <- liftIO $
+      (NewFanSubscribedChildren subscribers) <- liftIO $
         (\case
             Just res -> pure res
             Nothing -> do
               subscribers <- wbEmpty
-              !uninit <- f k $ RootTrigger $ \a -> do
+              _uninit <- f k $ RootTrigger $ \a -> do
                 printf "trigger %d adding value: %s\n"  nodeId $ anythingToString a
                 occBefore <- readIORef occRef
                 when (DMap.null occBefore) $
                   runEventM @x $ deferClear $ writeIORef occRef DMap.empty
                 modifyIORef occRef $ DMap.insert k (Identity a)
-              (subscription, _) <- runEventM @x $ subscribeAndRead rootEvent $ Subscriber $ \_ -> do
+              (_subscription, _) <- runEventM @x $ subscribeAndRead rootEvent $ Subscriber $ \_ -> do
                 occ <- fmap runIdentity . DMap.lookup k <$> liftIO (readIORef occRef)
                 liftIO $ printf "propagating trigger %d to subscribers: %s\n" nodeId $ anythingToString occ
                 propagate occ subscribers
-              let res = NewFanSubscribedChildren subscribers uninit subscription
+              let res = NewFanSubscribedChildren subscribers
               modifyIORef' subscribedRef $ DMap.insertWith (error "getRootSubscribed: duplicate key inserted into Root") k res
               pure res)
         . DMap.lookup k
@@ -518,7 +516,6 @@ newFanEventWithTriggerIO f = do
       liftIO $ unsubscribe rootSubscription -- TODO: just give access to rootOccRef
       returnSubscription (wbRemove sln) -- TODO: unsubscribe parent if empty
         occ
-
 
 
 
