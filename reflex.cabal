@@ -288,6 +288,7 @@ test-suite EventWriterT
                , transformers
                , reflex
                , ref-tf
+               , patch
 
   if flag(split-these)
     build-depends: these-lens
@@ -316,6 +317,7 @@ test-suite DebugCycles
                , ref-tf
                , witherable
                , proctest
+               , patch
 
 
   if flag(split-these)
