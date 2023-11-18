@@ -34,13 +34,15 @@ import Prelude
 
 testAgreement :: TestCase -> IO Bool
 testAgreement (TestE p) = do
-  spider <- runSpiderHost $ runTestE p
+--  spider <- runSpiderHost $ runTestE p
+  spider <- withSpiderTimeline (runSpiderHostForTimeline (runTestE p))
   let results = [("spider", spider)]
 
   compareResult results (testEvent $ runPure p)
 
 testAgreement (TestB p) = do
-  spider <- runSpiderHost $ runTestB p
+  -- spider <- runSpiderHost $ runTestB p
+  spider <- withSpiderTimeline (runSpiderHostForTimeline (runTestB p))
   let results = [("spider", spider)]
 
   compareResult results (testBehavior $ runPure p)
