@@ -172,11 +172,11 @@ newtype SpiderTimelineEnv (x :: Type) = STE {unSTE :: SpiderTimelineEnv' x}
 -- we can get the coercions we want safely.
 
 data SpiderTimelineEnv' x = SpiderTimelineEnv
-  { _spiderTimeline_lock :: {-# UNPACK #-} !(MVar ())
-  , _spiderTimeline_eventEnv :: {-# UNPACK #-} !(EventEnv x)
-  , _spiderTimeline_rootEvent :: {-# UNPACK #-} !(Subscriber x () -> EventM x (EventSubscription x, Maybe (Maybe ())))
-  , _spiderTimeline_triggerRootEvent :: {-# UNPACK #-} !(IO ())
-  , _spiderTimeline_rootTriggers :: {-# UNPACK #-} !(IORef (IntMap (Some (RootTrigger x))))
+  { _spiderTimeline_lock :: MVar ()
+  , _spiderTimeline_eventEnv :: EventEnv x
+  , _spiderTimeline_rootEvent :: Subscriber x () -> EventM x (EventSubscription x, Maybe (Maybe ()))
+  , _spiderTimeline_triggerRootEvent :: IO ()
+  , _spiderTimeline_rootTriggers :: IORef (IntMap (Some (RootTrigger x)))
   }
 
 data EventEnv x
@@ -202,7 +202,6 @@ deferUnsubscribe subscription = addToQueue subscription =<< asksEventEnv eventEn
 deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
 deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
 
-{-# INLINE writeAndScheduleClear #-}
 writeAndScheduleClear :: forall x a. HasSpiderTimeline x => String -> IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear info ref val = do
   prevVal <- liftIO $ readIORef ref
@@ -229,7 +228,7 @@ run triggers after = do
 
 newtype Clear = Clear (IO ())
 
-data SomeAssignment x = forall a. SomeAssignment {-# UNPACK #-} !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
+data SomeAssignment x = forall a. SomeAssignment !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
@@ -309,7 +308,6 @@ unsafeNewSpiderTimelineEnv = do
     }
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
-  {-# INLINABLE sample #-}
   sample b = liftIO . runBehaviorM (R.sample b) Nothing =<< asksEventEnv eventEnvInits
 
 data BehaviorEnv x = BehaviorEnv
@@ -343,11 +341,9 @@ addThisBehaviorMsInvalidator invsRef = do
   forM_ m $ \(!wi, _) -> liftIO $ modifyIORef' invsRef (wi:)
 
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
-  {-# INLINABLE sample #-}
   sample = readBehaviorTracked
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
-  {-# NOINLINE buildHold #-}
   -- Note: cannot examine its event until after the phase is over
   buildHold readV0 e = do
     liftIO $ putStrLn "buildHold running"
@@ -371,7 +367,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       tellBehaviorParent (BehaviorSubscribedHold parentRef)
       addThisBehaviorMsInvalidator invsRef
       liftIO $ readIORef forceLazyHoldReturnValRef
-  {-# INLINABLE now #-}
   now = R.headE rootEvent
 
 rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
@@ -383,9 +378,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe (Maybe a)) }
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
-  {-# INLINABLE never #-}
   never = error "never value got evaluated??" <$ filter (const False) rootEvent
-  {-# NOINLINE [0] cacheEvent #-}
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
     liftIO $ putStrLn "cacheEvent being subscribed to"
@@ -397,9 +390,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       liftIO $ printf "cacheEvent occ on read: %s\n" . anythingToString =<< readIORef occRef
       sln <- liftIO $ wbInsert sub subscribers
       returnSubscription (wbRemove sln) <=< liftIO $ readIORef occRef
-  {-# INLINE [1] pushCheap #-}
   pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
-  {-# INLINABLE pull #-}
   pull a = unsafePerformIO $ do
     ref :: IORef (Maybe (a, [BehaviorSubscribed x])) <- newIORef Nothing
     invsRef :: IORef [Weak Invalidator] <- newIORef []
@@ -615,26 +606,20 @@ data SpiderEventHandle x a = SpiderEventHandle
 newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE buildHold #-}
   buildHold getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildHold getV0 e
-  {-# INLINABLE now #-}
   now = runFrame . runSpiderHostFrame $ Reflex.Class.now
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE sample #-}
   sample = runFrame . R.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  {-# INLINABLE sample #-}
   sample = Reflex.Spider.Internal.ReadPhase . Reflex.Class.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
   buildHold getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildHold getV0 e
-  {-# INLINABLE now #-}
   now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
-  {-# INLINABLE subscribeEvent #-}
   subscribeEvent e = SpiderHostFrame $ do
     --TODO: Unsubscribe eventually (manually and/or with weak ref)
     valRef <- liftIO $ newIORef Nothing
@@ -653,7 +638,6 @@ instance HasSpiderTimeline x => Reflex.Host.Class.ReflexHost (SpiderTimeline x) 
   type HostFrame (SpiderTimeline x) = SpiderHostFrame x
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadReadEvent (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  {-# NOINLINE readEvent #-}
   readEvent h = Reflex.Spider.Internal.ReadPhase $ fmap (fmap return) $ liftIO $ do
     result <- readIORef $ spiderEventHandleValue h
     touch h
@@ -666,7 +650,6 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexCreateTrigger (Spid
   newFanEventWithTrigger f = SpiderHostFrame $ EventM $ liftIO $ newFanEventWithTriggerIO f
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHost x) where
-  {-# INLINABLE subscribeEvent #-}
   subscribeEvent = runFrame . runSpiderHostFrame . Reflex.Host.Class.subscribeEvent
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexHost (SpiderTimeline x) (SpiderHost x) where
@@ -676,15 +659,11 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadReflexHost (SpiderTimelin
 
 instance MonadRef (EventM x) where
   type Ref (EventM x) = Ref IO
-  {-# INLINABLE newRef #-}
-  {-# INLINABLE readRef #-}
-  {-# INLINABLE writeRef #-}
   newRef = liftIO . newRef
   readRef = liftIO . readRef
   writeRef r a = liftIO $ writeRef r a
 
 instance MonadAtomicRef (EventM x) where
-  {-# INLINABLE atomicModifyRef #-}
   atomicModifyRef r f = liftIO $ atomicModifyRef r f
 
 -- | Run an action affecting the global Spider timeline; this will be guarded by
@@ -698,11 +677,7 @@ runSpiderHostForTimeline :: SpiderHost x a -> SpiderTimelineEnv x -> IO a
 runSpiderHostForTimeline (SpiderHost a) _ = a
 
 newtype SpiderHostFrame (x :: Type) a = SpiderHostFrame { runSpiderHostFrame :: EventM x a }
-  deriving (Functor, Applicative, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadMask, MonadThrow, MonadCatch, R.MonadSample (SpiderTimeline x), R.MonadHold (SpiderTimeline x))
-
-instance Monad (SpiderHostFrame x) where
-  {-# INLINABLE (>>=) #-}
-  SpiderHostFrame x >>= f = SpiderHostFrame $ x >>= runSpiderHostFrame . f
+  deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadMask, MonadThrow, MonadCatch, R.MonadSample (SpiderTimeline x), R.MonadHold (SpiderTimeline x))
 
 newtype ReadPhase x a = ReadPhase (EventM x a) deriving (Functor, Applicative, Monad, MonadFix)
 
