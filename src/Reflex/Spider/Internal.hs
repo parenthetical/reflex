@@ -73,14 +73,12 @@ import Data.Proxy
 import Data.Traversable
 import Data.Type.Equality ((:~:)(Refl))
 import System.IO.Unsafe
-import System.Mem.Weak
 import Unsafe.Coerce
 import Data.Reflection
 import Data.Some (Some(Some))
-import Data.WeakBag (WeakBag)
-import qualified Data.WeakBag as WeakBag
 import Control.Monad.Reader
 import Data.IntMap (IntMap)
+import qualified Data.IntMap as IntMap
 import Text.Printf (printf)
 import Witherable (filter)
 import Prelude hiding (filter)
@@ -89,6 +87,27 @@ import Prelude hiding (filter)
 anythingToString :: p -> String
 anythingToString _ = "<anythingToString>"
 
+type WeakBag a = IORef (IntMap a)
+
+wbTraverse_ :: (Foldable t, MonadIO m) => IORef (t a) -> (a -> m b) -> m ()
+wbTraverse_ wb f = traverse_ f <=< liftIO . readIORef $ wb
+
+wbEmpty :: IO (WeakBag a)
+wbEmpty = newIORef mempty
+
+wbInsert :: a -> IORef (IntMap a) -> IO (IntMap.Key, WeakBag a)
+wbInsert a wb = do
+  as <- readIORef wb
+  let i = maybe 0 (succ . fst . fst) . IntMap.maxViewWithKey $ as
+  writeIORef wb (IntMap.insert i a as)
+  pure (i,wb)
+
+wbRemove :: (IntMap.Key, WeakBag a) -> IO ()
+wbRemove (i,wb) = modifyIORef wb $ IntMap.delete i
+
+wbNull :: WeakBag a -> IO Bool
+wbNull = fmap IntMap.null . readIORef
+
 {-# NOINLINE nodeCtrRef #-}
 nodeCtrRef :: IORef Int
 nodeCtrRef = unsafePerformIO $ newIORef (0 :: Int)
@@ -96,11 +115,21 @@ nodeCtrRef = unsafePerformIO $ newIORef (0 :: Int)
 newNodeId :: (MonadIO m) => m Int
 newNodeId = liftIO $ atomicModifyIORef nodeCtrRef (\n -> (succ n, n))
 
+type Weak a = IORef (Maybe a)
+
+finalize :: Weak a -> IO ()
+finalize w = writeIORef w Nothing
+
+deRefWeak :: Weak a -> IO (Maybe a)
+deRefWeak = readIORef
+
+mkWeakPtr :: a -> IO (Weak a)
+mkWeakPtr = newIORef . Just
+
 --NB: Once you subscribe to an Event, you must always hold on the the WHOLE EventSubscription you get back
 -- If you do not retain the subscription, you may be prematurely unsubscribed from the parent event.
 data EventSubscription x = EventSubscription
   { unsubscribe :: !(IO ())
-  , _eventSubscription_subscribed :: {-# UNPACK #-} !Any
   }
 
 newtype Subscriber x a = Subscriber
@@ -112,9 +141,9 @@ newtype Subscriber x a = Subscriber
 -- with existentially quantified fields. So instead we just coerce values
 -- to type Any on the way in. Since we never coerce them back, this is
 -- perfectly safe.
-returnSubscription :: Monad m => IO () -> a -> b -> m (EventSubscription x, b)
-returnSubscription cleanup retained occ =
-  return (EventSubscription cleanup (toAny retained), occ)
+returnSubscription :: Monad m => IO () -> Maybe (Maybe b) -> m (EventSubscription x, Maybe (Maybe b))
+returnSubscription cleanup occ =
+  return (EventSubscription cleanup, occ)
 
 subscribeWithRec :: R.Event (SpiderTimeline x) a -> (EventSubscription x -> Maybe a -> EventM x (Maybe b)) -> Subscriber x b -> EventM x (EventSubscription x, Maybe (Maybe b))
 subscribeWithRec e f subscriber = mdo
@@ -131,7 +160,7 @@ propagate :: forall x a. Maybe a -> WeakBag (Subscriber x a) -> EventM x ()
 propagate a subscribers =
   -- Note: in the following traversal, we do not visit nodes that are added to the list during our traversal; they are new events, which will necessarily have full information already, so there is no need to traverse them
   --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
-  WeakBag.traverse_ subscribers $ \s -> subscriberPropagate s a
+  wbTraverse_ subscribers $ \s -> subscriberPropagate s a
 
 toAny :: a -> Any
 toAny = unsafeCoerce
@@ -261,15 +290,15 @@ unsafeNewSpiderTimelineEnv = do
             toBlaRef <- newIORef []
             return $ EventEnv toAssignRef initRef toClearRef toUnsubscribeRef toBlaRef
   triggers <- newIORef mempty
-  rootSubscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
+  rootSubscribers :: WeakBag (Subscriber x a) <- wbEmpty
   rootOccRef :: IORef (Maybe (Maybe ())) <- newIORef Nothing
   return $ STE $ SpiderTimelineEnv
     { _spiderTimeline_lock = lock
     , _spiderTimeline_eventEnv = env
     , _spiderTimeline_rootEvent = \sub -> do
-        sln <- liftIO $ WeakBag.insert' sub rootSubscribers $ pure ()
+        sln <- liftIO $ wbInsert sub rootSubscribers
         occ <- liftIO $ readIORef rootOccRef
-        returnSubscription (WeakBag.remove sln) sln occ
+        returnSubscription (wbRemove sln) occ
     , _spiderTimeline_triggerRootEvent = runEventM @x $ do
         liftIO $ writeIORef rootOccRef (Just (Just ()))
 --        addToQueue (Clear $ writeIORef rootOccRef Nothing) $ eventEnvClears env
@@ -327,10 +356,12 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     !invsRef <- liftIO $ newIORef [] -- invalidators
     !parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do
+          liftIO $ putStrLn "one"
           !valRef <- liftIO . newIORef =<< readV0
           flip addToQueue initsQueue $! do
             liftIO . writeIORef parentRef . fst
                 <=< subscribeWithRec e (\_ ma -> mapM (\a -> do
+                                                          liftIO $ putStrLn "hold event occurring"
                                                           vRef <- pure $! valRef
                                                           iRef <- pure $! invsRef
                                                           liftIO $ printf "Hold update %s\n" $ anythingToString a
@@ -362,20 +393,23 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
     liftIO $ putStrLn "cacheEvent being subscribed to"
-    subscribers :: WeakBag (Subscriber x a) <- WeakBag.empty
+    subscribers :: WeakBag (Subscriber x a) <- wbEmpty
     parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
     occRef :: IORef (Maybe (Maybe a)) <- newIORef Nothing
     pure $ Event $ \sub -> do
-      do notSubscribed <- liftIO (WeakBag.null subscribers)
+      do notSubscribed <- liftIO (wbNull subscribers)
          when notSubscribed $
            liftIO . writeIORef parentSubscriptionRef . fst
            <=< subscribeWithRec e (\_ occ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
            $ Subscriber { subscriberPropagate = flip propagate subscribers }
       liftIO $ printf "cacheEvent occ on read: %s\n" . anythingToString =<< readIORef occRef
       parentSub <- liftIO $ readIORef parentSubscriptionRef
-      sln <- liftIO $ WeakBag.insert' sub subscribers $ unsubscribe parentSub >> writeIORef parentSubscriptionRef (error "cacheEvent: parentRef uninitialized")
-      returnSubscription (WeakBag.remove sln >> touch sln)
-                         (sln, parentSubscriptionRef, subscribers)
+      sln <- liftIO $ wbInsert sub subscribers
+      returnSubscription (do wbRemove sln
+                             nowEmpty <- wbNull subscribers
+                             when nowEmpty $ do
+                               unsubscribe parentSub
+                               writeIORef parentSubscriptionRef (error "cacheEvent: parentRef uninitialized"))
                          <=< liftIO $ readIORef occRef
   {-# INLINE [1] pushCheap #-}
   pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
@@ -386,7 +420,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     pure $ Behavior $ do
       (val, parents) <- liftIO (readIORef ref) >>= maybe (do
                       let i = readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
-                      wi <- liftIO $ mkWeakPtr i Nothing
+                      wi <- liftIO $ mkWeakPtr i
                       parentsRef <- liftIO $ newIORef []
                       !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
                       aVal <- liftIO $ runBehaviorM a (Just (wi, parentsRef)) holdInits
@@ -406,7 +440,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     -- TODO: holdInitsRef is always empty, parentsRef is always length 1?
     let f = do
           !i <- liftIO $ evaluate switchInvalidator
-          !wi <- liftIO $ mkWeakPtr i Nothing
+          !wi <- liftIO $ mkWeakPtr i
           liftIO $ writeIORef wiRef wi
           e <- liftIO $ runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
           (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
@@ -423,7 +457,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           pure oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
     returnSubscription
           (unsubscribe =<< readIORef subscriptionRef)
-          (switchInvalidator, wiRef, subscriptionRef, parentsRef)
           =<< f
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     let f = fmap join
@@ -434,7 +467,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     (subscriptionOuter, occOuter) <-
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
     occ <- f occOuter
-    returnSubscription (unsubscribe subscriptionOuter) subscriptionOuter occ
+    returnSubscription (unsubscribe subscriptionOuter) occ
   unsafeBuildIncremental readV0 e =
     unsafePerformIO $ do
       putStrLn "unsafeBuildIncremental"
@@ -480,7 +513,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       pure (occRef, subscription)
     maybeOcc <- liftIO maybeResult
     liftIO $ printf "merge occ on subscription: %s\n" $ anythingToString maybeOcc
-    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) occRefsSubscriptionsRef maybeOcc
+    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) maybeOcc
   eventCoercion Coercion = Coercion
   behaviorCoercion Coercion = Coercion
 
@@ -504,7 +537,7 @@ newFanEventWithTriggerIO f = do
         (\case
             Just res -> pure res
             Nothing -> do
-              subscribers <- WeakBag.empty
+              subscribers <- wbEmpty
               !uninit <- f k $ RootTrigger $ \a -> do
                 printf "trigger %d adding value: %s\n"  nodeId $ anythingToString a
                 occBefore <- readIORef occRef
@@ -520,17 +553,13 @@ newFanEventWithTriggerIO f = do
               pure res)
         . DMap.lookup k
         =<< readIORef subscribedRef
-      sln <- liftIO $ WeakBag.insert' sub subscribers $ do
-                uninit
-                unsubscribe subscription
-                modifyIORef' subscribedRef $ DMap.delete k
+      sln <- liftIO $ wbInsert sub subscribers
       (rootSubscription, maybeOccRoot) <- subscribeAndRead rootEvent $ Subscriber $ const (pure ())
       occ <- case maybeOccRoot of
         Nothing -> pure Nothing
         Just _ -> Just . fmap runIdentity . DMap.lookup k <$> liftIO (readIORef occRef)
       liftIO $ unsubscribe rootSubscription -- TODO: just give access to rootOccRef
-      returnSubscription (WeakBag.remove sln >> touch sln)
-        subscribedRef
+      returnSubscription (wbRemove sln) -- TODO: unsubscribe parent if empty
         occ
 
 
