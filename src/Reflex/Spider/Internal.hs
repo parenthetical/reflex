@@ -106,9 +106,6 @@ wbInsert a wb = do
 wbRemove :: (IntMap.Key, WeakBag a) -> IO ()
 wbRemove (i,wb) = modifyIORef wb $ IntMap.delete i
 
-wbNull :: WeakBag a -> IO Bool
-wbNull = fmap IntMap.null . readIORef
-
 {-# NOINLINE nodeCtrRef #-}
 nodeCtrRef :: IORef Int
 nodeCtrRef = unsafePerformIO $ newIORef (0 :: Int)
@@ -161,9 +158,6 @@ propagate a subscribers =
   -- Note: in the following traversal, we do not visit nodes that are added to the list during our traversal; they are new events, which will necessarily have full information already, so there is no need to traverse them
   --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
   wbTraverse_ subscribers $ \s -> subscriberPropagate s a
-
-toAny :: a -> Any
-toAny = unsafeCoerce
 
 -- | Stores all global data relevant to a particular Spider timeline; only one
 -- value should exist for each type @x@
@@ -264,7 +258,7 @@ runFrame a = SpiderHost $ do
   writeIORef initRef []
   writeIORef toBlaRef []
   putStrLn "-- BLA"
-  sequence toBla
+  sequence_ toBla
   putStrLn "-- UNSUBSCRIBING"
   mapM_ unsubscribe toUnsubscribe
   putStrLn "-- DONE RUNFRAME"
@@ -311,7 +305,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
   sample b = liftIO . runBehaviorM (R.sample b) Nothing =<< asksEventEnv eventEnvInits
 
 data BehaviorEnv x = BehaviorEnv
-  { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator, IORef [BehaviorSubscribed x])
+  { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator)
   , behaviorEnvInitsRef :: IORef [EventM x ()]
   }
 
@@ -319,26 +313,15 @@ data BehaviorEnv x = BehaviorEnv
 newtype BehaviorM (x :: Type) a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
   deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
 
--- INFO: This seems to keep hold of all events which might influence a Behavior's value?
-data BehaviorSubscribed x
-   = BehaviorSubscribedHold !(IORef (EventSubscription x))
-   | BehaviorSubscribedPull ![BehaviorSubscribed x]
-
 type Invalidator = IO ()
 
-runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator, IORef [BehaviorSubscribed x]) -> IORef [EventM x ()] -> IO a
+runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
-
--- | Log an Event or Behavior which influences the value of this Behavior.
-tellBehaviorParent :: BehaviorSubscribed x -> BehaviorM x ()
-tellBehaviorParent h = do
-  !m <- asks behaviorEnvMaybeWISubs
-  forM_ m $ \(_, !p) -> liftIO $ modifyIORef' p (h :)
 
 addThisBehaviorMsInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
 addThisBehaviorMsInvalidator invsRef = do
   !m <- asks behaviorEnvMaybeWISubs
-  forM_ m $ \(!wi, _) -> liftIO $ modifyIORef' invsRef (wi:)
+  forM_ m $ \wi -> liftIO $ modifyIORef' invsRef (wi:)
 
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   sample = readBehaviorTracked
@@ -364,7 +347,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
           pure valRef
     flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
-      tellBehaviorParent (BehaviorSubscribedHold parentRef)
       addThisBehaviorMsInvalidator invsRef
       liftIO $ readIORef forceLazyHoldReturnValRef
   now = R.headE rootEvent
@@ -392,22 +374,18 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       returnSubscription (wbRemove sln) <=< liftIO $ readIORef occRef
   pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
   pull a = unsafePerformIO $ do
-    ref :: IORef (Maybe (a, [BehaviorSubscribed x])) <- newIORef Nothing
+    ref :: IORef (Maybe a) <- newIORef Nothing
     invsRef :: IORef [Weak Invalidator] <- newIORef []
     pure $ Behavior $ do
       x <- liftIO $ readIORef ref
-      (val, parents) <- case x of
+      val <- case x of
         Just z -> pure z
         Nothing -> do
           wi <- liftIO $ mkWeakPtr $ readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
-          parentsRef <- liftIO $ newIORef []
           !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
-          aVal <- liftIO $ runBehaviorM a (Just (wi, parentsRef)) holdInits
-          parents <- liftIO $ readIORef parentsRef
-          let subscribed = (aVal, parents)
-          liftIO $ writeIORef ref $ Just subscribed
-          return subscribed
-      tellBehaviorParent (BehaviorSubscribedPull parents)
+          aVal <- liftIO $ runBehaviorM a (Just wi) holdInits
+          liftIO $ writeIORef ref $ Just aVal
+          return aVal
       addThisBehaviorMsInvalidator invsRef
       pure val
   switchUncached switchParent = Event $ \sub -> mdo
@@ -421,7 +399,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           unsubscribe oldSubscription
     let f = do
           !wi <- liftIO $ mkWeakPtr $ switchInvalidator
-          e <- liftIO $ runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
+          e <- liftIO $ runBehaviorM (R.sample switchParent) (Just wi) holdInitsRef
           (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
             liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
             subscriberPropagate sub ma
