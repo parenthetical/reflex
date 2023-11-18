@@ -87,6 +87,7 @@ import Prelude hiding (filter)
 anythingToString :: p -> String
 anythingToString _ = "<anythingToString>"
 
+
 type WeakBag a = IORef (IntMap a)
 
 wbTraverse_ :: (Foldable t, MonadIO m) => IORef (t a) -> (a -> m b) -> m ()
@@ -151,8 +152,7 @@ subscribeWithRec e f subscriber = mdo
          { subscriberPropagate = \mocc -> do
              subscriberPropagate subscriber <=< (subscription `f`) $ mocc
          }
-  occ' <- mapM (subscription `f`) occ
-  return (subscription, occ')
+  fmap (subscription,) .  mapM (subscription `f`) $ occ
 
 
 -- | Propagate everything
@@ -184,7 +184,7 @@ data EventEnv x
               , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
               , eventEnvUnsubscribes :: !(IORef [EventSubscription x])
-              , eventEnvBla :: !(IORef [IO (EventSubscription x)])
+              , eventEnvBla :: !(IORef [IO ()])
               }
 
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
@@ -199,7 +199,7 @@ deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 deferUnsubscribe :: HasSpiderTimeline x => EventSubscription x -> EventM x ()
 deferUnsubscribe subscription = addToQueue subscription =<< asksEventEnv eventEnvUnsubscribes
 
-deferBla :: HasSpiderTimeline x => IO (EventSubscription x) -> EventM x ()
+deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
 deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
 
 {-# INLINE writeAndScheduleClear #-}
@@ -265,10 +265,9 @@ runFrame a = SpiderHost $ do
   writeIORef initRef []
   writeIORef toBlaRef []
   putStrLn "-- BLA"
-  toUnsubscribeBla <- sequence toBla
+  sequence toBla
   putStrLn "-- UNSUBSCRIBING"
   mapM_ unsubscribe toUnsubscribe
-  mapM_ unsubscribe toUnsubscribeBla
   putStrLn "-- DONE RUNFRAME"
   return result
 
@@ -360,14 +359,11 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
           !valRef <- liftIO . newIORef =<< readV0
           flip addToQueue initsQueue $! do
             liftIO . writeIORef parentRef . fst
-                <=< subscribeWithRec e (\_ ma -> mapM (\a -> do
-                                                          liftIO $ putStrLn "hold event occurring"
-                                                          vRef <- pure $! valRef
-                                                          iRef <- pure $! invsRef
-                                                          liftIO $ printf "Hold update %s\n" $ anythingToString a
-                                                          addToQueue (SomeAssignment @x vRef iRef a) =<< asksEventEnv eventEnvAssignments
-                                                          pure a)
-                                                 ma)
+                <=< subscribeWithRec e
+                   (const (mapM (\a -> do
+                                    liftIO $ printf "Hold update %s\n" $ anythingToString a
+                                    addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
+                                    pure a)))
                 $ Subscriber (const (pure ()))
           pure valRef
     flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
@@ -394,23 +390,13 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   cacheEvent e = unsafePerformIO $ do
     liftIO $ putStrLn "cacheEvent being subscribed to"
     subscribers :: WeakBag (Subscriber x a) <- wbEmpty
-    parentSubscriptionRef :: IORef (EventSubscription x) <- newIORef $ error "cacheEvent: parentRef uninitialized"
-    occRef :: IORef (Maybe (Maybe a)) <- newIORef Nothing
-    pure $ Event $ \sub -> do
-      do notSubscribed <- liftIO (wbNull subscribers)
-         when notSubscribed $
-           liftIO . writeIORef parentSubscriptionRef . fst
-           <=< subscribeWithRec e (\_ occ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
+    occRef <- liftIO $ newIORef Nothing
+    void . runEventM @x . subscribeWithRec e (\_ occ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
            $ Subscriber { subscriberPropagate = flip propagate subscribers }
+    pure $ Event $ \sub -> do
       liftIO $ printf "cacheEvent occ on read: %s\n" . anythingToString =<< readIORef occRef
-      parentSub <- liftIO $ readIORef parentSubscriptionRef
       sln <- liftIO $ wbInsert sub subscribers
-      returnSubscription (do wbRemove sln
-                             nowEmpty <- wbNull subscribers
-                             when nowEmpty $ do
-                               unsubscribe parentSub
-                               writeIORef parentSubscriptionRef (error "cacheEvent: parentRef uninitialized"))
-                         <=< liftIO $ readIORef occRef
+      returnSubscription (wbRemove sln) <=< liftIO $ readIORef occRef
   {-# INLINE [1] pushCheap #-}
   pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
   {-# INLINABLE pull #-}
@@ -418,60 +404,62 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     ref :: IORef (Maybe (a, [BehaviorSubscribed x])) <- newIORef Nothing
     invsRef :: IORef [Weak Invalidator] <- newIORef []
     pure $ Behavior $ do
-      (val, parents) <- liftIO (readIORef ref) >>= maybe (do
-                      let i = readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
-                      wi <- liftIO $ mkWeakPtr i
-                      parentsRef <- liftIO $ newIORef []
-                      !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
-                      aVal <- liftIO $ runBehaviorM a (Just (wi, parentsRef)) holdInits
-                      parents <- liftIO $ readIORef parentsRef
-                      let subscribed = (aVal, parents)
-                      liftIO $ writeIORef ref $ Just subscribed
-                      return subscribed)
-                    pure
+      x <- liftIO $ readIORef ref
+      (val, parents) <- case x of
+        Just z -> pure z
+        Nothing -> do
+          wi <- liftIO $ mkWeakPtr $ readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
+          parentsRef <- liftIO $ newIORef []
+          !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
+          aVal <- liftIO $ runBehaviorM a (Just (wi, parentsRef)) holdInits
+          parents <- liftIO $ readIORef parentsRef
+          let subscribed = (aVal, parents)
+          liftIO $ writeIORef ref $ Just subscribed
+          return subscribed
       tellBehaviorParent (BehaviorSubscribedPull parents)
       addThisBehaviorMsInvalidator invsRef
       pure val
   switchUncached switchParent = Event $ \sub -> mdo
-    parentsRef <- liftIO $ newIORef [] --TODO: This should be unnecessary, because it will always be filled with just the single parent behavior
+    parentsRef <- liftIO $ newIORef [] --TODO: This shouldn't be unnecessary, because it will always be filled with just the single parent behavior
     holdInitsRef <- asksEventEnv eventEnvInits
     subscriptionRef <- liftIO $ newIORef $ error "switchUncached: subscriptionRef uninitialized"
-    wiRef <- liftIO $ newIORef $ error "switchUncached: wiRef uninitialized"
     -- TODO: holdInitsRef is always empty, parentsRef is always length 1?
+    let undoThings = do
+          (oldSubscription, wi) <- readIORef subscriptionRef
+          finalize wi
+          unsubscribe oldSubscription
     let f = do
-          !i <- liftIO $ evaluate switchInvalidator
-          !wi <- liftIO $ mkWeakPtr i
-          liftIO $ writeIORef wiRef wi
+          !wi <- liftIO $ mkWeakPtr $ switchInvalidator
           e <- liftIO $ runBehaviorM (R.sample switchParent) (Just (wi, parentsRef)) holdInitsRef
           (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
             liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
             subscriberPropagate sub ma
-          liftIO $ writeIORef subscriptionRef subscription
+          liftIO $ writeIORef subscriptionRef (subscription, wi)
           pure occ
     let switchInvalidator = runEventM @x $ deferBla $ do
-          oldSubscription <- readIORef subscriptionRef
-          finalize =<< readIORef wiRef
+          undoThings
           writeIORef parentsRef []
-          _occ <- unSpiderHost $ runFrame f  --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-          -- FIXME: (is this what is meant above?): when (isJust _occ) $ error $ "Event is firing but it shouldn't?"
-          pure oldSubscription -- TODO: not sure that the unsubscribe queue is going to be processed still?
-    returnSubscription
-          (unsubscribe =<< readIORef subscriptionRef)
-          =<< f
+          --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
+          _occ <- unSpiderHost $ runFrame f  
+          -- FIXME: (Is this what is meant above? Currently registers as firing.):
+          -- when (isJust _occ) $ error $ "Event is firing but it shouldn't?"
+          pure ()
+    returnSubscription undoThings =<< f
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     let f = fmap join
-          . mapM (maybe (pure (Just Nothing)) $ \innerE -> do
-                                 (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ subscriberPropagate sub
-                                 deferUnsubscribe subscriptionInner
-                                 pure occInner)
+          . mapM (maybe
+                  (pure (Just Nothing))
+                  (\innerE -> do
+                      (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ subscriberPropagate sub
+                      deferUnsubscribe subscriptionInner
+                      pure occInner))
     (subscriptionOuter, occOuter) <-
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
     occ <- f occOuter
     returnSubscription (unsubscribe subscriptionOuter) occ
-  unsafeBuildIncremental readV0 e =
-    unsafePerformIO $ do
-      putStrLn "unsafeBuildIncremental"
-      runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0) $ e
+  unsafeBuildIncremental = R.Incremental . R.pull
+      -- TODO: why originally something like:
+      -- unsafePerformIO $ runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0) $ e
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
     nodeId <- newNodeId
