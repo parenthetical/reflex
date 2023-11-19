@@ -90,9 +90,6 @@ anythingToString _ = "<anythingToString>"
 
 type WeakBag a = IORef (IntMap a)
 
-wbTraverse_ :: (Foldable t, MonadIO m) => IORef (t a) -> (a -> m b) -> m ()
-wbTraverse_ wb f = traverse_ f <=< liftIO . readIORef $ wb
-
 wbEmpty :: IO (WeakBag a)
 wbEmpty = newIORef mempty
 
@@ -118,12 +115,6 @@ type Weak a = IORef (Maybe a)
 finalize :: Weak a -> IO ()
 finalize w = writeIORef w Nothing
 
-deRefWeak :: Weak a -> IO (Maybe a)
-deRefWeak = readIORef
-
-mkWeakPtr :: a -> IO (Weak a)
-mkWeakPtr = newIORef . Just
-
 newtype EventSubscription x = EventSubscription { unsubscribe :: IO () }
 newtype Subscriber x a = Subscriber { subscriberPropagate :: Maybe a -> EventM x () }
 
@@ -135,11 +126,10 @@ subscribeWithRec e f subscriber = mdo
   (subscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< (subscription `f`)
   fmap (subscription,) .  mapM (subscription `f`) $ occ
 
-
 -- | Propagate everything
 propagate :: forall x a. Maybe a -> WeakBag (Subscriber x a) -> EventM x ()
 propagate a subscribers =
-  wbTraverse_ subscribers $ \s -> subscriberPropagate s a
+  (\ f -> traverse_ f <=< liftIO . readIORef $ subscribers) $ \s -> subscriberPropagate s a
 
 -- | Stores all global data relevant to a particular Spider timeline; only one
 -- value should exist for each type @x@
@@ -201,11 +191,6 @@ newtype Clear = Clear (IO ())
 
 data SomeAssignment x = forall a. SomeAssignment (IORef a) (IORef [Weak Invalidator]) a
 
-invalidate :: IORef [Weak Invalidator] -> IO ()
-invalidate wisRef = do
-  mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< deRefWeak $ wi) =<< readIORef wisRef
-  writeIORef wisRef []
-
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
@@ -224,9 +209,12 @@ runFrame a = SpiderHost $ do
   readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
   writeIORef toClearRef []
   putStrLn "-- ASSIGNMENTS"
-  readIORef toAssignRef >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
-                                      writeIORef vRef v
-                                      invalidate iRef)
+  readIORef toAssignRef
+    >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
+                  writeIORef vRef v
+                  mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< readIORef $ wi)
+                      =<< readIORef iRef
+                  writeIORef iRef [])
   writeIORef toAssignRef []
   ----------------
   toBla <- readIORef toBlaRef
@@ -276,7 +264,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Eve
 
 data BehaviorEnv x = BehaviorEnv
   { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator)
-  , behaviorEnvInitsRef :: IORef [EventM x ()]
+  , _behaviorEnvInitsRef :: IORef [EventM x ()]
   }
 
 -- BehaviorM can sample behaviors
@@ -287,11 +275,6 @@ type Invalidator = IO ()
 
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
-
-addThisBehaviorMsInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
-addThisBehaviorMsInvalidator invsRef = do
-  m <- asks behaviorEnvMaybeWISubs
-  forM_ m $ \wi -> liftIO $ modifyIORef' invsRef (wi:)
 
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   sample = readBehaviorTracked
@@ -315,7 +298,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
           pure valRef
     flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
-      addThisBehaviorMsInvalidator invsRef
+      m <- asks behaviorEnvMaybeWISubs
+      forM_ m $ \wi -> liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ readIORef forceLazyHoldReturnValRef
   now = R.headE rootEvent
 
@@ -347,21 +331,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   pushCheap f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
 
   pull :: R.PullM (SpiderTimeline x) a -> R.Behavior (SpiderTimeline x) a
-  pull a = unsafePerformIO $ do
-    ref :: IORef (Maybe a) <- newIORef Nothing
-    invsRef :: IORef [Weak Invalidator] <- newIORef []
-    pure $ Behavior $ do
-      x <- liftIO $ readIORef ref
-      val <- case x of
-        Just z -> pure z
-        Nothing -> do
-          wi <- liftIO $ mkWeakPtr $ readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
-          holdInits <- BehaviorM $ asks behaviorEnvInitsRef
-          aVal <- liftIO $ runBehaviorM a (Just wi) holdInits
-          liftIO $ writeIORef ref $ Just aVal
-          return aVal
-      addThisBehaviorMsInvalidator invsRef
-      pure val
+  pull = Behavior
 
   switchUncached :: R.Behavior (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
   switchUncached switchParent = Event $ \sub -> mdo
@@ -374,7 +344,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           finalize wi
           unsubscribe oldSubscription
     let f = do
-          wi <- liftIO $ mkWeakPtr switchInvalidator
+          wi <- liftIO $ newIORef . Just $ switchInvalidator
           e <- liftIO $ runBehaviorM (R.sample switchParent) (Just wi) holdInitsRef
           (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
             liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
@@ -397,9 +367,10 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           . mapM (maybe
                   (pure (Just Nothing))
                   (\innerE -> mdo
-                      fmap snd . subscribeWithRec innerE (\subscriptionInner occ -> do
-                                                  liftIO (unsubscribe subscriptionInner)
-                                                  pure occ)
+                      fmap snd .
+                        subscribeWithRec innerE (\subscriptionInner occ -> do
+                                                    liftIO (unsubscribe subscriptionInner)
+                                                    pure occ)
                         $ Subscriber $ subscriberPropagate sub))
     (subscriptionOuter, occOuter) <-
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
