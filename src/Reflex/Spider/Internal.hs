@@ -128,22 +128,17 @@ newtype EventSubscription x = EventSubscription { unsubscribe :: IO () }
 newtype Subscriber x a = Subscriber { subscriberPropagate :: Maybe a -> EventM x () }
 
 returnSubscription :: Monad m => IO () -> Maybe (Maybe b) -> m (EventSubscription x, Maybe (Maybe b))
-returnSubscription cleanup occ =
-  return (EventSubscription cleanup, occ)
+returnSubscription cleanup occ = return (EventSubscription cleanup, occ)
 
 subscribeWithRec :: R.Event (SpiderTimeline x) a -> (EventSubscription x -> Maybe a -> EventM x (Maybe b)) -> Subscriber x b -> EventM x (EventSubscription x, Maybe (Maybe b))
 subscribeWithRec e f subscriber = mdo
-  (subscription, occ) <- subscribeAndRead e $ subscriber
-         { subscriberPropagate = subscriberPropagate subscriber <=< (subscription `f`)
-         }
+  (subscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate subscriber <=< (subscription `f`)
   fmap (subscription,) .  mapM (subscription `f`) $ occ
 
 
 -- | Propagate everything
 propagate :: forall x a. Maybe a -> WeakBag (Subscriber x a) -> EventM x ()
 propagate a subscribers =
-  -- Note: in the following traversal, we do not visit nodes that are added to the list during our traversal; they are new events, which will necessarily have full information already, so there is no need to traverse them
-  --TODO: Should we check if nodes already have their values before propagating?  Maybe we're re-doing work
   wbTraverse_ subscribers $ \s -> subscriberPropagate s a
 
 -- | Stores all global data relevant to a particular Spider timeline; only one
@@ -151,7 +146,6 @@ propagate a subscribers =
 newtype SpiderTimelineEnv (x :: Type) = STE {unSTE :: SpiderTimelineEnv' x}
 -- We implement SpiderTimelineEnv with a newtype wrapper so
 -- we can get the coercions we want safely.
-
 data SpiderTimelineEnv' x = SpiderTimelineEnv
   { _spiderTimeline_lock :: MVar ()
   , _spiderTimeline_eventEnv :: EventEnv x
@@ -310,7 +304,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     invsRef <- liftIO $ newIORef [] -- invalidators
     parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do
-          liftIO $ putStrLn "one"
           valRef <- liftIO . newIORef =<< readV0
           flip addToQueue initsQueue $ liftIO . writeIORef parentRef . fst
               <=< subscribeWithRec e
