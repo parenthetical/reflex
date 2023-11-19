@@ -603,7 +603,7 @@ holdIncremental :: (Patch p, MonadHold t m, Reflex t) => PatchTarget p -> Event 
 holdIncremental v0 = buildIncremental (pure v0)
 
 hold :: (MonadHold t m, Reflex t) => a -> Event t a -> m (Behavior t a)
-hold v0 = fmap current . holdDyn v0
+hold v0 = buildHold (pure v0)
 
 holdDyn :: (MonadHold t m, Reflex t) => a -> Event t a -> m (Dynamic t a)
 holdDyn v0 e = fmap Dynamic . holdIncremental v0 $ fmap Identity e
