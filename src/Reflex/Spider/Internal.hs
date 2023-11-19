@@ -23,7 +23,7 @@
 
 {-# OPTIONS_GHC -Wunused-binds #-}
 {-# LANGUAGE PartialTypeSignatures #-}
-{-# LANGUAGE BangPatterns #-}
+
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -134,8 +134,7 @@ returnSubscription cleanup occ =
 subscribeWithRec :: R.Event (SpiderTimeline x) a -> (EventSubscription x -> Maybe a -> EventM x (Maybe b)) -> Subscriber x b -> EventM x (EventSubscription x, Maybe (Maybe b))
 subscribeWithRec e f subscriber = mdo
   (subscription, occ) <- subscribeAndRead e $ subscriber
-         { subscriberPropagate = \mocc -> do
-             subscriberPropagate subscriber <=< (subscription `f`) $ mocc
+         { subscriberPropagate = subscriberPropagate subscriber <=< (subscription `f`)
          }
   fmap (subscription,) .  mapM (subscription `f`) $ occ
 
@@ -162,17 +161,17 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
   }
 
 data EventEnv x
-   = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
-              , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
-              , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
-              , eventEnvBla :: !(IORef [IO ()])
+   = EventEnv { eventEnvAssignments :: IORef [SomeAssignment x] -- Needed for Subscribe  -- This should only actually get used when events are firing
+              , eventEnvInits :: IORef [EventM x ()] -- Needed for Subscribe
+              , eventEnvClears :: IORef [Clear] -- Needed for Subscribe
+              , eventEnvBla :: IORef [IO ()]
               }
 
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
 asksEventEnv f = return $ f $ _spiderTimeline_eventEnv (unSTE (spiderTimeline :: SpiderTimelineEnv x))
 
 addToQueue :: MonadIO m => a -> IORef [a] -> m ()
-addToQueue (!a) q = liftIO $ modifyIORef' q (a:)
+addToQueue a q = liftIO $ modifyIORef' q (a:)
 
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
@@ -206,7 +205,7 @@ run triggers after = do
 
 newtype Clear = Clear (IO ())
 
-data SomeAssignment x = forall a. SomeAssignment !(IORef a) {-# UNPACK #-} !(IORef [Weak Invalidator]) a
+data SomeAssignment x = forall a. SomeAssignment (IORef a) (IORef [Weak Invalidator]) a
 
 invalidate :: IORef [Weak Invalidator] -> IO ()
 invalidate wisRef = do
@@ -297,7 +296,7 @@ runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi hold
 
 addThisBehaviorMsInvalidator :: IORef [Weak Invalidator] -> BehaviorM x ()
 addThisBehaviorMsInvalidator invsRef = do
-  !m <- asks behaviorEnvMaybeWISubs
+  m <- asks behaviorEnvMaybeWISubs
   forM_ m $ \wi -> liftIO $ modifyIORef' invsRef (wi:)
 
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
@@ -307,20 +306,19 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   -- Note: cannot examine its event until after the phase is over
   buildHold readV0 e = do
     liftIO $ putStrLn "buildHold running"
-    !initsQueue <- asksEventEnv eventEnvInits
-    !invsRef <- liftIO $ newIORef [] -- invalidators
-    !parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
+    initsQueue <- asksEventEnv eventEnvInits
+    invsRef <- liftIO $ newIORef [] -- invalidators
+    parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do
           liftIO $ putStrLn "one"
-          !valRef <- liftIO . newIORef =<< readV0
-          flip addToQueue initsQueue $! do
-            liftIO . writeIORef parentRef . fst
-                <=< subscribeWithRec e
-                   (const (mapM (\a -> do
-                                    liftIO $ printf "Hold update %s\n" $ anythingToString a
-                                    addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
-                                    pure a)))
-                $ Subscriber (const (pure ()))
+          valRef <- liftIO . newIORef =<< readV0
+          flip addToQueue initsQueue $ liftIO . writeIORef parentRef . fst
+              <=< subscribeWithRec e
+                 (const (mapM (\a -> do
+                                  liftIO $ printf "Hold update %s\n" $ anythingToString a
+                                  addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
+                                  pure a)))
+              $ Subscriber (const (pure ()))
           pure valRef
     flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
     pure $ Behavior $ do
@@ -353,7 +351,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       returnSubscription (wbRemove sln) <=< liftIO $ readIORef occRef
 
   pushCheap :: (a -> R.PushM (SpiderTimeline x) (Maybe b)) -> R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) b
-  pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
+  pushCheap f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
 
   pull :: R.PullM (SpiderTimeline x) a -> R.Behavior (SpiderTimeline x) a
   pull a = unsafePerformIO $ do
@@ -365,7 +363,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
         Just z -> pure z
         Nothing -> do
           wi <- liftIO $ mkWeakPtr $ readIORef ref >>= mapM_ (const $ writeIORef ref Nothing >> invalidate invsRef)
-          !holdInits <- BehaviorM $ asks behaviorEnvInitsRef
+          holdInits <- BehaviorM $ asks behaviorEnvInitsRef
           aVal <- liftIO $ runBehaviorM a (Just wi) holdInits
           liftIO $ writeIORef ref $ Just aVal
           return aVal
@@ -383,7 +381,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           finalize wi
           unsubscribe oldSubscription
     let f = do
-          !wi <- liftIO $ mkWeakPtr switchInvalidator
+          wi <- liftIO $ mkWeakPtr switchInvalidator
           e <- liftIO $ runBehaviorM (R.sample switchParent) (Just wi) holdInitsRef
           (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
             liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
@@ -394,7 +392,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           undoThings
           writeIORef parentsRef []
           --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-          _occ <- unSpiderHost $ runFrame f  
+          _occ <- unSpiderHost $ runFrame f
           -- FIXME: (Is this what is meant above? Currently registers as firing.):
           -- when (isJust _occ) $ error $ "Event is firing but it shouldn't?"
           pure ()
@@ -478,7 +476,7 @@ newFanEventWithTriggerIO f = do
   nodeId <- newNodeId
   subscribedRef :: IORef (DMap k (NewFanSubscribedChildren x)) <- newIORef DMap.empty
   occRef <- newIORef DMap.empty
-  return $ R.EventSelector $ \(!k) ->
+  return $ R.EventSelector $ \k ->
     Event $ \sub -> do
       (NewFanSubscribedChildren subscribers) <- liftIO $
         (\case
