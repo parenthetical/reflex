@@ -178,7 +178,6 @@ data EventEnv x
    = EventEnv { eventEnvAssignments :: !(IORef [SomeAssignment x]) -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvInits :: !(IORef [EventM x ()]) -- Needed for Subscribe
               , eventEnvClears :: !(IORef [Clear]) -- Needed for Subscribe
-              , eventEnvUnsubscribes :: !(IORef [EventSubscription x])
               , eventEnvBla :: !(IORef [IO ()])
               }
 
@@ -190,9 +189,6 @@ addToQueue (!a) q = liftIO $ modifyIORef' q (a:)
 
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
-
-deferUnsubscribe :: HasSpiderTimeline x => EventSubscription x -> EventM x ()
-deferUnsubscribe subscription = addToQueue subscription =<< asksEventEnv eventEnvUnsubscribes
 
 deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
 deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
@@ -234,7 +230,7 @@ invalidate wisRef = do
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
   liftIO $ putStrLn "-- START RUNFRAME"
-  let (EventEnv toAssignRef initRef toClearRef toUnsubscribeRef toBlaRef) =
+  let (EventEnv toAssignRef initRef toClearRef toBlaRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   liftIO $ putStrLn ">>> Running inits"
   let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
@@ -254,14 +250,10 @@ runFrame a = SpiderHost $ do
   writeIORef toAssignRef []
   ----------------
   toBla <- readIORef toBlaRef
-  toUnsubscribe <- readIORef toUnsubscribeRef
-  writeIORef toUnsubscribeRef []
   writeIORef initRef []
   writeIORef toBlaRef []
   putStrLn "-- BLA"
   sequence_ toBla
-  putStrLn "-- UNSUBSCRIBING"
-  mapM_ unsubscribe toUnsubscribe
   putStrLn "-- DONE RUNFRAME"
   return result
 
@@ -279,9 +271,8 @@ unsafeNewSpiderTimelineEnv = do
   env <- do toAssignRef <- newIORef []
             initRef <- newIORef []
             toClearRef <- newIORef []
-            toUnsubscribeRef <- newIORef []
             toBlaRef <- newIORef []
-            return $ EventEnv toAssignRef initRef toClearRef toUnsubscribeRef toBlaRef
+            return $ EventEnv toAssignRef initRef toClearRef toBlaRef
   triggers <- newIORef mempty
   rootSubscribers :: WeakBag (Subscriber x a) <- wbEmpty
   rootOccRef :: IORef (Maybe (Maybe ())) <- newIORef Nothing
@@ -427,9 +418,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     let f = fmap join
           . mapM (maybe
                   (pure (Just Nothing))
-                  (\innerE -> do
-                      (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ subscriberPropagate sub
-                      deferUnsubscribe subscriptionInner
+                  (\innerE -> mdo
+                      (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ \occ -> do
+                        liftIO $ unsubscribe subscriptionInner
+                        subscriberPropagate sub occ
+                      when (isJust occInner) $ liftIO $ unsubscribe subscriptionInner
                       pure occInner))
     (subscriptionOuter, occOuter) <-
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
