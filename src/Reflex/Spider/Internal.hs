@@ -160,9 +160,6 @@ addToQueue a q = liftIO $ modifyIORef' q (a:)
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
 deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
 
-deferBla :: HasSpiderTimeline x => IO () -> EventM x ()
-deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
-
 writeAndScheduleClear :: forall x a. HasSpiderTimeline x => String -> IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear info ref val = do
   prevVal <- liftIO $ readIORef ref
@@ -351,6 +348,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
             subscriberPropagate sub ma
           liftIO $ writeIORef subscriptionRef (subscription, wi)
           pure occ
+    let deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
     let switchInvalidator = runEventM @x $ deferBla $ do
           undoThings
           writeIORef parentsRef []
