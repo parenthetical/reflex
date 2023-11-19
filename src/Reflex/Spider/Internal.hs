@@ -82,6 +82,7 @@ import qualified Data.IntMap as IntMap
 import Text.Printf (printf)
 import Witherable (filter)
 import Prelude hiding (filter)
+import Data.Patch (Patch)
 -- import Debug.RecoverRTTI (anythingToString)
 
 anythingToString :: p -> String
@@ -293,10 +294,8 @@ unsafeNewSpiderTimelineEnv = do
         returnSubscription (wbRemove sln) occ
     , _spiderTimeline_triggerRootEvent = runEventM @x $ do
         liftIO $ writeIORef rootOccRef (Just (Just ()))
---        addToQueue (Clear $ writeIORef rootOccRef Nothing) $ eventEnvClears env
         liftIO $ printf "propagating rootEvent\n"
         propagate (Just ()) rootSubscribers
-        -- liftIO $ writeIORef rootOccRef Nothing
         addToQueue (Clear (writeIORef rootOccRef Nothing)) (eventEnvClears env)
     , _spiderTimeline_rootTriggers = triggers
     }
@@ -360,7 +359,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe (Maybe a)) }
   type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
+
   never = error "never value got evaluated??" <$ filter (const False) rootEvent
+
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
     liftIO $ putStrLn "cacheEvent being subscribed to"
@@ -372,7 +373,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       liftIO $ printf "cacheEvent occ on read: %s\n" . anythingToString =<< readIORef occRef
       sln <- liftIO $ wbInsert sub subscribers
       returnSubscription (wbRemove sln) <=< liftIO $ readIORef occRef
+
+  pushCheap :: (a -> R.PushM (SpiderTimeline x) (Maybe b)) -> R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) b
   pushCheap !f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
+
+  pull :: R.PullM (SpiderTimeline x) a -> R.Behavior (SpiderTimeline x) a
   pull a = unsafePerformIO $ do
     ref :: IORef (Maybe a) <- newIORef Nothing
     invsRef :: IORef [Weak Invalidator] <- newIORef []
@@ -388,6 +393,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           return aVal
       addThisBehaviorMsInvalidator invsRef
       pure val
+
+  switchUncached :: R.Behavior (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
   switchUncached switchParent = Event $ \sub -> mdo
     parentsRef <- liftIO $ newIORef [] --TODO: This shouldn't be unnecessary, because it will always be filled with just the single parent behavior
     holdInitsRef <- asksEventEnv eventEnvInits
@@ -414,6 +421,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           -- when (isJust _occ) $ error $ "Event is firing but it shouldn't?"
           pure ()
     returnSubscription undoThings =<< f
+
+  coincidenceUncached :: R.Event (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
   coincidenceUncached coincidenceParent = Event $ \sub -> do
     let f = fmap join
           . mapM (maybe
@@ -426,9 +435,10 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
     occ <- f occOuter
     returnSubscription (unsubscribe subscriptionOuter) occ
+
+  unsafeBuildIncremental :: (Patch p) => R.PullM (SpiderTimeline x) (R.PatchTarget p) -> R.Event (SpiderTimeline x) p -> R.Incremental (SpiderTimeline x) p
   unsafeBuildIncremental = R.Incremental . R.pull
-      -- TODO: why originally something like:
-      -- unsafePerformIO $ runEventM @x . R.buildIncremental (R.sample . R.pull $ readV0) $ e
+
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
     nodeId <- newNodeId
@@ -471,7 +481,9 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     maybeOcc <- liftIO maybeResult
     liftIO $ printf "merge occ on subscription: %s\n" $ anythingToString maybeOcc
     returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) maybeOcc
+
   eventCoercion Coercion = Coercion
+
   behaviorCoercion Coercion = Coercion
 
 
