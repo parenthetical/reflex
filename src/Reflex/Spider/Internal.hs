@@ -404,11 +404,10 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           . mapM (maybe
                   (pure (Just Nothing))
                   (\innerE -> mdo
-                      (subscriptionInner, occInner) <- subscribeAndRead innerE $ Subscriber $ \occ -> do
-                        liftIO $ unsubscribe subscriptionInner
-                        subscriberPropagate sub occ
-                      when (isJust occInner) $ liftIO $ unsubscribe subscriptionInner
-                      pure occInner))
+                      fmap snd . subscribeWithRec innerE (\subscriptionInner occ -> do
+                                                  liftIO (unsubscribe subscriptionInner)
+                                                  pure occ)
+                        $ Subscriber $ subscriberPropagate sub))
     (subscriptionOuter, occOuter) <-
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
     occ <- f occOuter
@@ -588,10 +587,10 @@ instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTim
   subscribeEvent e = SpiderHostFrame $ do
     --TODO: Unsubscribe eventually (manually and/or with weak ref)
     valRef <- liftIO $ newIORef Nothing
-    (subscription, occ) <- subscribeAndRead e $ Subscriber
-      { subscriberPropagate = mapM_ (writeAndScheduleClear "subscribeEvent propagate" valRef)
-      }
-    mapM_ (mapM_ (writeAndScheduleClear "subscribeEvent init" valRef)) occ -- TODO: added but why was this originally not like that?
+    (subscription, _) <- subscribeWithRec e (\_ occ -> do
+                                                mapM_ (writeAndScheduleClear "subscribeEvent" valRef) occ
+                                                pure Nothing)
+                         $ Subscriber (const (pure ()))
     return $ SpiderEventHandle
       { spiderEventHandleSubscription = subscription
       , spiderEventHandleValue = valRef
