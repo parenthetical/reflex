@@ -125,8 +125,6 @@ deRefWeak = readIORef
 mkWeakPtr :: a -> IO (Weak a)
 mkWeakPtr = newIORef . Just
 
---NB: Once you subscribe to an Event, you must always hold on the the WHOLE EventSubscription you get back
--- If you do not retain the subscription, you may be prematurely unsubscribed from the parent event.
 data EventSubscription x = EventSubscription
   { unsubscribe :: !(IO ())
   }
@@ -135,11 +133,6 @@ newtype Subscriber x a = Subscriber
   { subscriberPropagate :: Maybe a -> EventM x ()
   }
 
--- Why do we use Any here, instead of just using an
--- existential type? Sadly, GHC does not currently know how to unbox types
--- with existentially quantified fields. So instead we just coerce values
--- to type Any on the way in. Since we never coerce them back, this is
--- perfectly safe.
 returnSubscription :: Monad m => IO () -> Maybe (Maybe b) -> m (EventSubscription x, Maybe (Maybe b))
 returnSubscription cleanup occ =
   return (EventSubscription cleanup, occ)
