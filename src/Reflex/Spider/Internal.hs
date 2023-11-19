@@ -82,7 +82,6 @@ import qualified Data.IntMap as IntMap
 import Text.Printf (printf)
 import Witherable (filter)
 import Prelude hiding (filter)
-import Data.Patch (Patch)
 -- import Debug.RecoverRTTI (anythingToString)
 
 anythingToString :: p -> String
@@ -125,13 +124,8 @@ deRefWeak = readIORef
 mkWeakPtr :: a -> IO (Weak a)
 mkWeakPtr = newIORef . Just
 
-data EventSubscription x = EventSubscription
-  { unsubscribe :: !(IO ())
-  }
-
-newtype Subscriber x a = Subscriber
-  { subscriberPropagate :: Maybe a -> EventM x ()
-  }
+newtype EventSubscription x = EventSubscription { unsubscribe :: IO () }
+newtype Subscriber x a = Subscriber { subscriberPropagate :: Maybe a -> EventM x () }
 
 returnSubscription :: Monad m => IO () -> Maybe (Maybe b) -> m (EventSubscription x, Maybe (Maybe b))
 returnSubscription cleanup occ =
@@ -389,7 +383,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           finalize wi
           unsubscribe oldSubscription
     let f = do
-          !wi <- liftIO $ mkWeakPtr $ switchInvalidator
+          !wi <- liftIO $ mkWeakPtr switchInvalidator
           e <- liftIO $ runBehaviorM (R.sample switchParent) (Just wi) holdInitsRef
           (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
             liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
@@ -422,7 +416,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
     occ <- f occOuter
     returnSubscription (unsubscribe subscriptionOuter) occ
 
-  unsafeBuildIncremental :: (Patch p) => R.PullM (SpiderTimeline x) (R.PatchTarget p) -> R.Event (SpiderTimeline x) p -> R.Incremental (SpiderTimeline x) p
+  unsafeBuildIncremental :: R.PullM (SpiderTimeline x) (R.PatchTarget p) -> R.Event (SpiderTimeline x) p -> R.Incremental (SpiderTimeline x) p
   unsafeBuildIncremental = R.Incremental . R.pull
 
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
