@@ -282,11 +282,9 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     liftIO $ putStrLn "buildHold running"
     initsQueue <- asksEventEnv eventEnvInits
     invsRef <- liftIO $ newIORef [] -- invalidators
-    parentRef <- liftIO $ newIORef $ error "buildHold: parentRef uninitialized"
     let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do
           valRef <- liftIO . newIORef =<< readV0
-          flip addToQueue initsQueue $ liftIO . writeIORef parentRef . fst
-              <=< subscribeWithRec e
+          flip addToQueue initsQueue $ void $ subscribeWithRec e
                  (const (mapM (\a -> do
                                   liftIO $ printf "Hold update %s\n" $ anythingToString a
                                   addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
