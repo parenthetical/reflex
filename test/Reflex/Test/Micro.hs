@@ -330,6 +330,10 @@ testCases =
       let e = pushAlways (\a -> if a == "a" then now else return never) e1
       x <- accumDyn (<>) never e 
       return . coincidence $ updated x
+  , testE "now-3" $ now
+  , testE "now-4" $ do
+      e1 <- events1
+      pure $ coincidence $ pushAlways (\a -> if a == "a" then now else return never) e1
   ] where
 
     events1, events2, events3 ::  TestPlan t m => m (Event t String)
