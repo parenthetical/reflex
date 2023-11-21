@@ -194,41 +194,23 @@ runFrame a = SpiderHost $ do
   liftIO $ putStrLn "-- START RUNFRAME"
   let (EventEnv toAssignRef initRef toClearRef toBlaRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-  liftIO $ putStrLn ">>> Running inits"
-  let env = _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
-  result <- runEventM $ do
-        result <- a
-        -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
-        runHoldInits (eventEnvInits env)
-        return result
-  liftIO $ putStrLn "<<< End running inits"
-  putStrLn "-- CLEARING"
-  readIORef toClearRef >>= mapM_ (\(Clear m) -> m)
-  writeIORef toClearRef []
-  putStrLn "-- ASSIGNMENTS"
-  readIORef toAssignRef
+  result <- runEventM a
+  -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
+  fix $ \runHoldInits' -> do
+    inits <- readIORef initRef
+    unless (null inits) $ do
+      writeIORef initRef []
+      runEventM $ sequence_ inits
+      runHoldInits'
+  atomicModifyIORef toClearRef ([],) >>= mapM_ (\(Clear m) -> m)
+  atomicModifyIORef toAssignRef ([],)
     >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                   writeIORef vRef v
                   mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< readIORef $ wi)
                       =<< readIORef iRef
                   writeIORef iRef [])
-  writeIORef toAssignRef []
-  ----------------
-  toBla <- readIORef toBlaRef
-  writeIORef initRef []
-  writeIORef toBlaRef []
-  putStrLn "-- BLA"
-  sequence_ toBla
-  putStrLn "-- DONE RUNFRAME"
+  atomicModifyIORef toBlaRef ([],) >>= sequence_
   return result
-
-runHoldInits :: MonadIO m => IORef [m a] -> m ()
-runHoldInits initsRef = fix $ \runHoldInits' -> do
-  inits <- liftIO $ readIORef initsRef
-  unless (null inits) $ do
-    liftIO $ writeIORef initsRef []
-    sequence_ inits
-    runHoldInits'
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
 unsafeNewSpiderTimelineEnv = do
