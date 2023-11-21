@@ -230,21 +230,14 @@ import qualified Data.Patch.MapWithMove as PatchMapWithMove
 import Debug.Trace (trace)
 import Unsafe.Coerce (unsafeCoerce)
 
-{-# RULES
-"cacheEvent/cacheEvent" forall e. cacheEvent (cacheEvent e) = cacheEvent e
-"cacheEvent/pushCheap" forall f e. pushCheap f (cacheEvent e) = cacheEvent (pushCheap f e)
-"buildIncremental/cacheEvent" forall f e. buildIncremental f (cacheEvent e) = buildIncremental f e
-"cacheEvent/f/cacheEvent" forall f e. cacheEvent (f (cacheEvent e)) = cacheEvent (f e)
-#-}
-
 -- | The 'Reflex' class contains all the primitive functionality needed for
 -- Functional Reactive Programming (FRP).  The @/t/@ type parameter indicates
 -- which "timeline" is in use.  Timelines are fully-independent FRP contexts,
 -- and the type of the timeline determines the FRP engine to be used.  For most
 -- purposes, the 'Reflex.Spider' implementation is recommended.
 class ( MonadHold t (PushM t)
-      , MonadSample t (PullM t)
       , MonadFix (PushM t)
+      , MonadFix (Behavior t)
       ) => Reflex t where
   -- | A container for a value that can change over time.  'Behavior's can be
   -- sampled at will, but it is not possible to be notified when they change
