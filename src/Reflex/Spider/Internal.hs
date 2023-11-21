@@ -329,33 +329,13 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   pull = Behavior
 
   switchUncached :: R.Behavior (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
-  switchUncached switchParent = Event $ \sub -> mdo
-    parentsRef <- liftIO $ newIORef [] --TODO: This shouldn't be unnecessary, because it will always be filled with just the single parent behavior
-    holdInitsRef <- asksEventEnv eventEnvInits
-    subscriptionRef <- liftIO $ newIORef $ error "switchUncached: subscriptionRef uninitialized"
-    -- TODO: holdInitsRef is always empty, parentsRef is always length 1?
-    let undoThings = do
-          (oldSubscription, wi) <- readIORef subscriptionRef
-          finalize wi
-          unsubscribe oldSubscription
-    let f = do
-          wi <- liftIO $ newIORef . Just $ switchInvalidator
-          e <- liftIO $ runBehaviorM (R.sample switchParent) (Just wi) holdInitsRef
-          (subscription, occ) <- subscribeAndRead e $ Subscriber $ \ma -> do
-            liftIO $ printf "Switch propagating update: %s\n" $ anythingToString ma
-            subscriberPropagate sub ma
-          liftIO $ writeIORef subscriptionRef (subscription, wi)
-          pure occ
-    let deferBla x = addToQueue x =<< asksEventEnv eventEnvBla
-    let switchInvalidator = runEventM @x $ deferBla $ do
-          undoThings
-          writeIORef parentsRef []
-          --TODO: Assert that the event isn't firing --TODO: This should not loop because none of the events should be firing, but still, it is inefficient
-          _occ <- unSpiderHost $ runFrame f
-          -- FIXME: (Is this what is meant above? Currently registers as firing.):
-          -- when (isJust _occ) $ error $ "Event is firing but it shouldn't?"
-          pure ()
-    returnSubscription undoThings =<< f
+  switchUncached switchParent = Event $ \sub ->
+    -- TODO: eventEnvInits is always empty?
+    fix $ \f -> mfix $ \(~(subscription,_occ)) -> do
+      wi <- liftIO . newIORef . Just . addToQueue (unsubscribe subscription >> void (runEventM @x f)) =<< asksEventEnv eventEnvBla
+      e <- liftIO . runBehaviorM (R.sample switchParent) (Just wi) =<< asksEventEnv eventEnvInits
+      (parentSubscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
+      returnSubscription (finalize wi >> unsubscribe parentSubscription) occ
 
   coincidenceUncached :: R.Event (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
   coincidenceUncached coincidenceParent = Event $ \sub -> do
