@@ -264,23 +264,18 @@ instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   -- Note: cannot examine its event until after the phase is over
   buildHold readV0 e = do
-    liftIO $ putStrLn "buildHold running"
-    initsQueue <- asksEventEnv eventEnvInits
     invsRef <- liftIO $ newIORef [] -- invalidators
-    let forceLazyHoldReturnValRef = unsafePerformIO . runEventM @x $ do
-          valRef <- liftIO . newIORef =<< readV0
-          flip addToQueue initsQueue $ void $ subscribeWithRec e
-                 (const (mapM (\a -> do
-                                  liftIO $ printf "Hold update %s\n" $ anythingToString a
-                                  addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
-                                  pure a)))
-              $ Subscriber (const (pure ()))
-          pure valRef
-    flip addToQueue initsQueue $ void $ liftIO $ evaluate forceLazyHoldReturnValRef
+    valRef <- liftIO . unsafeInterleaveIO $ newIORef =<< runEventM @x readV0
+    addToQueue (do void $ liftIO $ evaluate valRef
+                   void $ subscribeWithRec e
+                     (const (mapM (\a -> do
+                                    addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
+                                    pure Nothing)))
+                     $ Subscriber (const (pure ())))
+      =<< asksEventEnv eventEnvInits
     pure $ Behavior $ do
-      m <- asks behaviorEnvMaybeWISubs
-      forM_ m $ \wi -> liftIO $ modifyIORef' invsRef (wi:)
-      liftIO $ readIORef forceLazyHoldReturnValRef
+      asks behaviorEnvMaybeWISubs >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
+      liftIO $ readIORef valRef
 
   now = R.headE rootEvent
 
