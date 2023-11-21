@@ -196,19 +196,23 @@ runFrame a = SpiderHost $ do
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- runEventM a
   -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
+  liftIO $ putStr "INITS"
   fix $ \runHoldInits' -> do
     inits <- readIORef initRef
     unless (null inits) $ do
       writeIORef initRef []
-      runEventM $ sequence_ inits
+      runEventM $ mapM_ (\m -> liftIO (putStr ".") >> m) inits
       runHoldInits'
+  liftIO $ putStrLn "\nCLEARS"
   atomicModifyIORef toClearRef ([],) >>= mapM_ (\(Clear m) -> m)
+  liftIO $ putStrLn "ASSIGNMENTS"
   atomicModifyIORef toAssignRef ([],)
     >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
                   writeIORef vRef v
                   mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< readIORef $ wi)
                       =<< readIORef iRef
                   writeIORef iRef [])
+  liftIO $ putStrLn "BLAS"
   atomicModifyIORef toBlaRef ([],) >>= sequence_
   return result
 
