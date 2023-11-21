@@ -255,6 +255,9 @@ type Invalidator = IO ()
 runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
 runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
 
+rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
+rootEvent = Event (_spiderTimeline_rootEvent (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
+
 instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
   sample = readBehaviorTracked
 
@@ -278,10 +281,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
       m <- asks behaviorEnvMaybeWISubs
       forM_ m $ \wi -> liftIO $ modifyIORef' invsRef (wi:)
       liftIO $ readIORef forceLazyHoldReturnValRef
-  now = R.headE rootEvent
 
-rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
-rootEvent = Event (_spiderTimeline_rootEvent (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
+  now = R.headE rootEvent
 
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
