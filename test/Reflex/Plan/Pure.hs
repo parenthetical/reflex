@@ -36,7 +36,8 @@ liftPlan :: TimeM a -> PurePlan a
 liftPlan = PurePlan . lift
 
 instance MonadHold (Pure Int) PurePlan where
-  buildHold getInitial = liftPlan . buildHold getInitial
+  liftPush = liftPlan . liftPush
+  hold v0 = liftPlan . hold v0
   now = liftPlan now
 
 instance MonadSample (Pure Int) PurePlan where

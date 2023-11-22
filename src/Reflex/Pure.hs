@@ -81,7 +81,8 @@ instance MonadSample (Pure t) ((->) t) where
   sample = unBehavior
 
 instance (Enum t, HasTrie t, Ord t) => MonadHold (Pure t) ((->) t) where
-  buildHold getInitialValue e initialTime = hold' (getInitialValue initialTime)
+  liftPush = id
+  hold a e initialTime = hold' a
     where hold' initialValue = Behavior f
             where f = memo $ \sampleTime ->
                     -- Really, the sampleTime should never be prior to the initialTime,

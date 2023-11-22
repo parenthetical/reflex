@@ -223,7 +223,8 @@ test-suite semantics
     reflex,
     split,
     transformers,
-    patch
+    patch,
+    witherable
   other-modules:
     Reflex.Bench.Focused
     Reflex.Plan.Pure

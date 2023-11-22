@@ -23,6 +23,8 @@ import qualified Data.Map as Map
 import Data.Monoid
 
 import Prelude
+import Control.Monad.Identity (Identity(..))
+import Witherable (catMaybes)
 
 pushDyn :: (Reflex t, MonadHold t m) => (a -> PushM t b) -> Dynamic t a -> m (Dynamic t b)
 pushDyn f d = buildDynamic (sample (current d) >>= f) (pushAlways f (updated d))
@@ -45,7 +47,7 @@ scanInnerDyns d = do
 {-# ANN testCases "HLint: ignore Functor law" #-}
 testCases :: [(String, TestCase)]
 testCases =
-  [ testB "hold"  $ hold "0" =<< events1
+  [ testB "hold-0"  $ hold "0" =<< events1
 
   , testB "count" $ do
       b <- current <$> (count =<< events2)
@@ -259,6 +261,23 @@ testCases =
 
       _ <- sample (current d'')
       return (current d'')
+
+  , testB "buildHoldStrictness-2"  $ do
+      rec
+        e1 <- events1
+        b' <- buildHold (sample b) e1
+        b <- buildHold (pure "0") e1
+      -- _ <- sample b'
+      return b'
+
+  , testB "buildHoldStrictness-3"  $ do
+      rec
+        e1 <- events1
+        x <- sample b
+        b' <- buildHold (pure x) e1
+        b <- buildHold (pure "0") e1
+      _ <- sample b'
+      return b'
 
   , testB "factorDyn"  $ do
       d <- holdDyn (Left "a") =<< eithers

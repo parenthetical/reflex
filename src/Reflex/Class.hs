@@ -497,9 +497,12 @@ class (Applicative m, Monad m) => MonadSample t m | m -> t where
 -- 'Event's; usually this will be 'PushM' or a monad based on it.  'MonadHold'
 -- is required to create any stateful computations with Reflex.
 class (MonadFix m, MonadSample t m) => MonadHold t m where
-  buildHold :: PushM t a -> Event t a -> m (Behavior t a)
-  default buildHold :: (m ~ f m', MonadTrans f, MonadHold t m') => PushM t a -> Event t a -> m (Behavior t a)
-  buildHold readV0 = lift . buildHold readV0
+  hold :: a -> Event t a -> m (Behavior t a)
+  default hold :: (m ~ f m', MonadTrans f, MonadHold t m') => a -> Event t a -> m (Behavior t a)
+  hold v0 = lift . hold v0
+  liftPush :: PushM t a -> m a
+  default liftPush :: (m ~ f m', MonadTrans f, MonadHold t m') => PushM t a -> m a
+  liftPush = lift . liftPush
   now :: m (Event t ())
   default now :: (m ~ f m', MonadTrans f, MonadHold t m') => m (Event t ())
   now = lift now
@@ -610,8 +613,10 @@ headE = slowHeadE
 holdIncremental :: (Patch p, MonadHold t m, Reflex t) => PatchTarget p -> Event t p -> m (Incremental t p)
 holdIncremental v0 = buildIncremental (pure v0)
 
-hold :: (MonadHold t m, Reflex t) => a -> Event t a -> m (Behavior t a)
-hold v0 = buildHold (pure v0)
+buildHold :: (MonadHold t m) => PushM t a -> Event t a -> m (Behavior t a)
+buildHold readV0 e = do
+  v0 <- liftPush readV0
+  hold v0 e
 
 holdDyn :: (MonadHold t m, Reflex t) => a -> Event t a -> m (Dynamic t a)
 holdDyn v0 e = fmap Dynamic . holdIncremental v0 $ fmap Identity e
@@ -663,35 +668,35 @@ instance MonadSample t m => MonadSample t (ReaderT r m) where
   sample = lift . sample
 
 instance MonadHold t m => MonadHold t (ReaderT r m) where
-  buildHold a0 = lift . buildHold a0
+  hold a0 = lift . hold a0
   now = lift now
 
 instance (MonadSample t m, Monoid r) => MonadSample t (WriterT r m) where
   sample = lift . sample
 
 instance (MonadHold t m, Monoid r) => MonadHold t (WriterT r m) where
-  buildHold a0 = lift . buildHold a0
+  hold a0 = lift . hold a0
   now = lift now
 
 instance MonadSample t m => MonadSample t (StateT s m) where
   sample = lift . sample
 
 instance MonadHold t m => MonadHold t (StateT s m) where
-  buildHold a0 = lift . buildHold a0
+  hold a0 = lift . hold a0
   now = lift now
 
 instance MonadSample t m => MonadSample t (ExceptT e m) where
   sample = lift . sample
 
 instance MonadHold t m => MonadHold t (ExceptT e m) where
-  buildHold a0 = lift . buildHold a0
+  hold a0 = lift . hold a0
   now = lift now
 
 instance (MonadSample t m, Monoid w) => MonadSample t (RWST r w s m) where
   sample = lift . sample
 
 instance (MonadHold t m, Monoid w) => MonadHold t (RWST r w s m) where
-  buildHold a0 = lift . buildHold a0
+  hold a0 = lift . hold a0
   now = lift now
 
 instance MonadSample t m => MonadSample t (ContT r m) where

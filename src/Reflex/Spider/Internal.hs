@@ -232,9 +232,6 @@ unsafeNewSpiderTimelineEnv = do
     , _spiderTimeline_rootTriggers = triggers
     }
 
-instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
-  sample b = liftIO . runBehaviorM b Nothing =<< asksEventEnv eventEnvInits
-
 data BehaviorEnv x = BehaviorEnv
   { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator)
   , _behaviorEnvInitsRef :: IORef [EventM x ()]
@@ -248,13 +245,20 @@ runBehaviorM (Behavior a) mwi holdInits = runReaderIO a (BehaviorEnv mwi holdIni
 rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
 rootEvent = Event (_spiderTimeline_rootEvent (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
 
+instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
+  sample b = do
+    inits <- asksEventEnv eventEnvInits
+    res <- liftIO . unsafeInterleaveIO . runBehaviorM b Nothing $ inits
+    addToQueue eventEnvInits $ liftIO . void . evaluate $ res
+    pure res
+
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
+  liftPush = id
   -- Note: cannot examine its event until after the phase is over
-  buildHold readV0 e = do
+  hold v0 e = do
     invsRef <- liftIO $ newIORef [] -- invalidators
-    valRef <- liftIO . unsafeInterleaveIO $ newIORef =<< runEventM @x readV0
+    valRef <- liftIO $ newIORef v0
     addToQueue eventEnvInits $ do
-      void $ liftIO $ evaluate valRef
       void $ subscribeWithRec e
         (const (mapM (\a -> do
                          addToQueue eventEnvAssignments $ do
@@ -267,7 +271,6 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     pure $ Behavior $ do
       asks behaviorEnvMaybeWISubs >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
       liftIO $ readIORef valRef
-
   now = R.headE rootEvent
 
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
@@ -474,7 +477,8 @@ data SpiderEventHandle x a = SpiderEventHandle
 newtype SpiderHost (x :: Type) a = SpiderHost { unSpiderHost :: IO a } deriving (Functor, Applicative, Monad, MonadFix, MonadIO, MonadException, MonadAsyncException, MonadFail)
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (SpiderHost x) where
-  buildHold getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.buildHold getV0 e
+  liftPush m = runFrame . runSpiderHostFrame $ Reflex.Class.liftPush m
+  hold getV0 e = runFrame . runSpiderHostFrame $ Reflex.Class.hold getV0 e
   now = runFrame . runSpiderHostFrame $ Reflex.Class.now
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (SpiderHost x) where
@@ -484,7 +488,8 @@ instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (Ref
   sample = Reflex.Spider.Internal.ReadPhase . Reflex.Class.sample
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Reflex.Spider.Internal.ReadPhase x) where
-  buildHold getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.buildHold getV0 e
+  liftPush m = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.liftPush m
+  hold getV0 e = Reflex.Spider.Internal.ReadPhase $ Reflex.Class.hold getV0 e
   now = Reflex.Spider.Internal.ReadPhase Reflex.Class.now
 
 instance HasSpiderTimeline x => Reflex.Host.Class.MonadSubscribeEvent (SpiderTimeline x) (SpiderHostFrame x) where
