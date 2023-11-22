@@ -16,6 +16,7 @@
 --   * MonadSample (Pure t) ((->) t)
 --   * MonadHold (Pure t) ((->) t)
 {-# OPTIONS_GHC -fno-warn-orphans #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 -- |
 -- Module: Reflex.Pure
 -- Description:
@@ -42,6 +43,7 @@ import Data.Kind (Type)
 import Control.Monad.Trans.Maybe
 import qualified Data.List.NonEmpty as NonEmpty
 import Data.Semigroup (sconcat)
+import Control.Monad.Fix (MonadFix)
 
 -- | A completely pure-functional 'Reflex' timeline, identifying moments in time
 -- with the type @/t/@.
@@ -58,19 +60,17 @@ toEvent = Event . memo
 -- exclusively to memoize functions of @/t/@, not for any of its other capabilities.
 instance (Enum t, HasTrie t, Ord t) => Reflex (Pure t) where
   newtype Behavior (Pure t) a = Behavior { unBehavior :: t -> a }
+    deriving (Functor,Applicative,Monad,MonadFix)
   newtype Event (Pure t) a = Event { unEvent :: t -> Maybe a }
   type PushM (Pure t) = (->) t
-  type PullM (Pure t) = (->) t
   never = toEvent (pure Nothing)
   pushCheap f = toEvent . runMaybeT . (MaybeT . f <=< MaybeT . occurs)
-  pull = Behavior . memo
   fanG e = EventSelectorG $ \k -> Event $ unEvent e >=> DMap.lookup k
   cacheEvent = id
   switchUncached :: Behavior (Pure t) (Event (Pure t) a) -> Event (Pure t) a
   switchUncached = toEvent . (occurs <=< sample)
   coincidenceUncached :: Event (Pure t) (Event (Pure t) a) -> Event (Pure t) a
   coincidenceUncached = push occurs
-  unsafeBuildIncremental readV = Incremental (pull readV)
   behaviorCoercion Coercion = Coercion
   eventCoercion Coercion = Coercion
   fanInt e = EventSelectorInt $ \k -> Event $ unEvent e >=> IntMap.lookup k

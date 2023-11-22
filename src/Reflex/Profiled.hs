@@ -9,6 +9,7 @@
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE RankNTypes #-}
+{-# LANGUAGE StandaloneDeriving #-}
 -- |
 -- Module:
 --   Reflex.Profiled
@@ -134,19 +135,21 @@ profileEvent e = unsafePerformIO $ do
 
 --TODO: Instead of profiling just the input or output of each one, profile all the inputs and all the outputs
 
+deriving instance (Reflex t) => Functor (Behavior (ProfiledTimeline t))
+deriving instance (Reflex t) => Applicative (Behavior (ProfiledTimeline t))
+deriving instance (Reflex t) => Monad (Behavior (ProfiledTimeline t))
+deriving instance (Reflex t) => MonadFix (Behavior (ProfiledTimeline t))
+
 instance Reflex t => Reflex (ProfiledTimeline t) where
   newtype Behavior (ProfiledTimeline t) a = Behavior_Profiled { unBehavior_Profiled :: Behavior t a }
   newtype Event (ProfiledTimeline t) a = Event_Profiled { unEvent_Profiled :: Event t a }
   type PushM (ProfiledTimeline t) = ProfiledM (PushM t)
-  type PullM (ProfiledTimeline t) = ProfiledM (PullM t)
   never = Event_Profiled never
   cacheEvent (Event_Profiled e) = Event_Profiled (cacheEvent e)
   pushCheap f (Event_Profiled e) = coerce $ pushCheap (coerce f) $ profileEvent e
-  pull = Behavior_Profiled . pull . coerce
   fanG (Event_Profiled e) = EventSelectorG $ coerce $ selectG (fanG $ profileEvent e)
   switchUncached (Behavior_Profiled b) = coerce $ profileEvent $ switchUncached (coerceBehavior b)
   coincidenceUncached (Event_Profiled e) = coerce $ profileEvent $ coincidenceUncached (coerceEvent e)
-  unsafeBuildIncremental (ProfiledM a0) (Event_Profiled a') = unsafeCoerce $ unsafeBuildIncremental a0 a'
   mergeListUncached = Event_Profiled . mergeListUncached . fmap unEvent_Profiled
   behaviorCoercion c =
     Coercion `trans` behaviorCoercion @t c `trans` Coercion

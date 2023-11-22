@@ -1,5 +1,8 @@
-{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE CPP #-}
+#ifdef USE_REFLEX_OPTIMIZER
+{-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
+#endif
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE ConstraintKinds #-}
 {-# LANGUAGE DefaultSignatures #-}
 {-# LANGUAGE FlexibleContexts #-}
@@ -7,7 +10,6 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE GADTs #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NoMonomorphismRestriction #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE RecursiveDo #-}
@@ -17,9 +19,8 @@
 {-# LANGUAGE TypeOperators #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE Trustworthy #-}
-#ifdef USE_REFLEX_OPTIMIZER
-{-# OPTIONS_GHC -fplugin=Reflex.Optimizer #-}
-#endif
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -- |
 -- Module:
@@ -237,6 +238,9 @@ import Unsafe.Coerce (unsafeCoerce)
 -- purposes, the 'Reflex.Spider' implementation is recommended.
 class ( MonadHold t (PushM t)
       , MonadFix (PushM t)
+      , Functor (Behavior t)
+      , Applicative (Behavior t)
+      , Monad (Behavior t)
       , MonadFix (Behavior t)
       ) => Reflex t where
   -- | A container for a value that can change over time.  'Behavior's can be
@@ -248,16 +252,11 @@ class ( MonadHold t (PushM t)
   data Event t :: Type -> Type
   -- | A monad for doing complex push-based calculations efficiently
   type PushM t :: Type -> Type
-  -- | A monad for doing complex pull-based calculations efficiently
-  type PullM t :: Type -> Type
   -- | An 'Event' with no occurrences
   never :: Event t a
   cacheEvent :: Event t a -> Event t a
   -- | Like 'push' but intended for functions that the implementation can consider cheap to compute for performance considerations. WARNING: The function passed to 'pushCheap' may be run multiple times without any caching.
   pushCheap :: (a -> PushM t (Maybe b)) -> Event t a -> Event t b
-  -- | Create a 'Behavior' by reading from other 'Behavior's; the result will be
-  -- recomputed whenever any of the read 'Behavior's changes
-  pull :: PullM t a -> Behavior t a
   -- | Efficiently fan-out an event to many destinations.  You should save the
   -- result in a @let@-binding, and then repeatedly 'selectG' on the result to
   -- create child events
@@ -271,10 +270,6 @@ class ( MonadHold t (PushM t)
   -- | Create an 'Event' that will occur whenever the input event is occurring -- and its occurrence value, another 'Event', is also occurring.
   --   You maybe looking for '@switchHold@ @never@' instead.
   coincidenceUncached :: Event t (Event t a) -> Event t a
-  -- | Create a new 'Incremental'.  The given "PullM"'s value must always change
-  -- in the same way that the accumulated application of patches would change
-  -- that value.
-  unsafeBuildIncremental :: Patch p => PullM t (PatchTarget p) -> Event t p -> Incremental t p
   -- | Construct a 'Coercion' for a 'Behavior' given an 'Coercion' for its
   -- occurrence type
   behaviorCoercion :: Coercion a b -> Coercion (Behavior t a) (Behavior t b)
@@ -282,6 +277,26 @@ class ( MonadHold t (PushM t)
   -- occurrence type
   eventCoercion :: Coercion a b -> Coercion (Event t a) (Event t b)
   mergeListUncached :: (Semigroup a) => [Event t a] -> Event t a
+
+newtype PullM t a = PullM { unPullM :: Behavior t a }
+deriving instance (Reflex t) => Functor (PullM t)
+deriving instance (Reflex t) => Applicative (PullM t)
+deriving instance (Reflex t) => Monad (PullM t)
+deriving instance (Reflex t) => MonadFix (PullM t)
+
+instance Reflex t => MonadSample t (PullM t) where
+  sample = PullM
+
+-- | Create a new 'Incremental'.  The given "PullM"'s value must always change
+-- in the same way that the accumulated application of patches would change
+-- that value.
+unsafeBuildIncremental :: PullM t (PatchTarget p) -> Event t p -> Incremental t p
+unsafeBuildIncremental = Incremental . pull
+
+-- | Create a 'Behavior' by reading from other 'Behavior's; the result will be
+-- recomputed whenever any of the read 'Behavior's changes
+pull :: PullM t a -> Behavior t a
+pull = unPullM
 
 -- | Create a merge whose parents can change over time
 mergeIncrementalGUncached :: (GCompare k, Reflex t)
@@ -707,13 +722,7 @@ ffor2 a b f = liftA2 f a b
 ffor3 :: Applicative f => f a -> f b -> f c -> (a -> b -> c -> d) -> f d
 ffor3 a b c f = liftA3 f a b c
 
-instance Reflex t => Applicative (Behavior t) where
-  pure = pull . pure
-  f <*> x = pull $ sample f `ap` sample x
-  _ *> b = b
-  a <* _ = a
-
-instance Reflex t => Apply (Behavior t) where
+instance (Reflex t, Functor (Behavior t)) => Apply (Behavior t) where
   (<.>) = (<*>)
 
 instance Reflex t => Bind (Behavior t) where
@@ -724,15 +733,8 @@ instance (Reflex t, Fractional a) => Fractional (Behavior t a) where
   fromRational = pure . fromRational
   recip = fmap recip
 
-instance Reflex t => Functor (Behavior t) where
-  fmap f = pull . fmap f . sample
-
 instance (Reflex t, IsString a) => IsString (Behavior t a) where
   fromString = pure . fromString
-
-instance Reflex t => Monad (Behavior t) where
-  a >>= f = pull $ sample a >>= sample . f
-  -- Note: it is tempting to write (_ >> b = b); however, this would result in (fail x >> return y) succeeding (returning y), which violates the law that (a >> b = a >>= \_ -> b), since the implementation of (>>=) above actually will fail.  Since we can't examine 'Behavior's other than by using sample, I don't think it's possible to write (>>) to be more efficient than the (>>=) above.
 
 instance (Reflex t, Monoid a) => Monoid (Behavior t a) where
   mempty = constant mempty
@@ -997,7 +999,7 @@ mergeList [] = never
 mergeList es = mergeWithFoldCheap' id es
 
 unsafeMapIncremental
-  :: (Reflex t, Patch p, Patch p')
+  :: (Reflex t)
   => (PatchTarget p -> PatchTarget p')
   -> (p -> p')
   -> Incremental t p

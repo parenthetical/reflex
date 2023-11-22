@@ -250,7 +250,7 @@ data BehaviorEnv x = BehaviorEnv
 
 type Invalidator = IO ()
 
-runBehaviorM :: _ -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
+runBehaviorM :: R.Behavior (SpiderTimeline x) a -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
 runBehaviorM (Behavior a) mwi holdInits = runReaderIO a (BehaviorEnv mwi holdInits)
 
 rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
@@ -276,9 +276,9 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
 
 instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
-  newtype Behavior (SpiderTimeline x) a = Behavior { readBehaviorTracked :: BehaviorM x a }
+  newtype Behavior (SpiderTimeline x) a = Behavior (ReaderIO (BehaviorEnv x) a)
+    deriving (Functor,Applicative,Monad,MonadFix)
   newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe (Maybe a)) }
-  type PullM (SpiderTimeline x) = BehaviorM x
   type PushM (SpiderTimeline x) = EventM x
 
   never = error "never value got evaluated??" <$ filter (const False) rootEvent
@@ -298,15 +298,12 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   pushCheap :: (a -> R.PushM (SpiderTimeline x) (Maybe b)) -> R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) b
   pushCheap f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
 
-  pull :: R.PullM (SpiderTimeline x) a -> R.Behavior (SpiderTimeline x) a
-  pull = Behavior
-
   switchUncached :: R.Behavior (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
   switchUncached switchParent = Event $ \sub ->
     -- TODO: eventEnvInits is always empty?
     fix $ \f -> mfix $ \(~(subscription,_occ)) -> do
       wi <- liftIO . newIORef . Just . addToQueue (unsubscribe subscription >> void (runEventM @x f)) =<< asksEventEnv eventEnvBla
-      e <- liftIO . runBehaviorM (R.sample switchParent) (Just wi) =<< asksEventEnv eventEnvInits
+      e <- liftIO . runBehaviorM switchParent (Just wi) =<< asksEventEnv eventEnvInits
       (parentSubscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
       returnSubscription (finalize wi >> unsubscribe parentSubscription) occ
 
@@ -325,9 +322,6 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
       subscribeAndRead coincidenceParent $ Subscriber $ mapM_ (subscriberPropagate sub) <=< f . Just
     occ <- f occOuter
     returnSubscription (unsubscribe subscriptionOuter) occ
-
-  unsafeBuildIncremental :: R.PullM (SpiderTimeline x) (R.PatchTarget p) -> R.Event (SpiderTimeline x) p -> R.Incremental (SpiderTimeline x) p
-  unsafeBuildIncremental = R.Incremental . R.pull
 
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
