@@ -145,7 +145,7 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
   }
 
 data EventEnv x
-   = EventEnv { eventEnvAssignments :: IORef [SomeAssignment x] -- Needed for Subscribe  -- This should only actually get used when events are firing
+   = EventEnv { eventEnvAssignments :: IORef [IO ()] -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvInits :: IORef [EventM x ()] -- Needed for Subscribe
               , eventEnvClears :: IORef [IO ()] -- Needed for Subscribe
               , eventEnvBla :: IORef [IO ()]
@@ -184,8 +184,6 @@ run triggers after = do
     liftIO (_spiderTimeline_triggerRootEvent (unSTE t))
     after
 
-data SomeAssignment x = forall a. SomeAssignment (IORef a) (IORef [Weak Invalidator]) a
-
 -- | Run an event action outside of a frame
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
@@ -204,12 +202,7 @@ runFrame a = SpiderHost $ do
   liftIO $ putStrLn "\nCLEARS"
   atomicModifyIORef toClearRef ([],) >>= sequence_
   liftIO $ putStrLn "ASSIGNMENTS"
-  atomicModifyIORef toAssignRef ([],)
-    >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
-                  writeIORef vRef v
-                  mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i) <=< readIORef $ wi)
-                      =<< readIORef iRef
-                  writeIORef iRef [])
+  atomicModifyIORef toAssignRef ([],) >>= sequence_
   liftIO $ putStrLn "BLAS"
   atomicModifyIORef toBlaRef ([],) >>= sequence_
   return result
@@ -264,7 +257,12 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
     addToQueue (do void $ liftIO $ evaluate valRef
                    void $ subscribeWithRec e
                      (const (mapM (\a -> do
-                                    addToQueue (SomeAssignment @x valRef invsRef a) =<< asksEventEnv eventEnvAssignments
+                                    addToQueue
+                                      (do writeIORef valRef a
+                                          atomicModifyIORef invsRef ([],) >>=
+                                            mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i)
+                                                  <=< readIORef $ wi))
+                                      =<< asksEventEnv eventEnvAssignments
                                     pure Nothing)))
                      $ Subscriber (const (pure ())))
       =<< asksEventEnv eventEnvInits
