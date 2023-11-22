@@ -154,18 +154,17 @@ data EventEnv x
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
 asksEventEnv f = return $ f $ _spiderTimeline_eventEnv (unSTE (spiderTimeline :: SpiderTimelineEnv x))
 
-addToQueue :: MonadIO m => a -> IORef [a] -> m ()
-addToQueue a q = liftIO $ modifyIORef' q (a:)
-
-deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
-deferClear thunk = addToQueue thunk =<< asksEventEnv eventEnvClears
+addToQueue :: HasSpiderTimeline x => (EventEnv x -> IORef [a]) -> a -> EventM x ()
+addToQueue sel a = do
+  q <- asksEventEnv sel
+  liftIO $ modifyIORef' q (a:)
 
 writeAndScheduleClear :: forall x a. HasSpiderTimeline x => String -> IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear info ref val = do
   prevVal <- liftIO $ readIORef ref
   when (isJust prevVal) $ error $ "Val was already set in " <> info <> ". Old:" <> anythingToString (fromJust prevVal) <> ", new: " <> anythingToString val
   liftIO $ writeIORef ref (Just val)
-  deferClear $ writeIORef ref Nothing
+  addToQueue eventEnvClears $ writeIORef ref Nothing
 
 -- EventM can do everything BehaviorM can, plus create holds
 newtype EventM x a = EventM { runEventM :: IO a }
@@ -229,7 +228,7 @@ unsafeNewSpiderTimelineEnv = do
         liftIO $ writeIORef rootOccRef (Just (Just ()))
         liftIO $ printf "propagating rootEvent\n"
         propagate (Just ()) rootSubscribers
-        addToQueue (writeIORef rootOccRef Nothing) (eventEnvClears env)
+        liftIO $ modifyIORef' (eventEnvClears env) (writeIORef rootOccRef Nothing:)
     , _spiderTimeline_rootTriggers = triggers
     }
 
@@ -254,18 +253,17 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
   buildHold readV0 e = do
     invsRef <- liftIO $ newIORef [] -- invalidators
     valRef <- liftIO . unsafeInterleaveIO $ newIORef =<< runEventM @x readV0
-    addToQueue (do void $ liftIO $ evaluate valRef
-                   void $ subscribeWithRec e
-                     (const (mapM (\a -> do
-                                    addToQueue
-                                      (do writeIORef valRef a
-                                          atomicModifyIORef invsRef ([],) >>=
-                                            mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i)
-                                                  <=< readIORef $ wi))
-                                      =<< asksEventEnv eventEnvAssignments
-                                    pure Nothing)))
-                     $ Subscriber (const (pure ())))
-      =<< asksEventEnv eventEnvInits
+    addToQueue eventEnvInits $ do
+      void $ liftIO $ evaluate valRef
+      void $ subscribeWithRec e
+        (const (mapM (\a -> do
+                         addToQueue eventEnvAssignments $ do
+                           writeIORef valRef a
+                           atomicModifyIORef invsRef ([],) >>=
+                             mapM_ (\wi -> maybe (pure ()) (\i -> finalize wi >> i)
+                                           <=< readIORef $ wi)
+                         pure Nothing)))
+        $ Subscriber (const (pure ()))
     pure $ Behavior $ do
       asks behaviorEnvMaybeWISubs >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
       liftIO $ readIORef valRef
@@ -300,7 +298,8 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   switchUncached switchParent = Event $ \sub ->
     -- TODO: eventEnvInits is always empty?
     fix $ \f -> mfix $ \(~(subscription,_occ)) -> do
-      wi <- liftIO . newIORef . Just . addToQueue (unsubscribe subscription >> void (runEventM @x f)) =<< asksEventEnv eventEnvBla
+      wi <- liftIO . newIORef . Just $ runEventM @x $
+        addToQueue eventEnvBla $ unsubscribe subscription >> void (runEventM @x f)
       e <- liftIO . runBehaviorM switchParent (Just wi) =<< asksEventEnv eventEnvInits
       (parentSubscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
       returnSubscription (finalize wi >> unsubscribe parentSubscription) occ
@@ -336,7 +335,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
           isScheduled <- liftIO $ readIORef clearScheduledRef
           unless isScheduled $ do
             liftIO $ writeIORef clearScheduledRef True
-            deferClear $ do
+            addToQueue eventEnvClears $ do
               status <- maybeResult
               when (isNothing status) $
                 error "Merge: not all inputs fired"
@@ -391,7 +390,7 @@ newFanEventWithTriggerIO f = do
                 printf "trigger %d adding value: %s\n"  nodeId $ anythingToString a
                 occBefore <- readIORef occRef
                 when (DMap.null occBefore) $
-                  runEventM @x $ deferClear $ writeIORef occRef DMap.empty
+                  runEventM @x $ addToQueue eventEnvClears $ writeIORef occRef DMap.empty
                 modifyIORef occRef $ DMap.insert k (Identity a)
               (_subscription, _) <- runEventM @x $ subscribeAndRead rootEvent $ Subscriber $ \_ -> do
                 occ <- fmap runIdentity . DMap.lookup k <$> liftIO (readIORef occRef)
