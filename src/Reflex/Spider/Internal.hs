@@ -284,13 +284,11 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
 
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
-    liftIO $ putStrLn "cacheEvent being subscribed to"
     subscribers :: WeakBag (Subscriber x a) <- wbEmpty
     occRef <- liftIO $ newIORef Nothing
     void . runEventM @x . subscribeWithRec e (\_ occ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
            $ Subscriber { subscriberPropagate = flip propagate subscribers }
     pure $ Event $ \sub -> do
-      liftIO $ printf "cacheEvent occ on read: %s\n" . anythingToString =<< readIORef occRef
       sln <- liftIO $ wbInsert sub subscribers
       returnSubscription (wbRemove sln) <=< liftIO $ readIORef occRef
 
@@ -325,46 +323,19 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
 
   mergeListUncached :: forall a. (Semigroup a) => [R.Event (SpiderTimeline x) a] -> R.Event (SpiderTimeline x) a
   mergeListUncached es = Event $ \sub -> do
-    nodeId <- newNodeId
-    liftIO $ putStrLn $ "Merge being subscribed to " <> show nodeId
-    clearScheduledRef <- liftIO $ newIORef False
     occRefsSubscriptionsRef <- liftIO $ newIORef $ error "mergeListUncached: occRefsSubscriptions unitialized"
     let maybeResult = do
           res <- fmap (fmap mconcat . sequence) . mapM (readIORef . fst) =<< readIORef occRefsSubscriptionsRef
-          printf "Merge state: %s\n" . show . fmap (fmap void) =<< mapM (readIORef . fst) =<< readIORef occRefsSubscriptionsRef
-          printf "Merge maybeResult %d: %s\n" nodeId $ anythingToString res
+          forM_ res $ const $ mapM_ (flip writeIORef Nothing . fst) =<< readIORef occRefsSubscriptionsRef
           pure res
-    let doScheduleClearOnce = do
-          isScheduled <- liftIO $ readIORef clearScheduledRef
-          unless isScheduled $ do
-            liftIO $ writeIORef clearScheduledRef True
-            addToQueue eventEnvClears $ do
-              status <- maybeResult
-              when (isNothing status) $
-                error "Merge: not all inputs fired"
-              liftIO $ writeIORef clearScheduledRef False
-              occRefs <- fmap fst <$> readIORef occRefsSubscriptionsRef
-              forM_ occRefs (`writeIORef` Nothing)
-    liftIO . writeIORef occRefsSubscriptionsRef <=< forM (zip es [(0 :: Int)..]) $ \(e,n) -> do
-      liftIO $ printf "Merge starting subscribe of input nr %d\n" n
+    liftIO . writeIORef occRefsSubscriptionsRef <=< forM es $ \e -> do
       occRef <- liftIO $ newIORef Nothing
       subscription <- fmap fst . subscribeWithRec e
-        (\_ occ -> do
-            liftIO $ printf "Merge %d incoming known occ nr %d: %s\n" nodeId n (anythingToString occ)
-            prev <- liftIO $ readIORef occRef
-            unless (isNothing prev) $ error $ "merge slot written twice: " <> anythingToString prev <> " to " <> anythingToString occ
-            liftIO $ writeIORef occRef (Just occ)
-            doScheduleClearOnce
-            pure Nothing)
-        $ Subscriber $ \_ ->
-           mapM_ (\occ -> do
-                     liftIO $ printf "Merge %d propagating occ: %s\n" nodeId (anythingToString occ)
-                     subscriberPropagate sub occ)
-           =<< liftIO maybeResult
+        (\_ -> (Nothing <$) . liftIO . writeIORef occRef . Just)
+        $ Subscriber $ \_ -> mapM_ (subscriberPropagate sub) =<< liftIO maybeResult
       pure (occRef, subscription)
-    maybeOcc <- liftIO maybeResult
-    liftIO $ printf "merge occ on subscription: %s\n" $ anythingToString maybeOcc
-    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) maybeOcc
+    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef)
+      =<< liftIO maybeResult
 
   eventCoercion Coercion = Coercion
 
