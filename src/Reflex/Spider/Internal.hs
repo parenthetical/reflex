@@ -147,7 +147,7 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
 data EventEnv x
    = EventEnv { eventEnvAssignments :: IORef [SomeAssignment x] -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvInits :: IORef [EventM x ()] -- Needed for Subscribe
-              , eventEnvClears :: IORef [Clear] -- Needed for Subscribe
+              , eventEnvClears :: IORef [IO ()] -- Needed for Subscribe
               , eventEnvBla :: IORef [IO ()]
               }
 
@@ -158,7 +158,7 @@ addToQueue :: MonadIO m => a -> IORef [a] -> m ()
 addToQueue a q = liftIO $ modifyIORef' q (a:)
 
 deferClear :: forall x. HasSpiderTimeline x => IO () -> EventM x ()
-deferClear thunk = addToQueue (Clear thunk) =<< asksEventEnv eventEnvClears
+deferClear thunk = addToQueue thunk =<< asksEventEnv eventEnvClears
 
 writeAndScheduleClear :: forall x a. HasSpiderTimeline x => String -> IORef (Maybe a) -> a -> EventM x ()
 writeAndScheduleClear info ref val = do
@@ -184,8 +184,6 @@ run triggers after = do
     liftIO (_spiderTimeline_triggerRootEvent (unSTE t))
     after
 
-newtype Clear = Clear (IO ())
-
 data SomeAssignment x = forall a. SomeAssignment (IORef a) (IORef [Weak Invalidator]) a
 
 -- | Run an event action outside of a frame
@@ -204,7 +202,7 @@ runFrame a = SpiderHost $ do
       runEventM $ mapM_ (\m -> liftIO (putStr ".") >> m) inits
       runHoldInits'
   liftIO $ putStrLn "\nCLEARS"
-  atomicModifyIORef toClearRef ([],) >>= mapM_ (\(Clear m) -> m)
+  atomicModifyIORef toClearRef ([],) >>= sequence_
   liftIO $ putStrLn "ASSIGNMENTS"
   atomicModifyIORef toAssignRef ([],)
     >>= mapM_ (\(SomeAssignment vRef iRef v) -> do
@@ -238,32 +236,25 @@ unsafeNewSpiderTimelineEnv = do
         liftIO $ writeIORef rootOccRef (Just (Just ()))
         liftIO $ printf "propagating rootEvent\n"
         propagate (Just ()) rootSubscribers
-        addToQueue (Clear (writeIORef rootOccRef Nothing)) (eventEnvClears env)
+        addToQueue (writeIORef rootOccRef Nothing) (eventEnvClears env)
     , _spiderTimeline_rootTriggers = triggers
     }
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
-  sample b = liftIO . runBehaviorM (R.sample b) Nothing =<< asksEventEnv eventEnvInits
+  sample b = liftIO . runBehaviorM b Nothing =<< asksEventEnv eventEnvInits
 
 data BehaviorEnv x = BehaviorEnv
   { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator)
   , _behaviorEnvInitsRef :: IORef [EventM x ()]
   }
 
--- BehaviorM can sample behaviors
-newtype BehaviorM (x :: Type) a = BehaviorM { unBehaviorM :: ReaderIO (BehaviorEnv x) a }
-  deriving (Functor, Applicative, Monad, MonadIO, MonadFix, MonadReader (BehaviorEnv x))
-
 type Invalidator = IO ()
 
-runBehaviorM :: BehaviorM x a -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
-runBehaviorM a mwi holdInits = runReaderIO (unBehaviorM a) (BehaviorEnv mwi holdInits)
+runBehaviorM :: _ -> Maybe (Weak Invalidator) -> IORef [EventM x ()] -> IO a
+runBehaviorM (Behavior a) mwi holdInits = runReaderIO a (BehaviorEnv mwi holdInits)
 
 rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
 rootEvent = Event (_spiderTimeline_rootEvent (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
-
-instance Reflex.Class.MonadSample (SpiderTimeline x) (BehaviorM x) where
-  sample = readBehaviorTracked
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   -- Note: cannot examine its event until after the phase is over
