@@ -82,6 +82,7 @@ import qualified Data.IntMap as IntMap
 import Text.Printf (printf)
 import Witherable (filter)
 import Prelude hiding (filter)
+import Control.Monad.Trans.Maybe
 -- import Debug.RecoverRTTI (anythingToString)
 
 anythingToString :: p -> String
@@ -89,9 +90,6 @@ anythingToString _ = "<anythingToString>"
 
 
 type WeakBag a = IORef (IntMap a)
-
-wbEmpty :: IO (WeakBag a)
-wbEmpty = newIORef mempty
 
 wbInsert :: a -> IORef (IntMap a) -> IO (IntMap.Key, WeakBag a)
 wbInsert a wb = do
@@ -215,7 +213,7 @@ unsafeNewSpiderTimelineEnv = do
             toBlaRef <- newIORef []
             return $ EventEnv toAssignRef initRef toClearRef toBlaRef
   triggers <- newIORef mempty
-  rootSubscribers :: WeakBag (Subscriber x a) <- wbEmpty
+  rootSubscribers :: WeakBag (Subscriber x a) <- newIORef mempty
   rootOccRef :: IORef (Maybe (Maybe ())) <- newIORef Nothing
   return $ STE $ SpiderTimelineEnv
     { _spiderTimeline_lock = lock
@@ -233,7 +231,7 @@ unsafeNewSpiderTimelineEnv = do
     }
 
 data BehaviorEnv x = BehaviorEnv
-  { behaviorEnvMaybeWISubs :: Maybe (Weak Invalidator)
+  { behaviorEnvMaybeInvalidators :: Maybe (Weak Invalidator)
   , _behaviorEnvInitsRef :: IORef [EventM x ()]
   }
 
@@ -246,15 +244,17 @@ rootEvent :: forall x. HasSpiderTimeline x => R.Event (SpiderTimeline x) ()
 rootEvent = Event (_spiderTimeline_rootEvent (unSTE (spiderTimeline :: SpiderTimelineEnv x)))
 
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
+  sample :: R.Behavior (SpiderTimeline x) a -> EventM x a
   sample b = do
-    inits <- asksEventEnv eventEnvInits
-    res <- liftIO . unsafeInterleaveIO . runBehaviorM b Nothing $ inits
+    res <- liftIO . unsafeInterleaveIO . runBehaviorM b Nothing
+                 =<< asksEventEnv eventEnvInits
     addToQueue eventEnvInits $ liftIO . void . evaluate $ res
     pure res
 
 instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (EventM x) where
   liftPush = id
   -- Note: cannot examine its event until after the phase is over
+  hold :: a -> R.Event (SpiderTimeline x) a -> EventM x (R.Behavior (SpiderTimeline x) a)
   hold v0 e = do
     invsRef <- liftIO $ newIORef [] -- invalidators
     valRef <- liftIO $ newIORef v0
@@ -269,7 +269,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                          pure Nothing)))
         $ Subscriber (const (pure ()))
     pure $ Behavior $ do
-      asks behaviorEnvMaybeWISubs >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
+      asks behaviorEnvMaybeInvalidators >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
       liftIO $ readIORef valRef
   now = R.headE rootEvent
 
@@ -277,14 +277,15 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   {-# SPECIALIZE instance R.Reflex (SpiderTimeline Global) #-}
   newtype Behavior (SpiderTimeline x) a = Behavior (ReaderIO (BehaviorEnv x) a)
     deriving (Functor,Applicative,Monad,MonadFix)
-  newtype Event (SpiderTimeline x) a = Event { subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe (Maybe a)) }
+  newtype Event (SpiderTimeline x) a = Event {
+    subscribeAndRead :: Subscriber x a -> EventM x (EventSubscription x, Maybe (Maybe a)) }
   type PushM (SpiderTimeline x) = EventM x
 
   never = error "never value got evaluated??" <$ filter (const False) rootEvent
 
   cacheEvent :: forall a. R.Event (SpiderTimeline x) a -> R.Event (SpiderTimeline x) a
   cacheEvent e = unsafePerformIO $ do
-    subscribers :: WeakBag (Subscriber x a) <- wbEmpty
+    subscribers :: WeakBag (Subscriber x a) <- newIORef mempty
     occRef <- liftIO $ newIORef Nothing
     void . runEventM @x . subscribeWithRec e (\_ occ -> writeAndScheduleClear "cacheEvent" occRef occ >> pure occ)
            $ Subscriber { subscriberPropagate = flip propagate subscribers }
@@ -334,8 +335,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
         (\_ -> (Nothing <$) . liftIO . writeIORef occRef . Just)
         $ Subscriber $ \_ -> mapM_ (subscriberPropagate sub) =<< liftIO maybeResult
       pure (occRef, subscription)
-    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef)
-      =<< liftIO maybeResult
+    returnSubscription (mapM_ (unsubscribe . snd) =<< readIORef occRefsSubscriptionsRef) =<< liftIO maybeResult
 
   eventCoercion Coercion = Coercion
 
@@ -359,7 +359,7 @@ newFanEventWithTriggerIO f = do
         (\case
             Just res -> pure res
             Nothing -> do
-              subscribers <- wbEmpty
+              subscribers <- newIORef mempty
               _uninit <- f k $ RootTrigger $ \a -> do
                 printf "trigger %d adding value: %s\n"  nodeId $ anythingToString a
                 occBefore <- readIORef occRef
