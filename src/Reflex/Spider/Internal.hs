@@ -139,7 +139,6 @@ data SpiderTimelineEnv' x = SpiderTimelineEnv
   , _spiderTimeline_eventEnv :: EventEnv x
   , _spiderTimeline_rootEvent :: Subscriber x () -> EventM x (EventSubscription x, Maybe (Maybe ()))
   , _spiderTimeline_triggerRootEvent :: IO ()
-  , _spiderTimeline_rootTriggers :: IORef (IntMap (Some (RootTrigger x)))
   }
 
 data EventEnv x
@@ -212,7 +211,6 @@ unsafeNewSpiderTimelineEnv = do
             toClearRef <- newIORef []
             toBlaRef <- newIORef []
             return $ EventEnv toAssignRef initRef toClearRef toBlaRef
-  triggers <- newIORef mempty
   rootSubscribers :: WeakBag (Subscriber x a) <- newIORef mempty
   rootOccRef :: IORef (Maybe (Maybe ())) <- newIORef Nothing
   return $ STE $ SpiderTimelineEnv
@@ -227,7 +225,6 @@ unsafeNewSpiderTimelineEnv = do
         liftIO $ printf "propagating rootEvent\n"
         propagate (Just ()) rootSubscribers
         liftIO $ modifyIORef' (eventEnvClears env) (writeIORef rootOccRef Nothing:)
-    , _spiderTimeline_rootTriggers = triggers
     }
 
 data BehaviorEnv x = BehaviorEnv
