@@ -145,7 +145,6 @@ data EventEnv x
    = EventEnv { eventEnvAssignments :: IORef [IO ()] -- Needed for Subscribe  -- This should only actually get used when events are firing
               , eventEnvInits :: IORef [EventM x ()] -- Needed for Subscribe
               , eventEnvClears :: IORef [IO ()] -- Needed for Subscribe
-              , eventEnvBla :: IORef [IO ()]
               }
 
 asksEventEnv :: forall x a. HasSpiderTimeline x => (EventEnv x -> a) -> EventM x a
@@ -184,7 +183,7 @@ run triggers after = do
 runFrame :: forall x a. HasSpiderTimeline x => EventM x a -> SpiderHost x a --TODO: This function also needs to hold the mutex
 runFrame a = SpiderHost $ do
   liftIO $ putStrLn "-- START RUNFRAME"
-  let (EventEnv toAssignRef initRef toClearRef toBlaRef) =
+  let (EventEnv toAssignRef initRef toClearRef) =
         _spiderTimeline_eventEnv $ unSTE (spiderTimeline :: SpiderTimelineEnv x)
   result <- runEventM a
   -- This must happen before doing the assignments, in case subscribing a Hold causes existing Holds to be read by the newly-propagated events:
@@ -199,8 +198,6 @@ runFrame a = SpiderHost $ do
   atomicModifyIORef toClearRef ([],) >>= sequence_
   liftIO $ putStrLn "ASSIGNMENTS"
   atomicModifyIORef toAssignRef ([],) >>= sequence_
-  liftIO $ putStrLn "BLAS"
-  atomicModifyIORef toBlaRef ([],) >>= sequence_
   return result
 
 unsafeNewSpiderTimelineEnv :: forall x. IO (SpiderTimelineEnv x)
@@ -209,8 +206,7 @@ unsafeNewSpiderTimelineEnv = do
   env <- do toAssignRef <- newIORef []
             initRef <- newIORef []
             toClearRef <- newIORef []
-            toBlaRef <- newIORef []
-            return $ EventEnv toAssignRef initRef toClearRef toBlaRef
+            return $ EventEnv toAssignRef initRef toClearRef
   rootSubscribers :: WeakBag (Subscriber x a) <- newIORef mempty
   rootOccRef :: IORef (Maybe (Maybe ())) <- newIORef Nothing
   return $ STE $ SpiderTimelineEnv
@@ -295,8 +291,7 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   switchUncached :: R.Behavior (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
   switchUncached switchParent = Event $ \sub -> fix $ \f -> mdo
     -- TODO: eventEnvInits is always empty?
-      wi <- liftIO . newIORef . Just $ runEventM @x $
-        addToQueue eventEnvBla $ unsubscribe parentSubscription >> void (runEventM @x f)
+      wi <- liftIO . newIORef . Just $ unsubscribe parentSubscription >> void (runEventM @x f)
       e <- liftIO . runBehaviorM switchParent (Just wi) =<< asksEventEnv eventEnvInits
       (parentSubscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
       returnSubscription (finalize wi >> unsubscribe parentSubscription) occ
