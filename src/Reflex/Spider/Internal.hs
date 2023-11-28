@@ -243,8 +243,7 @@ rootEvent = Event (_spiderTimeline_rootEvent (unSTE (spiderTimeline :: SpiderTim
 instance HasSpiderTimeline x => Reflex.Class.MonadSample (SpiderTimeline x) (EventM x) where
   sample :: R.Behavior (SpiderTimeline x) a -> EventM x a
   sample b = do
-    res <- liftIO . unsafeInterleaveIO . runBehaviorM b Nothing
-                 =<< asksEventEnv eventEnvInits
+    res <- liftIO . unsafeInterleaveIO . runBehaviorM b Nothing =<< asksEventEnv eventEnvInits
     addToQueue eventEnvInits $ liftIO . void . evaluate $ res
     pure res
 
@@ -294,11 +293,10 @@ instance HasSpiderTimeline x => R.Reflex (SpiderTimeline x) where
   pushCheap f e = Event $ subscribeWithRec e (\_ -> fmap join . mapM f)
 
   switchUncached :: R.Behavior (SpiderTimeline x) (R.Event (SpiderTimeline x) a) -> R.Event (SpiderTimeline x) a
-  switchUncached switchParent = Event $ \sub ->
+  switchUncached switchParent = Event $ \sub -> fix $ \f -> mdo
     -- TODO: eventEnvInits is always empty?
-    fix $ \f -> mfix $ \(~(subscription,_occ)) -> do
       wi <- liftIO . newIORef . Just $ runEventM @x $
-        addToQueue eventEnvBla $ unsubscribe subscription >> void (runEventM @x f)
+        addToQueue eventEnvBla $ unsubscribe parentSubscription >> void (runEventM @x f)
       e <- liftIO . runBehaviorM switchParent (Just wi) =<< asksEventEnv eventEnvInits
       (parentSubscription, occ) <- subscribeAndRead e $ Subscriber $ subscriberPropagate sub
       returnSubscription (finalize wi >> unsubscribe parentSubscription) occ
