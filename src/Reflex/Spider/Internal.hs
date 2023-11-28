@@ -228,7 +228,7 @@ unsafeNewSpiderTimelineEnv = do
     }
 
 data BehaviorEnv x = BehaviorEnv
-  { behaviorEnvMaybeInvalidators :: Maybe (Weak Invalidator)
+  { behaviorEnvMaybeInvalidator :: Maybe (Weak Invalidator)
   , _behaviorEnvInitsRef :: IORef [EventM x ()]
   }
 
@@ -266,7 +266,7 @@ instance HasSpiderTimeline x => Reflex.Class.MonadHold (SpiderTimeline x) (Event
                          pure Nothing)))
         $ Subscriber (const (pure ()))
     pure $ Behavior $ do
-      asks behaviorEnvMaybeInvalidators >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
+      asks behaviorEnvMaybeInvalidator >>= mapM_ (liftIO . modifyIORef' invsRef . (:))
       liftIO $ readIORef valRef
   now = R.headE rootEvent
 
